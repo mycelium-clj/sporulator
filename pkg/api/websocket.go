@@ -202,6 +202,8 @@ func (s *Server) handleWSMessage(c *wsClient, msg WSMessage) {
 		go s.handleCellImplementFeedback(c, msg)
 	case "cell_iterate":
 		go s.handleCellIterate(c, msg)
+	case "orchestrate":
+		go s.handleOrchestrate(c, msg)
 	default:
 		c.sendError("unknown message type: " + msg.Type)
 	}
@@ -484,5 +486,78 @@ func (s *Server) handleCellImplementFeedback(c *wsClient, msg WSMessage) {
 			"code":    result.Code,
 			"raw":     result.Raw,
 		},
+	})
+}
+
+// --- Orchestrator handler ---
+
+type orchestratePayload struct {
+	ProjectPath   string `json:"project_path"`
+	BaseNamespace string `json:"base_namespace"`
+	SourceDir     string `json:"source_dir"`
+	TestDir       string `json:"test_dir"`
+	Spec          string `json:"spec"`
+	ManifestID    string `json:"manifest_id"`
+}
+
+func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		c.sendError("invalid payload")
+		return
+	}
+	var payload orchestratePayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		c.sendError("invalid orchestrate payload")
+		return
+	}
+
+	if payload.SourceDir == "" {
+		payload.SourceDir = "src/clj"
+	}
+	if payload.TestDir == "" {
+		payload.TestDir = "test/clj"
+	}
+
+	orch := agents.NewOrchestrator(s.manager, s.store)
+
+	err = orch.Run(c.ctx, agents.ProjectConfig{
+		ProjectPath:   payload.ProjectPath,
+		BaseNamespace: payload.BaseNamespace,
+		SourceDir:     payload.SourceDir,
+		TestDir:       payload.TestDir,
+		Spec:          payload.Spec,
+		ManifestID:    payload.ManifestID,
+	},
+		func(source string, chunk string) {
+			c.sendMsg(WSMessage{
+				Type: "stream_chunk",
+				ID:   source,
+				Payload: map[string]string{
+					"chunk": chunk,
+				},
+			})
+		},
+		func(event agents.OrchestratorEvent) {
+			c.sendMsg(WSMessage{
+				Type: "orchestrator_event",
+				ID:   msg.ID,
+				Payload: event,
+			})
+		},
+	)
+
+	if err != nil {
+		c.sendMsg(WSMessage{
+			Type:    "orchestrator_error",
+			ID:      msg.ID,
+			Payload: err.Error(),
+		})
+		return
+	}
+
+	c.sendMsg(WSMessage{
+		Type: "orchestrator_complete",
+		ID:   msg.ID,
 	})
 }

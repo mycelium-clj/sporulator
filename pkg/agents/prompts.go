@@ -404,6 +404,32 @@ The :validate option controls schema validation when compiling or running workfl
 - **:warn**: Development mode. Schema mismatches are collected in :mycelium/warnings but the workflow continues.
 - **:off**: No validation at all. Useful during schema inference.
 
+## Testing Cells (TDD)
+
+When asked to write tests, use clojure.test. The pattern for testing a cell:
+
+` + "```" + `clojure
+(ns <test-namespace>
+  (:require [clojure.test :refer :all]
+            [mycelium.cell :as cell]
+            [<cell-namespace>]))  ;; require the cell namespace to register defcells
+
+(deftest test-cell-name
+  (let [handler (:handler (cell/get-cell! :ns/cell-id))
+        resources {<resource-key> <test-resource-value>}
+        result (handler resources {<input-key> <test-input-value>})]
+    (is (= <expected-value> (<output-key> result)))))
+` + "```" + `
+
+Key test patterns:
+- Use cell/get-cell! to retrieve the registered cell's spec map
+- Extract :handler from the spec and call it directly: (handler resources data)
+- Set up realistic resources and input data based on the specification
+- Test edge cases, boundary conditions, and error scenarios
+- Use (is (= expected actual)) for assertions
+- Group related tests with deftest, use testing for sub-cases
+- The test namespace and cell namespace will be provided when you are asked to write tests
+
 ## Boundaries of Your Knowledge
 
 You have detailed knowledge about:

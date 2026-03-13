@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-var codeBlockRe = regexp.MustCompile("(?s)```(?:clojure|clj|edn)?\\s*\n(.*?)```")
+var codeBlockRe = regexp.MustCompile("(?s)`{3,}(?:clojure|clj|edn)?\\s*\n(.*?)\n\\s*`{3,}")
 
 // ExtractCodeBlocks returns all fenced code blocks from a response.
 // Matches ```clojure, ```clj, ```edn, and bare ``` blocks.
@@ -28,7 +28,27 @@ func ExtractFirstCodeBlock(response string) string {
 	if len(blocks) > 0 {
 		return blocks[0]
 	}
-	return strings.TrimSpace(response)
+	// Fallback: strip any leading/trailing fence markers the regex missed
+	return stripFenceMarkers(strings.TrimSpace(response))
+}
+
+// stripFenceMarkers removes markdown code fence markers from the start and end.
+func stripFenceMarkers(s string) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) < 2 {
+		return s
+	}
+	first := strings.TrimSpace(lines[0])
+	if strings.HasPrefix(first, "```") {
+		lines = lines[1:]
+	}
+	if len(lines) > 0 {
+		last := strings.TrimSpace(lines[len(lines)-1])
+		if strings.HasPrefix(last, "```") {
+			lines = lines[:len(lines)-1]
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // ExtractDefcell extracts the first (cell/defcell ...) form from a response.
