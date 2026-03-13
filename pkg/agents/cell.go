@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/mycelium-clj/sporulator/pkg/bridge"
 	"github.com/mycelium-clj/sporulator/pkg/llm"
 	"github.com/mycelium-clj/sporulator/pkg/store"
 )
@@ -28,11 +29,21 @@ type CellResult struct {
 	Error   error
 }
 
+// FeedbackEvent is emitted during the REPL feedback loop to report progress.
+type FeedbackEvent struct {
+	Type    string // "eval", "error", "fix", "success"
+	Attempt int    // 1-based attempt number
+	Code    string // code that was evaluated
+	Output  string // REPL output (value, out, or error)
+	Message string // human-readable description
+}
+
 // CellAgent manages a short-lived conversation for implementing a single cell.
 type CellAgent struct {
-	session *llm.Session
-	client  *llm.Client
-	store   *store.Store
+	session        *llm.Session
+	client         *llm.Client
+	store          *store.Store
+	bridgeProvider BridgeProvider // returns current bridge, nil-safe
 }
 
 // Implement generates a cell implementation from a brief.
@@ -53,6 +64,100 @@ func (c *CellAgent) ImplementStream(ctx context.Context, brief CellBrief, onChun
 		return nil, fmt.Errorf("cell agent implement stream: %w", err)
 	}
 	return c.buildResult(brief.ID, response), nil
+}
+
+// ImplementWithFeedback generates a cell, evaluates it in the REPL, and iterates
+// on errors automatically. onChunk streams LLM tokens, onFeedback reports REPL results.
+// Makes up to maxAttempts tries (1 initial + fixes). Returns the final result.
+func (c *CellAgent) ImplementWithFeedback(ctx context.Context, brief CellBrief, maxAttempts int, onChunk func(string), onFeedback func(FeedbackEvent)) (*CellResult, error) {
+	br := c.getBridge()
+	if br == nil {
+		return c.ImplementStream(ctx, brief, onChunk)
+	}
+	if maxAttempts < 1 {
+		maxAttempts = 3
+	}
+
+	// Initial implementation
+	result, err := c.ImplementStream(ctx, brief, onChunk)
+	if err != nil {
+		return nil, err
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		code := result.Code
+		if code == "" {
+			onFeedback(FeedbackEvent{
+				Type:    "error",
+				Attempt: attempt,
+				Message: "No defcell form found in LLM response",
+			})
+			break
+		}
+
+		// Eval in REPL
+		onFeedback(FeedbackEvent{
+			Type:    "eval",
+			Attempt: attempt,
+			Code:    code,
+			Message: fmt.Sprintf("Evaluating cell (attempt %d/%d)", attempt, maxAttempts),
+		})
+
+		evalResult, evalErr := br.InstantiateCell(code)
+		if evalErr != nil {
+			onFeedback(FeedbackEvent{
+				Type:    "error",
+				Attempt: attempt,
+				Output:  evalErr.Error(),
+				Message: "REPL connection error",
+			})
+			break // can't fix connection errors
+		}
+
+		if !evalResult.IsError() {
+			// Success — cell loaded cleanly
+			onFeedback(FeedbackEvent{
+				Type:    "success",
+				Attempt: attempt,
+				Code:    code,
+				Output:  evalResult.Value,
+				Message: "Cell loaded successfully",
+			})
+			return result, nil
+		}
+
+		// Error — feed it back to the LLM for a fix
+		errMsg := evalResult.Ex
+		if evalResult.Err != "" {
+			errMsg += "\n" + evalResult.Err
+		}
+		onFeedback(FeedbackEvent{
+			Type:    "error",
+			Attempt: attempt,
+			Code:    code,
+			Output:  errMsg,
+			Message: "REPL error, requesting fix from LLM",
+		})
+
+		if attempt >= maxAttempts {
+			break // no more retries
+		}
+
+		// Ask the LLM to fix
+		feedback := fmt.Sprintf("The code produced this error when evaluated in the REPL:\n\n```\n%s\n```\n\nPlease fix the issue and return the corrected `cell/defcell` form.", errMsg)
+		onFeedback(FeedbackEvent{
+			Type:    "fix",
+			Attempt: attempt + 1,
+			Message: "Requesting fix from LLM",
+		})
+
+		result, err = c.IterateStream(ctx, feedback, onChunk)
+		if err != nil {
+			return nil, fmt.Errorf("cell agent fix attempt %d: %w", attempt+1, err)
+		}
+	}
+
+	return result, nil
 }
 
 // Iterate sends feedback and gets an updated implementation.
@@ -93,6 +198,14 @@ func (c *CellAgent) Save(result *CellResult, schema, requires, doc, createdBy st
 // History returns the conversation history.
 func (c *CellAgent) History() []llm.Message {
 	return c.session.History()
+}
+
+// getBridge returns the current bridge, or nil if no provider or no bridge.
+func (c *CellAgent) getBridge() *bridge.Bridge {
+	if c.bridgeProvider == nil {
+		return nil
+	}
+	return c.bridgeProvider()
 }
 
 func (c *CellAgent) buildResult(cellID, response string) *CellResult {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/mycelium-clj/sporulator/pkg/agents"
 	"github.com/mycelium-clj/sporulator/pkg/bridge"
+	"github.com/mycelium-clj/sporulator/pkg/source"
 	"github.com/mycelium-clj/sporulator/pkg/store"
 )
 
@@ -80,6 +81,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/repl/eval", s.handleReplEval)
 	s.mux.HandleFunc("POST /api/repl/instantiate", s.handleReplInstantiate)
 	s.mux.HandleFunc("GET /api/repl/status", s.handleReplStatus)
+
+	// Source generation
+	s.mux.HandleFunc("POST /api/source/generate", s.handleSourceGenerate)
 
 	// WebSocket
 	s.mux.HandleFunc("GET /ws", s.handleWebSocket)
@@ -389,4 +393,38 @@ func (s *Server) handleReplStatus(w http.ResponseWriter, r *http.Request) {
 		connected = b.Connected()
 	}
 	writeJSON(w, 200, map[string]any{"connected": connected})
+}
+
+// --- Source generation handler ---
+
+type sourceGenerateRequest struct {
+	OutputDir     string `json:"output_dir"`
+	BaseNamespace string `json:"base_namespace"`
+}
+
+func (s *Server) handleSourceGenerate(w http.ResponseWriter, r *http.Request) {
+	var req sourceGenerateRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, 400, fmt.Sprintf("invalid json: %v", err))
+		return
+	}
+	if req.OutputDir == "" {
+		writeError(w, 400, "output_dir is required")
+		return
+	}
+	if req.BaseNamespace == "" {
+		writeError(w, 400, "base_namespace is required")
+		return
+	}
+
+	result, err := source.Generate(s.store, source.Config{
+		OutputDir:     req.OutputDir,
+		BaseNamespace: req.BaseNamespace,
+	})
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("generate: %v", err))
+		return
+	}
+
+	writeJSON(w, 200, result)
 }

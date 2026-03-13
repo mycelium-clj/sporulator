@@ -3,7 +3,9 @@ package agents
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/mycelium-clj/sporulator/pkg/bridge"
 	"github.com/mycelium-clj/sporulator/pkg/llm"
 	"github.com/mycelium-clj/sporulator/pkg/store"
 )
@@ -11,9 +13,10 @@ import (
 // GraphAgent manages a long-lived conversation about workflow design.
 // It produces and modifies manifests but does not implement cells.
 type GraphAgent struct {
-	session *llm.Session
-	client  *llm.Client
-	store   *store.Store
+	session        *llm.Session
+	client         *llm.Client
+	store          *store.Store
+	bridgeProvider BridgeProvider // returns current bridge, nil-safe
 }
 
 // Chat sends a message to the graph agent and returns the response.
@@ -59,6 +62,107 @@ func (g *GraphAgent) SaveManifest(manifestID, response, createdBy string) (int, 
 		return 0, fmt.Errorf("save manifest: %w", err)
 	}
 	return version, nil
+}
+
+// ChatStreamWithFeedback sends a message, streams the response, and if the response
+// contains a manifest, attempts to compile it in the REPL. On compilation error,
+// feeds the error back to the LLM for a fix. maxAttempts controls retries (default 3).
+func (g *GraphAgent) ChatStreamWithFeedback(ctx context.Context, message string, maxAttempts int, onChunk func(string), onFeedback func(FeedbackEvent)) (string, error) {
+	br := g.getBridge()
+	if br == nil {
+		return g.ChatStream(ctx, message, onChunk)
+	}
+	if maxAttempts < 1 {
+		maxAttempts = 3
+	}
+
+	response, err := g.ChatStream(ctx, message, onChunk)
+	if err != nil {
+		return "", err
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		manifest := ExtractFirstCodeBlock(response)
+		if manifest == "" || !looksLikeManifest(manifest) {
+			// No manifest in response, just return the text
+			return response, nil
+		}
+
+		onFeedback(FeedbackEvent{
+			Type:    "eval",
+			Attempt: attempt,
+			Code:    manifest,
+			Message: fmt.Sprintf("Compiling manifest in REPL (attempt %d/%d)", attempt, maxAttempts),
+		})
+
+		evalResult, evalErr := br.CompileWorkflow(manifest, "")
+		if evalErr != nil {
+			onFeedback(FeedbackEvent{
+				Type:    "error",
+				Attempt: attempt,
+				Output:  evalErr.Error(),
+				Message: "REPL connection error",
+			})
+			return response, nil // can't fix connection errors
+		}
+
+		if !evalResult.IsError() {
+			onFeedback(FeedbackEvent{
+				Type:    "success",
+				Attempt: attempt,
+				Code:    manifest,
+				Output:  evalResult.Value,
+				Message: "Manifest compiled successfully",
+			})
+			return response, nil
+		}
+
+		// Compilation error — feed back to LLM
+		errMsg := evalResult.Ex
+		if evalResult.Err != "" {
+			errMsg += "\n" + evalResult.Err
+		}
+		onFeedback(FeedbackEvent{
+			Type:    "error",
+			Attempt: attempt,
+			Code:    manifest,
+			Output:  errMsg,
+			Message: "Manifest compilation error, requesting fix",
+		})
+
+		if attempt >= maxAttempts {
+			break
+		}
+
+		feedback := fmt.Sprintf("The manifest failed to compile with this error:\n\n```\n%s\n```\n\nPlease fix the manifest and return the corrected EDN.", errMsg)
+		onFeedback(FeedbackEvent{
+			Type:    "fix",
+			Attempt: attempt + 1,
+			Message: "Requesting fix from LLM",
+		})
+
+		response, err = g.ChatStream(ctx, feedback, onChunk)
+		if err != nil {
+			return "", fmt.Errorf("graph agent fix attempt %d: %w", attempt+1, err)
+		}
+	}
+
+	return response, nil
+}
+
+// looksLikeManifest does a quick check to see if text looks like a Mycelium manifest.
+// Requires :id AND at least one of :cells or :pipeline to avoid false positives.
+func looksLikeManifest(s string) bool {
+	return len(s) > 10 && strings.Contains(s, ":id") &&
+		(strings.Contains(s, ":cells") || strings.Contains(s, ":pipeline"))
+}
+
+// getBridge returns the current bridge, or nil if no provider or no bridge.
+func (g *GraphAgent) getBridge() *bridge.Bridge {
+	if g.bridgeProvider == nil {
+		return nil
+	}
+	return g.bridgeProvider()
 }
 
 // History returns the conversation history.

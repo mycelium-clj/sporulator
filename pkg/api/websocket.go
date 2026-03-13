@@ -194,8 +194,12 @@ func (s *Server) handleWSMessage(c *wsClient, msg WSMessage) {
 	switch msg.Type {
 	case "graph_chat":
 		go s.handleGraphChat(c, msg)
+	case "graph_chat_feedback":
+		go s.handleGraphChatFeedback(c, msg)
 	case "cell_implement":
 		go s.handleCellImplement(c, msg)
+	case "cell_implement_feedback":
+		go s.handleCellImplementFeedback(c, msg)
 	case "cell_iterate":
 		go s.handleCellIterate(c, msg)
 	default:
@@ -337,6 +341,144 @@ func (s *Server) handleCellIterate(c *wsClient, msg WSMessage) {
 	c.sendMsg(WSMessage{
 		Type: "cell_result",
 		ID:   payload.SessionID,
+		Payload: map[string]string{
+			"cell_id": result.CellID,
+			"code":    result.Code,
+			"raw":     result.Raw,
+		},
+	})
+}
+
+// --- Feedback loop handlers ---
+
+type graphChatFeedbackPayload struct {
+	SessionID   string `json:"session_id"`
+	Message     string `json:"message"`
+	MaxAttempts int    `json:"max_attempts"`
+}
+
+func (s *Server) handleGraphChatFeedback(c *wsClient, msg WSMessage) {
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		c.sendError("invalid payload")
+		return
+	}
+	var payload graphChatFeedbackPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		c.sendError("invalid graph_chat_feedback payload")
+		return
+	}
+
+	agent := s.manager.GetGraphAgent(payload.SessionID)
+	maxAttempts := payload.MaxAttempts
+	if maxAttempts == 0 {
+		maxAttempts = 3
+	}
+
+	response, err := agent.ChatStreamWithFeedback(c.ctx, payload.Message, maxAttempts,
+		func(chunk string) {
+			c.sendMsg(WSMessage{
+				Type: "stream_chunk",
+				ID:   payload.SessionID,
+				Payload: map[string]string{
+					"chunk": chunk,
+				},
+			})
+		},
+		func(event agents.FeedbackEvent) {
+			c.sendMsg(WSMessage{
+				Type: "feedback_event",
+				ID:   payload.SessionID,
+				Payload: map[string]any{
+					"event_type": event.Type,
+					"attempt":    event.Attempt,
+					"code":       event.Code,
+					"output":     event.Output,
+					"message":    event.Message,
+				},
+			})
+		},
+	)
+
+	if err != nil {
+		c.sendMsg(WSMessage{
+			Type:    "stream_error",
+			ID:      payload.SessionID,
+			Payload: err.Error(),
+		})
+		return
+	}
+
+	c.sendMsg(WSMessage{
+		Type: "stream_end",
+		ID:   payload.SessionID,
+		Payload: map[string]string{
+			"content": response,
+		},
+	})
+}
+
+type cellImplementFeedbackPayload struct {
+	Brief       agents.CellBrief `json:"brief"`
+	MaxAttempts int              `json:"max_attempts"`
+}
+
+func (s *Server) handleCellImplementFeedback(c *wsClient, msg WSMessage) {
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		c.sendError("invalid payload")
+		return
+	}
+	var payload cellImplementFeedbackPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		c.sendError("invalid cell_implement_feedback payload")
+		return
+	}
+
+	cellID := payload.Brief.ID
+	agent := s.manager.NewCellAgent(cellID)
+	maxAttempts := payload.MaxAttempts
+	if maxAttempts == 0 {
+		maxAttempts = 3
+	}
+
+	result, err := agent.ImplementWithFeedback(c.ctx, payload.Brief, maxAttempts,
+		func(chunk string) {
+			c.sendMsg(WSMessage{
+				Type: "stream_chunk",
+				ID:   cellID,
+				Payload: map[string]string{
+					"chunk": chunk,
+				},
+			})
+		},
+		func(event agents.FeedbackEvent) {
+			c.sendMsg(WSMessage{
+				Type: "feedback_event",
+				ID:   cellID,
+				Payload: map[string]any{
+					"event_type": event.Type,
+					"attempt":    event.Attempt,
+					"code":       event.Code,
+					"output":     event.Output,
+					"message":    event.Message,
+				},
+			})
+		},
+	)
+
+	if err != nil {
+		c.sendMsg(WSMessage{
+			Type:    "stream_error",
+			ID:      cellID,
+			Payload: err.Error(),
+		})
+		return
+	}
+
+	c.sendMsg(WSMessage{
+		Type: "cell_result",
+		ID:   cellID,
 		Payload: map[string]string{
 			"cell_id": result.CellID,
 			"code":    result.Code,

@@ -76,7 +76,7 @@ type Client struct {
 
 // Connect establishes a TCP connection to an nREPL server at host:port.
 func Connect(host string, port int) (*Client, error) {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("nrepl connect %s: %w", addr, err)

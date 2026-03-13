@@ -3,6 +3,7 @@ package agents
 import (
 	"sync"
 
+	"github.com/mycelium-clj/sporulator/pkg/bridge"
 	"github.com/mycelium-clj/sporulator/pkg/llm"
 	"github.com/mycelium-clj/sporulator/pkg/store"
 )
@@ -21,6 +22,10 @@ type Config struct {
 	CellPrompt string
 }
 
+// BridgeProvider returns the current bridge. Used by agents to read the
+// bridge at call time rather than caching a snapshot at creation.
+type BridgeProvider func() *bridge.Bridge
+
 // Manager orchestrates graph agents and cell agents.
 type Manager struct {
 	graphClient *llm.Client
@@ -28,6 +33,9 @@ type Manager struct {
 	store       *store.Store
 	graphPrompt string
 	cellPrompt  string
+
+	bridgeMu sync.RWMutex
+	bridge   *bridge.Bridge // nil if no REPL connected
 
 	mu            sync.Mutex
 	graphSessions map[string]*GraphAgent
@@ -56,6 +64,20 @@ func NewManager(cfg Config) *Manager {
 	}
 }
 
+// SetBridge connects or replaces the REPL bridge for agent feedback loops.
+func (m *Manager) SetBridge(b *bridge.Bridge) {
+	m.bridgeMu.Lock()
+	defer m.bridgeMu.Unlock()
+	m.bridge = b
+}
+
+// GetBridge returns the current bridge (thread-safe).
+func (m *Manager) GetBridge() *bridge.Bridge {
+	m.bridgeMu.RLock()
+	defer m.bridgeMu.RUnlock()
+	return m.bridge
+}
+
 // GetGraphAgent returns (or creates) a persistent graph agent session.
 func (m *Manager) GetGraphAgent(sessionID string) *GraphAgent {
 	m.mu.Lock()
@@ -66,9 +88,10 @@ func (m *Manager) GetGraphAgent(sessionID string) *GraphAgent {
 	}
 
 	agent := &GraphAgent{
-		session: llm.NewSession(sessionID, m.graphPrompt),
-		client:  m.graphClient,
-		store:   m.store,
+		session:        llm.NewSession(sessionID, m.graphPrompt),
+		client:         m.graphClient,
+		store:          m.store,
+		bridgeProvider: m.GetBridge,
 	}
 	m.graphSessions[sessionID] = agent
 	return agent
@@ -100,9 +123,10 @@ func (m *Manager) NewCellAgent(cellID string) *CellAgent {
 	defer m.mu.Unlock()
 
 	agent := &CellAgent{
-		session: llm.NewSession(cellID, m.cellPrompt),
-		client:  m.cellClient,
-		store:   m.store,
+		session:        llm.NewSession(cellID, m.cellPrompt),
+		client:         m.cellClient,
+		store:          m.store,
+		bridgeProvider: m.GetBridge,
 	}
 	m.cellSessions[cellID] = agent
 	return agent
@@ -119,9 +143,10 @@ func (m *Manager) GetCellAgent(cellID string) *CellAgent {
 	}
 
 	agent := &CellAgent{
-		session: llm.NewSession(cellID, m.cellPrompt),
-		client:  m.cellClient,
-		store:   m.store,
+		session:        llm.NewSession(cellID, m.cellPrompt),
+		client:         m.cellClient,
+		store:          m.store,
+		bridgeProvider: m.GetBridge,
 	}
 	m.cellSessions[cellID] = agent
 	return agent
