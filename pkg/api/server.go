@@ -199,6 +199,10 @@ func (s *Server) handleSaveCell(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCellHistory(w http.ResponseWriter, r *http.Request) {
 	id := cellID(r)
+	if id == "" {
+		writeError(w, 400, "id parameter is required")
+		return
+	}
 
 	history, err := s.store.GetCellHistory(id)
 	if err != nil {
@@ -213,6 +217,10 @@ func (s *Server) handleCellHistory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCellTests(w http.ResponseWriter, r *http.Request) {
 	id := cellID(r)
+	if id == "" {
+		writeError(w, 400, "id parameter is required")
+		return
+	}
 
 	cell, err := s.store.GetLatestCell(id)
 	if err != nil || cell == nil {

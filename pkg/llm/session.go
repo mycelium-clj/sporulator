@@ -11,6 +11,7 @@ type Session struct {
 	system   string
 	messages []Message
 	mu       sync.Mutex
+	sendMu   sync.Mutex // serializes Send/SendStream to prevent interleaving
 }
 
 // NewSession creates a session with a system prompt.
@@ -38,6 +39,9 @@ func (s *Session) Messages() []Message {
 // Send sends a user message through the client and appends both the user
 // message and the assistant response to the session history.
 func (s *Session) Send(ctx context.Context, client *Client, userMessage string, opts ...RequestOption) (string, error) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
 	s.addMessage("user", userMessage)
 
 	reqOpts := defaultOpts()
@@ -63,6 +67,9 @@ func (s *Session) Send(ctx context.Context, client *Client, userMessage string, 
 // SendStream sends a user message and streams the response token by token.
 // onChunk is called with each content fragment as it arrives.
 func (s *Session) SendStream(ctx context.Context, client *Client, userMessage string, onChunk func(string), opts ...RequestOption) (string, error) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
 	s.addMessage("user", userMessage)
 
 	reqOpts := defaultOpts()
