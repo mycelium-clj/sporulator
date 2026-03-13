@@ -5,6 +5,7 @@ package bridge
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mycelium-clj/sporulator/pkg/repl"
 	"github.com/mycelium-clj/sporulator/pkg/store"
@@ -288,7 +289,17 @@ func unquoteClojure(s string) string {
 }
 
 // Connected returns true if the bridge has an active connection.
+// Times out after 5 seconds to avoid blocking if the nREPL is hung.
 func (b *Bridge) Connected() bool {
-	_, err := b.client.EvalCollect("1", repl.WithSession(b.session))
-	return err == nil
+	done := make(chan bool, 1)
+	go func() {
+		_, err := b.client.EvalCollect("1", repl.WithSession(b.session))
+		done <- (err == nil)
+	}()
+	select {
+	case ok := <-done:
+		return ok
+	case <-time.After(5 * time.Second):
+		return false
+	}
 }

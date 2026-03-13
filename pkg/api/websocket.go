@@ -28,13 +28,16 @@ type Hub struct {
 	broadcast  chan WSMessage
 	register   chan *wsClient
 	unregister chan *wsClient
+	done       chan struct{}
 	mu         sync.RWMutex
 }
 
 type wsClient struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan WSMessage
+	hub    *Hub
+	conn   *websocket.Conn
+	send   chan WSMessage
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewHub creates a new WebSocket hub.
@@ -44,6 +47,7 @@ func NewHub() *Hub {
 		broadcast:  make(chan WSMessage, 64),
 		register:   make(chan *wsClient),
 		unregister: make(chan *wsClient),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -51,6 +55,16 @@ func NewHub() *Hub {
 func (h *Hub) Run() {
 	for {
 		select {
+		case <-h.done:
+			h.mu.Lock()
+			for client := range h.clients {
+				client.cancel()
+				close(client.send)
+				delete(h.clients, client)
+			}
+			h.mu.Unlock()
+			return
+
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
@@ -59,6 +73,7 @@ func (h *Hub) Run() {
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
+				client.cancel()
 				delete(h.clients, client)
 				close(client.send)
 			}
@@ -79,6 +94,7 @@ func (h *Hub) Run() {
 				h.mu.Lock()
 				for _, client := range dead {
 					if _, ok := h.clients[client]; ok {
+						client.cancel()
 						delete(h.clients, client)
 						close(client.send)
 					}
@@ -89,9 +105,17 @@ func (h *Hub) Run() {
 	}
 }
 
+// Stop shuts down the hub, closing all client connections.
+func (h *Hub) Stop() {
+	close(h.done)
+}
+
 // Broadcast sends a message to all connected WebSocket clients.
 func (h *Hub) Broadcast(msg WSMessage) {
-	h.broadcast <- msg
+	select {
+	case h.broadcast <- msg:
+	case <-h.done:
+	}
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -101,10 +125,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	client := &wsClient{
-		hub:  s.hub,
-		conn: conn,
-		send: make(chan WSMessage, 64),
+		hub:    s.hub,
+		conn:   conn,
+		send:   make(chan WSMessage, 64),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	s.hub.register <- client
 
@@ -192,7 +219,7 @@ func (s *Server) handleGraphChat(c *wsClient, msg WSMessage) {
 	}
 
 	agent := s.manager.GetGraphAgent(payload.SessionID)
-	response, err := agent.ChatStream(context.Background(), payload.Message, func(chunk string) {
+	response, err := agent.ChatStream(c.ctx, payload.Message, func(chunk string) {
 		c.sendMsg(WSMessage{
 			Type: "stream_chunk",
 			ID:   payload.SessionID,
@@ -238,7 +265,7 @@ func (s *Server) handleCellImplement(c *wsClient, msg WSMessage) {
 
 	cellID := payload.Brief.ID
 	agent := s.manager.NewCellAgent(cellID)
-	result, err := agent.ImplementStream(context.Background(), payload.Brief, func(chunk string) {
+	result, err := agent.ImplementStream(c.ctx, payload.Brief, func(chunk string) {
 		c.sendMsg(WSMessage{
 			Type: "stream_chunk",
 			ID:   cellID,
@@ -286,7 +313,7 @@ func (s *Server) handleCellIterate(c *wsClient, msg WSMessage) {
 	}
 
 	agent := s.manager.GetCellAgent(payload.SessionID)
-	result, err := agent.IterateStream(context.Background(), payload.Feedback, func(chunk string) {
+	result, err := agent.IterateStream(c.ctx, payload.Feedback, func(chunk string) {
 		c.sendMsg(WSMessage{
 			Type: "stream_chunk",
 			ID:   payload.SessionID,
