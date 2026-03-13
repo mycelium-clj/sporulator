@@ -48,7 +48,7 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		apiKey:     apiKey,
 		model:      model,
-		httpClient: &http.Client{Timeout: 120 * time.Second},
+		httpClient: &http.Client{Timeout: 10 * time.Minute},
 	}
 }
 
@@ -112,10 +112,13 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, err
 }
 
 // streamDelta is a single SSE chunk from a streaming response.
+// Supports both standard OpenAI format and DeepSeek reasoner
+// (which uses reasoning_content for chain-of-thought, then content for final answer).
 type streamDelta struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content          *string `json:"content"`
+			ReasoningContent *string `json:"reasoning_content"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -165,7 +168,13 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 		}
 
 		if len(delta.Choices) > 0 {
-			chunk := delta.Choices[0].Delta.Content
+			d := delta.Choices[0].Delta
+			// Use content if available, otherwise reasoning_content
+			// (DeepSeek reasoner streams reasoning_content first, then content)
+			var chunk string
+			if d.Content != nil && *d.Content != "" {
+				chunk = *d.Content
+			}
 			if chunk != "" {
 				fullContent.WriteString(chunk)
 				if onChunk != nil {

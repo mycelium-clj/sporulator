@@ -175,10 +175,12 @@ func (c *wsClient) readPump(s *Server) {
 }
 
 func (c *wsClient) sendMsg(msg WSMessage) {
+	// recover protects against sending on a closed channel
+	// (client disconnected while a handler goroutine is still running)
+	defer func() { recover() }()
 	select {
 	case c.send <- msg:
 	default:
-		// Buffer full
 	}
 }
 
