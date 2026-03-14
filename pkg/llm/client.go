@@ -37,6 +37,7 @@ type ChatRequest struct {
 // ChatResponse is the result of a non-streaming chat call.
 type ChatResponse struct {
 	Content          string
+	FinishReason     string // "stop", "length", etc.
 	PromptTokens     int
 	CompletionTokens int
 }
@@ -149,6 +150,7 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
 	var promptTokens, completionTokens int
+	var finishReason string
 
 	scanner := bufio.NewScanner(respBody)
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024) // 1MB line buffer for long SSE events
@@ -182,6 +184,10 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 			if d.ReasoningContent != nil && *d.ReasoningContent != "" {
 				fullReasoning.WriteString(*d.ReasoningContent)
 			}
+			// Capture finish reason
+			if delta.Choices[0].FinishReason != nil {
+				finishReason = *delta.Choices[0].FinishReason
+			}
 		}
 
 		if delta.Usage != nil {
@@ -203,6 +209,7 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 
 	return &ChatResponse{
 		Content:          content,
+		FinishReason:     finishReason,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 	}, nil

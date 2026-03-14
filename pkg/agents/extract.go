@@ -50,6 +50,41 @@ func looksLikeClojure(s string) bool {
 		strings.HasPrefix(trimmed, "(require")
 }
 
+// parenDepth returns the unclosed paren depth of Clojure code (0 = balanced).
+func parenDepth(s string) int {
+	depth := 0
+	inString := false
+	escaped := false
+	for _, ch := range s {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+		}
+	}
+	return depth
+}
+
+// IsTruncated returns true if Clojure code appears to be truncated (unbalanced parens).
+func IsTruncated(code string) bool {
+	return parenDepth(code) > 0
+}
+
 // balanceParens appends closing parens to truncated Clojure code.
 func balanceParens(s string) string {
 	depth := 0

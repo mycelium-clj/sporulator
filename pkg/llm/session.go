@@ -132,7 +132,7 @@ type requestOpts struct {
 func defaultOpts() requestOpts {
 	return requestOpts{
 		temperature: 0.3,
-		maxTokens:   4096,
+		maxTokens:   8192,
 	}
 }
 

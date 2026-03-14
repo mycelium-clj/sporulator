@@ -144,7 +144,34 @@ Return the complete manifest in an EDN code block.`, cfg.Spec, cfg.ManifestID)
 
 	manifest := ExtractFirstCodeBlock(response)
 	if manifest == "" || !looksLikeManifest(manifest) {
-		return "", fmt.Errorf("no valid manifest found in response")
+		// Log what we got for debugging
+		preview := response
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		onEvent(OrchestratorEvent{Phase: "manifest", Status: "retry",
+			Message: fmt.Sprintf("No valid manifest extracted (response %d chars, preview: %s), retrying with explicit instruction", len(response), preview)})
+
+		// Retry with more explicit instruction
+		retryPrompt := `Your previous response did not contain a valid Mycelium manifest EDN code block.
+
+Please return ONLY the manifest as an EDN map inside a code block like:
+
+` + "```edn\n{:id :order/placement\n :cells {...}\n :pipeline [...]}\n```" + `
+
+The manifest MUST contain :id, :cells, and either :pipeline or :edges.
+Do NOT include any explanation outside the code block.`
+
+		response, err = agent.ChatStream(ctx, retryPrompt,
+			func(chunk string) { onChunk("graph", chunk) })
+		if err != nil {
+			return "", fmt.Errorf("manifest retry: %w", err)
+		}
+
+		manifest = ExtractFirstCodeBlock(response)
+		if manifest == "" || !looksLikeManifest(manifest) {
+			return "", fmt.Errorf("no valid manifest found in response (retry also failed, response %d chars)", len(response))
+		}
 	}
 
 	// Save manifest
@@ -298,6 +325,7 @@ Return ONLY the complete test namespace code in a single code block. Do NOT impl
 	if testCode == "" {
 		return fmt.Errorf("no code block found in test response for %s", cellID)
 	}
+	testCode = requestContinuation(ctx, agent, testCode, onChunk, cellID+"/test")
 
 	// Write test file
 	if err := writeClojureFile(testFile, testCode); err != nil {
@@ -346,6 +374,7 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 	if implCode == "" {
 		return fmt.Errorf("no code block found in implementation response for %s", cellID)
 	}
+	implCode = requestContinuation(ctx, agent, implCode, onChunk, cellID+"/impl")
 
 	// Write source file
 	if err := writeClojureFile(srcFile, implCode); err != nil {
@@ -473,6 +502,7 @@ Do NOT include any explanation outside the code block.`, testOutput, testCode)
 			// No code block found — keep previous version and continue to next attempt
 			continue
 		}
+		extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/fix")
 		implCode = extracted
 		if err := writeClojureFile(srcFile, implCode); err != nil {
 			return fmt.Errorf("write fixed source %s: %w", srcFile, err)
@@ -533,6 +563,7 @@ The code must start with (ns ...) and contain a (cell/defcell ...) form.`, errMs
 	if fixed == "" {
 		return code, fmt.Errorf("no code block in fix response")
 	}
+	fixed = requestContinuation(ctx, agent, fixed, onChunk, cellID+"/fix")
 
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
@@ -581,6 +612,7 @@ The code must start with (ns ...) and contain deftest forms.`, errMsg, code)
 	if fixed == "" {
 		return code, fmt.Errorf("no code block in test fix response")
 	}
+	fixed = requestContinuation(ctx, agent, fixed, onChunk, cellID+"/test-fix")
 
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
@@ -813,6 +845,32 @@ func lintClojureFile(path string) string {
 		}
 	}
 	return ""
+}
+
+// requestContinuation detects if extracted code is truncated (unbalanced parens)
+// and requests the LLM to continue generating the rest of the code.
+// Returns the complete code or the original if it was already complete.
+func requestContinuation(ctx context.Context, agent *CellAgent, code string, onChunk func(string, string), chunkID string) string {
+	if !IsTruncated(code) {
+		return code
+	}
+
+	continuePrompt := `Your previous response was truncated — the code has unbalanced parentheses.
+Continue EXACTLY from where you left off. Output ONLY the remaining code (no explanation, no code fences, no repeated code).
+Start from the exact point the previous response ended.`
+
+	contResponse, err := agent.session.SendStream(ctx, agent.client, continuePrompt,
+		func(chunk string) { onChunk(chunkID, chunk) })
+	if err != nil {
+		return balanceParens(code) // fallback: force-balance
+	}
+
+	// Strip any fence markers from the continuation
+	cont := stripFenceMarkers(strings.TrimSpace(contResponse))
+	combined := code + "\n" + cont
+
+	// If still unbalanced, force-balance
+	return balanceParens(combined)
 }
 
 // extractCellNamesRegex is a fallback that extracts cell step names from manifest
