@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -66,7 +67,18 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 
 	cellNames, err := o.extractCellNames(br, manifest)
 	if err != nil {
-		return fmt.Errorf("extract cells: %w", err)
+		onEvent(OrchestratorEvent{Phase: "cells", Status: "error",
+			Message: fmt.Sprintf("REPL extraction failed: %v, trying regex fallback", err)})
+		cellNames = extractCellNamesRegex(manifest)
+	}
+
+	if len(cellNames) == 0 {
+		// Last resort: try regex extraction
+		cellNames = extractCellNamesRegex(manifest)
+	}
+
+	if len(cellNames) == 0 {
+		return fmt.Errorf("no cells found in manifest")
 	}
 
 	onEvent(OrchestratorEvent{Phase: "cells", Status: "extracted",
@@ -129,13 +141,17 @@ Return the complete manifest in an EDN code block.`, cfg.Spec, cfg.ManifestID)
 		return "", err
 	}
 
+	manifest := ExtractFirstCodeBlock(response)
+	if manifest == "" || !looksLikeManifest(manifest) {
+		return "", fmt.Errorf("no valid manifest found in response")
+	}
+
 	// Save manifest
 	version, err := agent.SaveManifest(cfg.ManifestID, response, "graph-agent")
 	if err != nil {
 		return "", fmt.Errorf("save manifest: %w", err)
 	}
 
-	manifest := ExtractFirstCodeBlock(response)
 	onEvent(OrchestratorEvent{Phase: "manifest", Status: "saved",
 		Message: fmt.Sprintf("Manifest saved v%d", version)})
 
@@ -676,4 +692,54 @@ func writeClojureFile(path, content string) error {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	return os.WriteFile(path, []byte(content), 0644)
+}
+
+// extractCellNamesRegex is a fallback that extracts cell step names from manifest
+// text using regex, when REPL-based extraction fails.
+// Looks for patterns like `:step-name {:id :namespace/cell-id` in the :cells map.
+var cellStepRe = regexp.MustCompile(`:cells\s*\{([\s\S]*?)\n\s*\}`)
+var cellKeyRe = regexp.MustCompile(`:(\w[\w-]*)\s*\{`)
+
+func extractCellNamesRegex(manifest string) []string {
+	// Find the :cells map
+	cellsMatch := cellStepRe.FindStringSubmatch(manifest)
+	if len(cellsMatch) < 2 {
+		// Try simpler: just find all :xxx {:id patterns
+		return extractCellNamesSimple(manifest)
+	}
+
+	cellsBody := cellsMatch[1]
+	matches := cellKeyRe.FindAllStringSubmatch(cellsBody, -1)
+	var names []string
+	seen := map[string]bool{}
+	for _, m := range matches {
+		name := m[1]
+		// Skip known non-step keys
+		if name == "id" || name == "doc" || name == "schema" || name == "on-error" || name == "requires" ||
+			name == "input" || name == "output" {
+			continue
+		}
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// extractCellNamesSimple finds step names by looking for `:step-name {:id :namespace/` patterns.
+var cellIDRe = regexp.MustCompile(`:(\w[\w-]*)\s*\{\s*:id\s+:`)
+
+func extractCellNamesSimple(manifest string) []string {
+	matches := cellIDRe.FindAllStringSubmatch(manifest, -1)
+	var names []string
+	seen := map[string]bool{}
+	for _, m := range matches {
+		name := m[1]
+		if name != "cells" && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names
 }
