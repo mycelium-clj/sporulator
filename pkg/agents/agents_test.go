@@ -40,10 +40,20 @@ func TestExtractCodeBlocksBare(t *testing.T) {
 }
 
 func TestExtractFirstCodeBlockFallback(t *testing.T) {
+	// Non-code text should return empty string, not the raw text
 	response := "Just some text with no code blocks"
 	result := agents.ExtractFirstCodeBlock(response)
-	if result != "Just some text with no code blocks" {
-		t.Errorf("expected trimmed response, got %q", result)
+	if result != "" {
+		t.Errorf("expected empty for non-code text, got %q", result)
+	}
+}
+
+func TestExtractFirstCodeBlockFallback_BareClojure(t *testing.T) {
+	// Bare Clojure code without fences should still be returned
+	response := "(ns my.ns)\n(def x 1)"
+	result := agents.ExtractFirstCodeBlock(response)
+	if result != response {
+		t.Errorf("expected bare Clojure, got %q", result)
 	}
 }
 

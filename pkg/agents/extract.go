@@ -21,15 +21,66 @@ func ExtractCodeBlocks(response string) []string {
 	return blocks
 }
 
-// ExtractFirstCodeBlock returns the first fenced code block, or the full
-// response (trimmed) if no code block is found.
+// ExtractFirstCodeBlock returns the first fenced code block from a response.
+// Falls back to stripFenceMarkers only if the result looks like Clojure code.
+// Returns empty string if no valid code block is found.
 func ExtractFirstCodeBlock(response string) string {
 	blocks := ExtractCodeBlocks(response)
 	if len(blocks) > 0 {
 		return blocks[0]
 	}
-	// Fallback: strip any leading/trailing fence markers the regex missed
-	return stripFenceMarkers(strings.TrimSpace(response))
+	// Fallback: try stripping fence markers (handles malformed fences)
+	stripped := stripFenceMarkers(strings.TrimSpace(response))
+	if looksLikeClojure(stripped) {
+		return stripped
+	}
+	// Last resort: scan for (ns ...) or (cell/defcell ...) form in raw text
+	if idx := strings.Index(response, "(ns "); idx >= 0 {
+		return balanceParens(response[idx:])
+	}
+	return ""
+}
+
+// looksLikeClojure checks if text starts with a Clojure form.
+func looksLikeClojure(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	return strings.HasPrefix(trimmed, "(ns ") ||
+		strings.HasPrefix(trimmed, "(def") ||
+		strings.HasPrefix(trimmed, "(cell/") ||
+		strings.HasPrefix(trimmed, "(require")
+}
+
+// balanceParens appends closing parens to truncated Clojure code.
+func balanceParens(s string) string {
+	depth := 0
+	inString := false
+	escaped := false
+	for _, ch := range s {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+		}
+	}
+	if depth > 0 {
+		return s + strings.Repeat(")", depth)
+	}
+	return s
 }
 
 // stripFenceMarkers removes markdown code fence markers from the start and end.

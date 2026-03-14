@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -294,10 +295,27 @@ Return ONLY the complete test namespace code in a single code block. Do NOT impl
 	}
 
 	testCode := ExtractFirstCodeBlock(testResponse)
+	if testCode == "" {
+		return fmt.Errorf("no code block found in test response for %s", cellID)
+	}
 
 	// Write test file
 	if err := writeClojureFile(testFile, testCode); err != nil {
 		return fmt.Errorf("write test file %s: %w", testFile, err)
+	}
+
+	// Lint test file with clj-kondo
+	if lintErrors := lintClojureFile(testFile); lintErrors != "" {
+		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "lint_error",
+			Message: fmt.Sprintf("Test lint errors: %s", lintErrors)})
+		lintResult := &bridge.EvalResult{Ex: "clj-kondo lint errors", Err: lintErrors}
+		fixResult, fixErr := o.fixTestCode(ctx, agent, cellID, testCode, lintResult, testFile, br, session, onChunk)
+		if fixErr != nil {
+			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
+				Message: fmt.Sprintf("Could not fix test lint errors: %v", fixErr)})
+		} else {
+			testCode = fixResult
+		}
 	}
 
 	onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "written",
@@ -325,10 +343,28 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 	}
 
 	implCode := ExtractFirstCodeBlock(implResponse)
+	if implCode == "" {
+		return fmt.Errorf("no code block found in implementation response for %s", cellID)
+	}
 
 	// Write source file
 	if err := writeClojureFile(srcFile, implCode); err != nil {
 		return fmt.Errorf("write source file %s: %w", srcFile, err)
+	}
+
+	// Lint with clj-kondo before loading in REPL
+	if lintErrors := lintClojureFile(srcFile); lintErrors != "" {
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "lint_error",
+			Message: fmt.Sprintf("Lint errors: %s", lintErrors)})
+		// Feed lint errors to LLM for fix before even trying REPL
+		lintResult := &bridge.EvalResult{Ex: "clj-kondo lint errors", Err: lintErrors}
+		fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, lintResult, srcFile, br, session, onChunk)
+		if fixErr != nil {
+			onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
+				Message: fmt.Sprintf("Could not fix lint errors: %v", fixErr)})
+		} else {
+			implCode = fixResult
+		}
 	}
 
 	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "written",
@@ -414,7 +450,17 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "fixing",
 			Message: "Tests failed, asking for fix..."})
 
-		fixPrompt := fmt.Sprintf("The tests are failing. Test output:\n\n```\n%s\n```\n\nHere are the tests for reference:\n\n```clojure\n%s\n```\n\nFix the cell implementation to pass all tests. Return the complete updated source namespace in a code block.", testOutput, testCode)
+		fixPrompt := fmt.Sprintf(`The tests are failing. Test output:
+
+`+"```\n%s\n```"+`
+
+Here are the tests for reference:
+
+`+"```clojure\n%s\n```"+`
+
+Fix the cell implementation to pass all tests.
+Return the COMPLETE updated source namespace in a single code block.
+Do NOT include any explanation outside the code block.`, testOutput, testCode)
 
 		fixResponse, fixErr := agent.session.SendStream(ctx, agent.client, fixPrompt,
 			func(chunk string) { onChunk(cellID+"/fix", chunk) })
@@ -422,7 +468,12 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 			return fmt.Errorf("fix iteration %d for %s: %w", attempt, cellID, fixErr)
 		}
 
-		implCode = ExtractFirstCodeBlock(fixResponse)
+		extracted := ExtractFirstCodeBlock(fixResponse)
+		if extracted == "" {
+			// No code block found — keep previous version and continue to next attempt
+			continue
+		}
+		implCode = extracted
 		if err := writeClojureFile(srcFile, implCode); err != nil {
 			return fmt.Errorf("write fixed source %s: %w", srcFile, err)
 		}
@@ -460,7 +511,17 @@ func (o *Orchestrator) fixCellCode(ctx context.Context, agent *CellAgent, cellID
 		errMsg += "\n" + evalResult.Err
 	}
 
-	fixPrompt := fmt.Sprintf("The implementation had a compilation error:\n\n```\n%s\n```\n\nHere is the code that failed:\n\n```clojure\n%s\n```\n\nFix the issue and return the complete corrected namespace in a code block.", errMsg, code)
+	fixPrompt := fmt.Sprintf(`The implementation had a compilation error:
+
+%s
+
+Here is the code that failed:
+
+`+"```clojure\n%s\n```"+`
+
+Fix the issue and return the COMPLETE corrected namespace in a single code block.
+Do NOT include any explanation outside the code block.
+The code must start with (ns ...) and contain a (cell/defcell ...) form.`, errMsg, code)
 
 	fixResponse, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 		func(chunk string) { onChunk(cellID+"/fix", chunk) })
@@ -469,6 +530,10 @@ func (o *Orchestrator) fixCellCode(ctx context.Context, agent *CellAgent, cellID
 	}
 
 	fixed := ExtractFirstCodeBlock(fixResponse)
+	if fixed == "" {
+		return code, fmt.Errorf("no code block in fix response")
+	}
+
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
 	}
@@ -494,7 +559,17 @@ func (o *Orchestrator) fixTestCode(ctx context.Context, agent *CellAgent, cellID
 		errMsg += "\n" + evalResult.Err
 	}
 
-	fixPrompt := fmt.Sprintf("The test file had a compilation error:\n\n```\n%s\n```\n\nHere is the test code that failed:\n\n```clojure\n%s\n```\n\nFix the test file and return the complete corrected test namespace in a code block.", errMsg, code)
+	fixPrompt := fmt.Sprintf(`The test file had a compilation error:
+
+%s
+
+Here is the test code that failed:
+
+`+"```clojure\n%s\n```"+`
+
+Fix the test file and return the COMPLETE corrected test namespace in a single code block.
+Do NOT include any explanation outside the code block.
+The code must start with (ns ...) and contain deftest forms.`, errMsg, code)
 
 	fixResponse, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 		func(chunk string) { onChunk(cellID+"/test-fix", chunk) })
@@ -503,6 +578,10 @@ func (o *Orchestrator) fixTestCode(ctx context.Context, agent *CellAgent, cellID
 	}
 
 	fixed := ExtractFirstCodeBlock(fixResponse)
+	if fixed == "" {
+		return code, fmt.Errorf("no code block in test fix response")
+	}
+
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
 	}
@@ -708,6 +787,32 @@ func writeClojureFile(path, content string) error {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	return os.WriteFile(path, []byte(content), 0644)
+}
+
+// lintClojureFile runs clj-kondo on a file and returns any errors.
+// Returns empty string if the file is clean, or the error output otherwise.
+// If clj-kondo is not available, returns empty string (lint is best-effort).
+func lintClojureFile(path string) string {
+	cmd := exec.Command("clj-kondo", "--lint", path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Exit code != 0 means lint errors found
+		result := string(output)
+		// Filter to only error-level diagnostics (skip warnings and info lines)
+		var errors []string
+		for _, line := range strings.Split(result, "\n") {
+			if strings.Contains(line, ": error:") {
+				// Skip namespace-name-mismatch since we use load-file, not require
+				if !strings.Contains(line, "Namespace name does not match file name") {
+					errors = append(errors, line)
+				}
+			}
+		}
+		if len(errors) > 0 {
+			return strings.Join(errors, "\n")
+		}
+	}
+	return ""
 }
 
 // extractCellNamesRegex is a fallback that extracts cell step names from manifest
