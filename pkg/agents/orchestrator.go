@@ -325,8 +325,8 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "written",
 		Message: fmt.Sprintf("Source file written: %s", srcFile)})
 
-	// Eval implementation in REPL
-	evalResult, err := br.Eval(implCode)
+	// Load implementation in REPL via load-file (avoids classpath dependency)
+	evalResult, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, srcFile))
 	if err != nil {
 		return fmt.Errorf("eval implementation %s: %w", cellID, err)
 	}
@@ -343,8 +343,8 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 		implCode = fixResult
 	}
 
-	// Eval test file in REPL
-	testEvalResult, err := br.Eval(testCode)
+	// Load test file in REPL
+	testEvalResult, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, testFile))
 	if err != nil {
 		return fmt.Errorf("eval test %s: %w", cellID, err)
 	}
@@ -365,7 +365,7 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "running",
 			Message: fmt.Sprintf("Running tests (attempt %d/%d)", attempt, maxAttempts)})
 
-		testOutput, testErr := runTests(br, cellNs, testNs)
+		testOutput, testErr := runTests(br, srcFile, testFile, testNs)
 		if testErr != nil {
 			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
 				Message: fmt.Sprintf("Test run error: %v", testErr)})
@@ -415,7 +415,7 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 			return fmt.Errorf("write fixed source %s: %w", srcFile, err)
 		}
 
-		evalResult, err := br.Eval(implCode)
+		evalResult, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, srcFile))
 		if err != nil {
 			return fmt.Errorf("eval fixed implementation %s: %w", cellID, err)
 		}
@@ -461,7 +461,7 @@ func (o *Orchestrator) fixCellCode(ctx context.Context, agent *CellAgent, cellID
 		return "", err
 	}
 
-	result, err := br.Eval(fixed)
+	result, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, filePath))
 	if err != nil {
 		return "", err
 	}
@@ -495,7 +495,7 @@ func (o *Orchestrator) fixTestCode(ctx context.Context, agent *CellAgent, cellID
 		return "", err
 	}
 
-	result, err := br.Eval(fixed)
+	result, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, filePath))
 	if err != nil {
 		return "", err
 	}
@@ -650,11 +650,11 @@ func parseCellSpec(output, stepName string) CellBrief {
 }
 
 // runTests runs clojure.test tests for a namespace in the REPL.
-// Reloads both the cell namespace (to pick up fixes) and the test namespace.
-func runTests(br *bridge.Bridge, cellNs, testNs string) (string, error) {
-	code := fmt.Sprintf(`(require '%s :reload)
-(require '%s :reload)
-(with-out-str (clojure.test/run-tests '%s))`, cellNs, testNs, testNs)
+// Uses load-file with absolute paths to avoid classpath dependency.
+func runTests(br *bridge.Bridge, cellFile, testFile, testNs string) (string, error) {
+	code := fmt.Sprintf(`(load-file "%s")
+(load-file "%s")
+(with-out-str (clojure.test/run-tests '%s))`, cellFile, testFile, testNs)
 
 	result, err := br.Eval(code)
 	if err != nil {
