@@ -197,6 +197,7 @@ func (o *Orchestrator) extractCellSpec(br *bridge.Bridge, manifest, stepName str
 }
 
 // implementCellsParallel runs TDD implementation for all cells concurrently.
+// Each cell gets its own nREPL session for isolation.
 func (o *Orchestrator) implementCellsParallel(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
 	manifest string, cellNames []string,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) []error {
@@ -208,7 +209,14 @@ func (o *Orchestrator) implementCellsParallel(ctx context.Context, cfg ProjectCo
 		wg.Add(1)
 		go func(idx int, cellName string) {
 			defer wg.Done()
-			errors[idx] = o.implementCellWithTDD(ctx, cfg, br, manifest, cellName, onChunk, onEvent)
+			// Create an isolated nREPL session for this cell agent
+			session, err := br.CloneSession()
+			if err != nil {
+				errors[idx] = fmt.Errorf("clone session for %s: %w", cellName, err)
+				return
+			}
+			defer br.CloseSession(session)
+			errors[idx] = o.implementCellWithTDD(ctx, cfg, br, session, manifest, cellName, onChunk, onEvent)
 		}(i, name)
 	}
 
@@ -222,11 +230,12 @@ func (o *Orchestrator) implementCellsParallel(ctx context.Context, cfg ProjectCo
 // 3. Ask cell agent to implement the cell
 // 4. Write source file, eval in REPL
 // 5. Run tests, iterate on failures
+// Each cell gets its own nREPL session for isolation.
 func (o *Orchestrator) implementCellWithTDD(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
-	manifest, stepName string,
+	session, manifest, stepName string,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
 
-	// Get the cell spec from the manifest
+	// Get the cell spec from the manifest (use main bridge session for manifest parsing)
 	brief, err := o.extractCellSpec(br, manifest, stepName)
 	if err != nil {
 		return fmt.Errorf("extract spec for %s: %w", stepName, err)
@@ -325,8 +334,10 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "written",
 		Message: fmt.Sprintf("Source file written: %s", srcFile)})
 
-	// Load implementation in REPL via load-file (avoids classpath dependency)
-	evalResult, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, srcFile))
+	// Load implementation in REPL via load-file in this cell's session
+	// Remove existing ns first to clear stale definitions from previous runs
+	br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, cellNs, cellNs))
+	evalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
 	if err != nil {
 		return fmt.Errorf("eval implementation %s: %w", cellID, err)
 	}
@@ -336,15 +347,16 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
 			Message: fmt.Sprintf("Compilation error: %s", evalResult.Ex)})
 
-		fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, evalResult, srcFile, br, onChunk)
+		fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, evalResult, srcFile, br, session, onChunk)
 		if fixErr != nil {
 			return fmt.Errorf("fix implementation %s: %w", cellID, fixErr)
 		}
 		implCode = fixResult
 	}
 
-	// Load test file in REPL
-	testEvalResult, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, testFile))
+	// Load test file in REPL — remove stale ns first
+	br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, testNs, testNs))
+	testEvalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, testFile))
 	if err != nil {
 		return fmt.Errorf("eval test %s: %w", cellID, err)
 	}
@@ -352,7 +364,7 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
 			Message: fmt.Sprintf("Test compilation error: %s", testEvalResult.Ex)})
 
-		fixResult, fixErr := o.fixTestCode(ctx, agent, cellID, testCode, testEvalResult, testFile, br, onChunk)
+		fixResult, fixErr := o.fixTestCode(ctx, agent, cellID, testCode, testEvalResult, testFile, br, session, onChunk)
 		if fixErr != nil {
 			return fmt.Errorf("fix tests %s: %w", cellID, fixErr)
 		}
@@ -365,7 +377,7 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "running",
 			Message: fmt.Sprintf("Running tests (attempt %d/%d)", attempt, maxAttempts)})
 
-		testOutput, testErr := runTests(br, srcFile, testFile, testNs)
+		testOutput, testErr := runTestsInSession(br, session, srcFile, testFile, cellNs, testNs)
 		if testErr != nil {
 			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
 				Message: fmt.Sprintf("Test run error: %v", testErr)})
@@ -415,7 +427,7 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 			return fmt.Errorf("write fixed source %s: %w", srcFile, err)
 		}
 
-		evalResult, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, srcFile))
+		evalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
 		if err != nil {
 			return fmt.Errorf("eval fixed implementation %s: %w", cellID, err)
 		}
@@ -424,7 +436,7 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 			onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
 				Message: fmt.Sprintf("Fix compilation error: %s", evalResult.Ex)})
 
-			fixResult, compFixErr := o.fixCellCode(ctx, agent, cellID, implCode, evalResult, srcFile, br, onChunk)
+			fixResult, compFixErr := o.fixCellCode(ctx, agent, cellID, implCode, evalResult, srcFile, br, session, onChunk)
 			if compFixErr != nil {
 				onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
 					Message: fmt.Sprintf("Could not fix compilation: %v", compFixErr)})
@@ -440,7 +452,7 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 
 // fixCellCode asks the cell agent to fix a compilation error and retries eval.
 func (o *Orchestrator) fixCellCode(ctx context.Context, agent *CellAgent, cellID, code string,
-	evalResult *bridge.EvalResult, filePath string, br *bridge.Bridge,
+	evalResult *bridge.EvalResult, filePath string, br *bridge.Bridge, session string,
 	onChunk func(string, string)) (string, error) {
 
 	errMsg := evalResult.Ex
@@ -461,7 +473,7 @@ func (o *Orchestrator) fixCellCode(ctx context.Context, agent *CellAgent, cellID
 		return "", err
 	}
 
-	result, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, filePath))
+	result, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, filePath))
 	if err != nil {
 		return "", err
 	}
@@ -474,7 +486,7 @@ func (o *Orchestrator) fixCellCode(ctx context.Context, agent *CellAgent, cellID
 
 // fixTestCode asks the cell agent to fix a test compilation error.
 func (o *Orchestrator) fixTestCode(ctx context.Context, agent *CellAgent, cellID, code string,
-	evalResult *bridge.EvalResult, filePath string, br *bridge.Bridge,
+	evalResult *bridge.EvalResult, filePath string, br *bridge.Bridge, session string,
 	onChunk func(string, string)) (string, error) {
 
 	errMsg := evalResult.Ex
@@ -495,7 +507,7 @@ func (o *Orchestrator) fixTestCode(ctx context.Context, agent *CellAgent, cellID
 		return "", err
 	}
 
-	result, err := br.Eval(fmt.Sprintf(`(load-file "%s")`, filePath))
+	result, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, filePath))
 	if err != nil {
 		return "", err
 	}
@@ -649,14 +661,18 @@ func parseCellSpec(output, stepName string) CellBrief {
 	return brief
 }
 
-// runTests runs clojure.test tests for a namespace in the REPL.
+// runTestsInSession runs clojure.test tests in a specific nREPL session.
 // Uses load-file with absolute paths to avoid classpath dependency.
-func runTests(br *bridge.Bridge, cellFile, testFile, testNs string) (string, error) {
-	code := fmt.Sprintf(`(load-file "%s")
+// Removes namespaces before reloading to clear stale test/fn definitions
+// from previous fix iterations.
+func runTestsInSession(br *bridge.Bridge, session, cellFile, testFile, cellNs, testNs string) (string, error) {
+	code := fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))
+(when (find-ns '%s) (remove-ns '%s))
 (load-file "%s")
-(with-out-str (clojure.test/run-tests '%s))`, cellFile, testFile, testNs)
+(load-file "%s")
+(with-out-str (clojure.test/run-tests '%s))`, cellNs, cellNs, testNs, testNs, cellFile, testFile, testNs)
 
-	result, err := br.Eval(code)
+	result, err := br.EvalInSession(session, code)
 	if err != nil {
 		return "", err
 	}

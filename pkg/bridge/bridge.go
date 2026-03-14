@@ -106,6 +106,36 @@ func (b *Bridge) EvalInNs(ns, code string) (*EvalResult, error) {
 	}, nil
 }
 
+// CloneSession creates a new nREPL session cloned from the bridge's main session.
+// The new session inherits loaded requires (e.g. mycelium.cell).
+// Caller must call CloseSession when done.
+func (b *Bridge) CloneSession() (string, error) {
+	session, err := b.client.Clone(b.session)
+	if err != nil {
+		return "", fmt.Errorf("bridge clone session: %w", err)
+	}
+	return session, nil
+}
+
+// CloseSession closes a previously cloned session.
+func (b *Bridge) CloseSession(session string) {
+	b.client.CloseSession(session)
+}
+
+// EvalInSession evaluates code in a specific nREPL session.
+func (b *Bridge) EvalInSession(session, code string) (*EvalResult, error) {
+	result, err := b.client.EvalCollect(code, repl.WithSession(session))
+	if err != nil {
+		return nil, fmt.Errorf("bridge eval: %w", err)
+	}
+	return &EvalResult{
+		Value: result.Value,
+		Out:   result.Out,
+		Err:   result.Err,
+		Ex:    result.Ex,
+	}, nil
+}
+
 // InstantiateCell evaluates a defcell form in the REPL, registering the cell.
 func (b *Bridge) InstantiateCell(defcellCode string) (*EvalResult, error) {
 	return b.Eval(defcellCode)
