@@ -147,9 +147,11 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 	defer respBody.Close()
 
 	var fullContent strings.Builder
+	var fullReasoning strings.Builder
 	var promptTokens, completionTokens int
 
 	scanner := bufio.NewScanner(respBody)
+	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024) // 1MB line buffer for long SSE events
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -169,17 +171,16 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 
 		if len(delta.Choices) > 0 {
 			d := delta.Choices[0].Delta
-			// Use content if available, otherwise reasoning_content
-			// (DeepSeek reasoner streams reasoning_content first, then content)
-			var chunk string
+			// Capture content (the final answer)
 			if d.Content != nil && *d.Content != "" {
-				chunk = *d.Content
-			}
-			if chunk != "" {
-				fullContent.WriteString(chunk)
+				fullContent.WriteString(*d.Content)
 				if onChunk != nil {
-					onChunk(chunk)
+					onChunk(*d.Content)
 				}
+			}
+			// Also capture reasoning_content (DeepSeek reasoner's chain-of-thought)
+			if d.ReasoningContent != nil && *d.ReasoningContent != "" {
+				fullReasoning.WriteString(*d.ReasoningContent)
 			}
 		}
 
@@ -193,8 +194,15 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 		return nil, fmt.Errorf("llm stream read: %w", err)
 	}
 
+	// If content is empty but reasoning has data, use reasoning as fallback
+	// (DeepSeek reasoner sometimes puts the answer in reasoning_content)
+	content := fullContent.String()
+	if content == "" && fullReasoning.Len() > 0 {
+		content = fullReasoning.String()
+	}
+
 	return &ChatResponse{
-		Content:          fullContent.String(),
+		Content:          content,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 	}, nil
