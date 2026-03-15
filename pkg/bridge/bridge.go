@@ -279,7 +279,7 @@ func (b *Bridge) ValidateSchema(schema, data string) (*EvalResult, error) {
 // Does NOT require cells to be registered — use this during manifest design.
 func (b *Bridge) ValidateManifestEDN(manifestEDN string) (*EvalResult, error) {
 	code := fmt.Sprintf(
-		`(let [m (read-string %q)]
+		`(let [m %s]
 		   (cond
 		     (not (map? m))
 		       (throw (ex-info "Manifest must be a map" {}))
@@ -289,6 +289,10 @@ func (b *Bridge) ValidateManifestEDN(manifestEDN string) (*EvalResult, error) {
 		       (throw (ex-info "Manifest must have :cells" {}))
 		     (not (or (:pipeline m) (:edges m)))
 		       (throw (ex-info "Manifest must have :pipeline or :edges" {}))
+		     (not (:start (:cells m)))
+		       (throw (ex-info "First cell must have key :start" {}))
+		     (and (:edges m) (not (:dispatches m)))
+		       (throw (ex-info "Manifest with :edges must also have :dispatches" {}))
 		     :else
 		       (pr-str {:id (:id m) :cell-count (count (:cells m))})))`,
 		manifestEDN)

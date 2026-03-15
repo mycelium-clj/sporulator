@@ -117,6 +117,13 @@ func (o *Orchestrator) designManifest(ctx context.Context, cfg ProjectConfig, br
 
 	agent := o.manager.GetGraphAgent(cfg.ManifestID)
 
+	// Build the namespace prefix for cell IDs from the manifest ID
+	// e.g. ":order/placement" → "order"
+	nsPrefix := strings.TrimPrefix(cfg.ManifestID, ":")
+	if idx := strings.Index(nsPrefix, "/"); idx >= 0 {
+		nsPrefix = nsPrefix[:idx]
+	}
+
 	prompt := fmt.Sprintf(`Design a Mycelium workflow manifest based on this specification.
 
 <spec>
@@ -125,20 +132,48 @@ func (o *Orchestrator) designManifest(ctx context.Context, cfg ProjectConfig, br
 
 Requirements:
 - Manifest ID: %s
-- Use :pipeline for linear flows, or :edges/:dispatches for branching
-- Each cell must have a clear :doc describing its business logic
-- Each cell must have a :schema with input/output contracts
-- Declare :requires for any resources cells need (e.g. :catalog, :inventory, :tax-rates, :coupons)
-- Keep cell IDs namespaced (e.g. :order/validate-items, :order/compute-tax)
+- Each cell must have :id (namespaced keyword like :%s/cell-name), :doc, and :schema with :input/:output
+- Declare :requires for any resources cells need (e.g. :catalog, :inventory)
 
-**IMPORTANT: Decomposition Guidelines**
+**CRITICAL: Manifest Structure Rules**
+The manifest MUST follow this exact structure:
+
+1. The FIRST cell in :cells MUST have the key :start — the workflow engine begins BFS from :start
+2. All other cell keys are short unqualified keywords (e.g. :compute-tax, :check-fraud)
+3. Each edge MUST use a map with dispatch keys, even for unconditional transitions: {:done :next-cell}
+4. Every cell that appears as a source in :edges MUST have a matching entry in :dispatches
+5. Unconditional dispatches use: [[:done (constantly true)]]
+6. Conditional dispatches use predicate functions: [[:approved (fn [data] ...)] [:rejected (fn [data] ...)]]
+7. The terminal state keyword is :end
+
+Example structure:
+`+"```edn"+`
+{:id :example/workflow
+ :cells
+ {:start       {:id :%s/validate :doc "Validate input" :schema {:input [:map] :output [:map]}}
+  :process     {:id :%s/process :doc "Process data" :schema {:input [:map] :output [:map]}}
+  :check       {:id :%s/check :doc "Check result" :schema {:input [:map] :output {:ok [:map] :fail [:map]}}}
+  :finalize    {:id :%s/finalize :doc "Finalize" :schema {:input [:map] :output [:map]}}}
+ :edges
+ {:start    {:done :process}
+  :process  {:done :check}
+  :check    {:ok :finalize :fail :end}
+  :finalize {:done :end}}
+ :dispatches
+ {:start    [[:done (constantly true)]]
+  :process  [[:done (constantly true)]]
+  :check    [[:ok (fn [data] (:valid? data))] [:fail (fn [data] (not (:valid? data)))]]
+  :finalize [[:done (constantly true)]]}}
+`+"```"+`
+
+**Decomposition Guidelines**
 - Break complex logic into multiple small, focused cells. Each cell should do ONE thing.
 - A cell implementation must fit in ~80 lines of Clojure. If the logic would be longer, split it into multiple cells.
-- When a spec describes a multi-step process (e.g. apply rules A, B, C in sequence), create a separate cell for EACH step rather than one monolithic cell.
-- Each cell should receive the running state and apply one transformation, passing results to the next cell in the pipeline.
+- When a spec describes a multi-step process, create a separate cell for EACH step.
 - Keep schemas simple — prefer flat maps over deeply nested structures.
 
-Return the complete manifest in an EDN code block.`, cfg.Spec, cfg.ManifestID)
+Return the complete manifest in an EDN code block.`, cfg.Spec, cfg.ManifestID,
+		nsPrefix, nsPrefix, nsPrefix, nsPrefix, nsPrefix)
 
 	response, err := agent.ChatStreamWithFeedback(ctx, prompt, 3,
 		func(chunk string) { onChunk("graph", chunk) },
@@ -164,9 +199,10 @@ Return the complete manifest in an EDN code block.`, cfg.Spec, cfg.ManifestID)
 
 Please return ONLY the manifest as an EDN map inside a code block like:
 
-` + "```edn\n{:id :order/placement\n :cells {...}\n :pipeline [...]}\n```" + `
+` + "```edn\n{:id :order/placement\n :cells {:start {...} ...}\n :edges {:start {:done :next} ...}\n :dispatches {:start [[:done (constantly true)]] ...}}\n```" + `
 
-The manifest MUST contain :id, :cells, and either :pipeline or :edges.
+The manifest MUST contain :id, :cells, :edges, and :dispatches.
+The first cell key MUST be :start.
 Do NOT include any explanation outside the code block.`
 
 		response, err = agent.ChatStream(ctx, retryPrompt,
@@ -317,6 +353,8 @@ The test file should:
 - Test the cell handler by calling: (let [handler (:handler (cell/get-cell! %s))] (handler resources data))
 - Include edge cases and boundary conditions
 - Set up realistic test data (resources, input maps) based on the spec
+- If you need a helper function (e.g. for approximate equality), define it in the test namespace — do NOT use undefined symbols
+- Use only clojure.test/is, clojure.test/deftest, clojure.test/testing — no external test libraries
 
 Return ONLY the complete test namespace code in a single code block. Do NOT implement the cell yet.`,
 		cellID, cfg.Spec, manifest, cellID, brief.Doc, brief.Schema,
@@ -667,10 +705,18 @@ The manifest:
 `+"```edn\n%s\n```"+`
 
 Write Clojure code that:
-1. Compiles the workflow with (myc/compile-workflow manifest)
-2. Sets up test resources (catalog, inventory, tax-rates, coupons, etc.) based on the spec
-3. Runs the workflow with test input for a few key test cases from the spec
-4. Prints the results clearly
+1. Requires [mycelium.core :as myc]
+2. Compiles the workflow: (def wf (myc/compile-workflow <manifest-edn>))
+3. Sets up test resources and input data based on the spec
+4. Runs the workflow: (myc/run-workflow wf resources input)
+5. Prints the results clearly with (println (pr-str result))
+
+IMPORTANT constraints:
+- Do NOT use clojure.test or deftest — this is a script evaluated in the REPL, not a test namespace
+- Do NOT define any function named run-tests
+- Do NOT use any undefined helper functions — define everything you use
+- Use simple (println ...) and (assert ...) for verification
+- Keep it simple: 2-3 test scenarios maximum
 
 Return the code in a single code block. I will evaluate it in the REPL.`, manifest)
 

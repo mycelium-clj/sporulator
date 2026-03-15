@@ -151,10 +151,11 @@ func (g *GraphAgent) ChatStreamWithFeedback(ctx context.Context, message string,
 }
 
 // looksLikeManifest does a quick check to see if text looks like a Mycelium manifest.
-// Requires :id AND at least one of :cells or :pipeline to avoid false positives.
+// Requires :id AND :cells AND at least one of :edges or :pipeline.
 func looksLikeManifest(s string) bool {
 	return len(s) > 10 && strings.Contains(s, ":id") &&
-		(strings.Contains(s, ":cells") || strings.Contains(s, ":pipeline"))
+		strings.Contains(s, ":cells") &&
+		(strings.Contains(s, ":edges") || strings.Contains(s, ":pipeline"))
 }
 
 // getBridge returns the current bridge, or nil if no provider or no bridge.
