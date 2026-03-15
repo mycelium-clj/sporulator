@@ -92,10 +92,10 @@ func (g *GraphAgent) ChatStreamWithFeedback(ctx context.Context, message string,
 			Type:    "eval",
 			Attempt: attempt,
 			Code:    manifest,
-			Message: fmt.Sprintf("Compiling manifest in REPL (attempt %d/%d)", attempt, maxAttempts),
+			Message: fmt.Sprintf("Validating manifest EDN (attempt %d/%d)", attempt, maxAttempts),
 		})
 
-		evalResult, evalErr := br.CompileWorkflow(manifest, "")
+		evalResult, evalErr := br.ValidateManifestEDN(manifest)
 		if evalErr != nil {
 			onFeedback(FeedbackEvent{
 				Type:    "error",
@@ -112,7 +112,7 @@ func (g *GraphAgent) ChatStreamWithFeedback(ctx context.Context, message string,
 				Attempt: attempt,
 				Code:    manifest,
 				Output:  evalResult.Value,
-				Message: "Manifest compiled successfully",
+				Message: "Manifest EDN validated successfully",
 			})
 			return response, nil
 		}
@@ -127,7 +127,7 @@ func (g *GraphAgent) ChatStreamWithFeedback(ctx context.Context, message string,
 			Attempt: attempt,
 			Code:    manifest,
 			Output:  errMsg,
-			Message: "Manifest compilation error, requesting fix",
+			Message: "Manifest EDN validation error, requesting fix",
 		})
 
 		if attempt >= maxAttempts {

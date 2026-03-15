@@ -131,6 +131,13 @@ Requirements:
 - Declare :requires for any resources cells need (e.g. :catalog, :inventory, :tax-rates, :coupons)
 - Keep cell IDs namespaced (e.g. :order/validate-items, :order/compute-tax)
 
+**IMPORTANT: Decomposition Guidelines**
+- Break complex logic into multiple small, focused cells. Each cell should do ONE thing.
+- A cell implementation must fit in ~80 lines of Clojure. If the logic would be longer, split it into multiple cells.
+- When a spec describes a multi-step process (e.g. apply rules A, B, C in sequence), create a separate cell for EACH step rather than one monolithic cell.
+- Each cell should receive the running state and apply one transformation, passing results to the next cell in the pipeline.
+- Keep schemas simple — prefer flat maps over deeply nested structures.
+
 Return the complete manifest in an EDN code block.`, cfg.Spec, cfg.ManifestID)
 
 	response, err := agent.ChatStreamWithFeedback(ctx, prompt, 3,
@@ -633,6 +640,22 @@ The code must start with (ns ...) and contain deftest forms.`, errMsg, code)
 func (o *Orchestrator) integrationTest(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
 	manifest string,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
+
+	// First compile the workflow now that all cells are loaded
+	onEvent(OrchestratorEvent{Phase: "integration", Status: "compiling",
+		Message: "Compiling workflow manifest with loaded cells..."})
+
+	compileResult, compileErr := br.CompileWorkflow(manifest, "")
+	if compileErr != nil {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
+			Message: fmt.Sprintf("Workflow compile connection error: %v", compileErr)})
+	} else if compileResult.IsError() {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
+			Message: fmt.Sprintf("Workflow compile error: %s %s", compileResult.Ex, compileResult.Err)})
+	} else {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "compiled",
+			Message: "Workflow compiled successfully"})
+	}
 
 	agent := o.manager.GetGraphAgent(cfg.ManifestID)
 

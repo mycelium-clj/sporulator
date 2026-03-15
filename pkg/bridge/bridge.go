@@ -275,6 +275,26 @@ func (b *Bridge) ValidateSchema(schema, data string) (*EvalResult, error) {
 	return b.Eval(code)
 }
 
+// ValidateManifestEDN checks that a manifest is valid EDN and has the expected structure.
+// Does NOT require cells to be registered — use this during manifest design.
+func (b *Bridge) ValidateManifestEDN(manifestEDN string) (*EvalResult, error) {
+	code := fmt.Sprintf(
+		`(let [m (read-string %q)]
+		   (cond
+		     (not (map? m))
+		       (throw (ex-info "Manifest must be a map" {}))
+		     (not (:id m))
+		       (throw (ex-info "Manifest must have :id" {}))
+		     (not (:cells m))
+		       (throw (ex-info "Manifest must have :cells" {}))
+		     (not (or (:pipeline m) (:edges m)))
+		       (throw (ex-info "Manifest must have :pipeline or :edges" {}))
+		     :else
+		       (pr-str {:id (:id m) :cell-count (count (:cells m))})))`,
+		manifestEDN)
+	return b.Eval(code)
+}
+
 // CompileWorkflow compiles a workflow manifest in the REPL.
 func (b *Bridge) CompileWorkflow(manifestEDN string, opts string) (*EvalResult, error) {
 	if opts == "" {
