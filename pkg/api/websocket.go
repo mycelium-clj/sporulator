@@ -492,12 +492,14 @@ func (s *Server) handleCellImplementFeedback(c *wsClient, msg WSMessage) {
 // --- Orchestrator handler ---
 
 type orchestratePayload struct {
-	ProjectPath   string `json:"project_path"`
-	BaseNamespace string `json:"base_namespace"`
-	SourceDir     string `json:"source_dir"`
-	TestDir       string `json:"test_dir"`
-	Spec          string `json:"spec"`
-	ManifestID    string `json:"manifest_id"`
+	ProjectPath      string `json:"project_path"`
+	BaseNamespace    string `json:"base_namespace"`
+	SourceDir        string `json:"source_dir"`
+	TestDir          string `json:"test_dir"`
+	Spec             string `json:"spec"`
+	ManifestID       string `json:"manifest_id"`
+	MaxStepsPerLevel int    `json:"max_steps_per_level"`
+	MaxDepth         int    `json:"max_depth"`
 }
 
 func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
@@ -522,12 +524,14 @@ func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
 	orch := agents.NewOrchestrator(s.manager, s.store)
 
 	err = orch.Run(c.ctx, agents.ProjectConfig{
-		ProjectPath:   payload.ProjectPath,
-		BaseNamespace: payload.BaseNamespace,
-		SourceDir:     payload.SourceDir,
-		TestDir:       payload.TestDir,
-		Spec:          payload.Spec,
-		ManifestID:    payload.ManifestID,
+		ProjectPath:      payload.ProjectPath,
+		BaseNamespace:    payload.BaseNamespace,
+		SourceDir:        payload.SourceDir,
+		TestDir:          payload.TestDir,
+		Spec:             payload.Spec,
+		ManifestID:       payload.ManifestID,
+		MaxStepsPerLevel: payload.MaxStepsPerLevel,
+		MaxDepth:         payload.MaxDepth,
 	},
 		func(source string, chunk string) {
 			c.sendMsg(WSMessage{

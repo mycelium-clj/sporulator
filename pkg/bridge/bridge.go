@@ -327,6 +327,51 @@ func (b *Bridge) RunWorkflow(manifestEDN, resources, input, opts string) (*EvalR
 	return b.Eval(code)
 }
 
+// CellContract describes the expected contract for a cell after implementation.
+type CellContract struct {
+	CellID       string // expected cell ID, e.g. ":order/validate"
+	InputSchema  string // expected input schema EDN (optional, "" to skip check)
+	OutputSchema string // expected output schema EDN (optional, "" to skip check)
+	Doc          string // expected doc string (optional, "" to skip check)
+}
+
+// VerifyCellContract checks that a cell registered in the REPL matches the expected contract.
+// Returns nil if the cell is valid, or a descriptive EvalResult with error details.
+func (b *Bridge) VerifyCellContract(contract CellContract) (*EvalResult, error) {
+	// Step 1: Check the cell exists with the expected ID
+	code := fmt.Sprintf(
+		`(let [cell-spec (cell/get-cell! %s)]
+		   (pr-str {:id %s
+		            :has-handler (some? (:handler cell-spec))
+		            :doc (get cell-spec :doc "")
+		            :schema (get cell-spec :schema {})}))`,
+		contract.CellID, contract.CellID)
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return nil, fmt.Errorf("verify cell contract: %w", err)
+	}
+	if result.IsError() {
+		return &EvalResult{
+			Ex: fmt.Sprintf("Cell %s not found in registry", contract.CellID),
+			Err: fmt.Sprintf("Expected cell %s to be registered after load-file. "+
+				"Ensure your (cell/defcell ...) form uses exactly %s as the cell ID.\n"+
+				"REPL error: %s", contract.CellID, contract.CellID, result.Ex),
+		}, nil
+	}
+
+	return result, nil
+}
+
+// RegisterWorkflowCell registers a sub-workflow as a cell via mycelium.compose.
+func (b *Bridge) RegisterWorkflowCell(cellID, manifestEDN, schemaEDN string) (*EvalResult, error) {
+	code := fmt.Sprintf(
+		`(require '[mycelium.compose :as compose])
+		 (compose/register-workflow-cell! %s %s %s)`,
+		cellID, manifestEDN, schemaEDN)
+	return b.Eval(code)
+}
+
 // ListRegisteredCells returns cell IDs currently registered in the REPL.
 func (b *Bridge) ListRegisteredCells() (*EvalResult, error) {
 	return b.Eval(`(pr-str (cell/list-cells))`)

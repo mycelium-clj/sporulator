@@ -132,6 +132,24 @@ func (m *Manager) NewCellAgent(cellID string) *CellAgent {
 	return agent
 }
 
+// NewDecomposeAgent creates a fresh graph agent for a decomposition level.
+// Each recursion level gets its own session to avoid context overflow.
+// Stored under "decompose/"+nodeID key.
+func (m *Manager) NewDecomposeAgent(nodeID string) *GraphAgent {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := "decompose/" + nodeID
+	agent := &GraphAgent{
+		session:        llm.NewSession(key, m.graphPrompt),
+		client:         m.graphClient,
+		store:          m.store,
+		bridgeProvider: m.GetBridge,
+	}
+	m.graphSessions[key] = agent
+	return agent
+}
+
 // GetCellAgent returns an existing cell agent session or creates a new one.
 // This preserves conversation history for iteration workflows.
 func (m *Manager) GetCellAgent(cellID string) *CellAgent {

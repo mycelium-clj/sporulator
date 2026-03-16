@@ -22,12 +22,14 @@ type Orchestrator struct {
 
 // ProjectConfig describes the target Clojure project.
 type ProjectConfig struct {
-	ProjectPath   string // absolute path to project root
-	BaseNamespace string // e.g. "example.order-lifecycle"
-	SourceDir     string // e.g. "src/clj" (relative to ProjectPath)
-	TestDir       string // e.g. "test/clj"
-	Spec          string // SPEC.md contents
-	ManifestID    string // e.g. ":order/placement"
+	ProjectPath      string // absolute path to project root
+	BaseNamespace    string // e.g. "example.order-lifecycle"
+	SourceDir        string // e.g. "src/clj" (relative to ProjectPath)
+	TestDir          string // e.g. "test/clj"
+	Spec             string // SPEC.md contents
+	ManifestID       string // e.g. ":order/placement"
+	MaxStepsPerLevel int    // max steps per decomposition level (default 5)
+	MaxDepth         int    // max recursion depth (default 3); 0 = flat (one-level decomposition)
 }
 
 // OrchestratorEvent reports progress during orchestration.
@@ -43,9 +45,16 @@ func NewOrchestrator(mgr *Manager, st *store.Store) *Orchestrator {
 	return &Orchestrator{manager: mgr, store: st}
 }
 
-// Run executes the full orchestrated workflow.
-// onChunk streams LLM tokens (source identifies which agent: "graph" or cell ID).
+// Run executes the full orchestrated workflow using recursive decomposition.
+// onChunk streams LLM tokens (source identifies which agent: "graph", "decompose/*", or cell ID).
 // onEvent reports progress.
+//
+// Phases:
+//  1. Decompose spec into a tree of steps (recursive, ≤MaxStepsPerLevel per level)
+//  2. Collect all leaf cells from the tree
+//  3. Implement leaves in parallel (existing TDD flow)
+//  4. Register sub-workflows bottom-up via compose/register-workflow-cell!
+//  5. Integration test on root manifest
 func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 	onChunk func(source string, chunk string),
 	onEvent func(OrchestratorEvent)) error {
@@ -55,51 +64,73 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 		return fmt.Errorf("no REPL bridge connected")
 	}
 
-	// Phase 1: Design manifest
-	onEvent(OrchestratorEvent{Phase: "manifest", Status: "started", Message: "Designing manifest..."})
+	// Phase 1: Decompose spec into tree + manifest
+	onEvent(OrchestratorEvent{Phase: "manifest", Status: "started", Message: "Decomposing specification..."})
 
-	manifest, err := o.designManifest(ctx, cfg, br, onChunk, onEvent)
+	manifest, tree, err := o.designManifest(ctx, cfg, br, onChunk, onEvent)
 	if err != nil {
 		return fmt.Errorf("manifest design: %w", err)
 	}
 
-	// Phase 2: Extract cell step names from manifest
-	onEvent(OrchestratorEvent{Phase: "cells", Status: "extracting", Message: "Extracting cell list..."})
+	// Phase 2: Collect leaf cells from decomposition tree
+	leaves := collectLeaves(tree)
+	if len(leaves) == 0 {
+		// Fallback: extract cell names from the root manifest directly
+		onEvent(OrchestratorEvent{Phase: "cells", Status: "extracting",
+			Message: "No leaves in tree, extracting from manifest..."})
 
-	cellNames, err := o.extractCellNames(br, manifest)
-	if err != nil {
-		onEvent(OrchestratorEvent{Phase: "cells", Status: "error",
-			Message: fmt.Sprintf("REPL extraction failed: %v, trying regex fallback", err)})
-		cellNames = extractCellNamesRegex(manifest)
-	}
+		cellNames, extractErr := o.extractCellNames(br, manifest)
+		if extractErr != nil {
+			cellNames = extractCellNamesRegex(manifest)
+		}
+		if len(cellNames) == 0 {
+			return fmt.Errorf("no cells found in manifest or decomposition tree")
+		}
 
-	if len(cellNames) == 0 {
-		// Last resort: try regex extraction
-		cellNames = extractCellNamesRegex(manifest)
-	}
+		onEvent(OrchestratorEvent{Phase: "cells", Status: "extracted",
+			Message: fmt.Sprintf("Found %d cells: %s", len(cellNames), strings.Join(cellNames, ", "))})
 
-	if len(cellNames) == 0 {
-		return fmt.Errorf("no cells found in manifest")
-	}
+		// Phase 3 (flat): Implement cells with TDD
+		cellErrors := o.implementCellsParallel(ctx, cfg, br, manifest, cellNames, onChunk, onEvent)
+		failCount := 0
+		for _, e := range cellErrors {
+			if e != nil {
+				failCount++
+			}
+		}
+		if failCount > 0 {
+			onEvent(OrchestratorEvent{Phase: "cells", Status: "partial",
+				Message: fmt.Sprintf("%d/%d cells had errors", failCount, len(cellNames))})
+		}
+	} else {
+		leafNames := make([]string, len(leaves))
+		for i, l := range leaves {
+			leafNames[i] = l.CellID
+		}
+		onEvent(OrchestratorEvent{Phase: "cells", Status: "extracted",
+			Message: fmt.Sprintf("Found %d leaf cells: %s", len(leaves), strings.Join(leafNames, ", "))})
 
-	onEvent(OrchestratorEvent{Phase: "cells", Status: "extracted",
-		Message: fmt.Sprintf("Found %d cells: %s", len(cellNames), strings.Join(cellNames, ", "))})
+		// Phase 3: Implement all leaf cells in parallel
+		cellErrors := o.implementLeavesParallel(ctx, cfg, br, tree, leaves, onChunk, onEvent)
+		failCount := 0
+		for _, e := range cellErrors {
+			if e != nil {
+				failCount++
+			}
+		}
+		if failCount > 0 {
+			onEvent(OrchestratorEvent{Phase: "cells", Status: "partial",
+				Message: fmt.Sprintf("%d/%d leaf cells had errors", failCount, len(leaves))})
+		}
 
-	// Phase 3: Implement each cell with TDD (parallel)
-	cellErrors := o.implementCellsParallel(ctx, cfg, br, manifest, cellNames, onChunk, onEvent)
-
-	failCount := 0
-	for _, e := range cellErrors {
-		if e != nil {
-			failCount++
+		// Phase 4: Register sub-workflows bottom-up
+		subWorkflows := collectSubWorkflows(tree)
+		if len(subWorkflows) > 0 {
+			o.registerSubWorkflows(ctx, br, subWorkflows, onEvent)
 		}
 	}
-	if failCount > 0 {
-		onEvent(OrchestratorEvent{Phase: "cells", Status: "partial",
-			Message: fmt.Sprintf("%d/%d cells had errors", failCount, len(cellNames))})
-	}
 
-	// Phase 4: Integration testing
+	// Phase 5: Integration testing
 	onEvent(OrchestratorEvent{Phase: "integration", Status: "started", Message: "Running integration tests..."})
 
 	err = o.integrationTest(ctx, cfg, br, manifest, onChunk, onEvent)
@@ -111,11 +142,10 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 	return nil
 }
 
-// designManifest asks the graph agent to design a manifest from the spec.
+// designManifest uses recursive decomposition to build a manifest from the spec.
+// Returns the root manifest EDN and the full decomposition tree.
 func (o *Orchestrator) designManifest(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
-	onChunk func(string, string), onEvent func(OrchestratorEvent)) (string, error) {
-
-	agent := o.manager.GetGraphAgent(cfg.ManifestID)
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) (string, *DecompositionNode, error) {
 
 	// Build the namespace prefix for cell IDs from the manifest ID
 	// e.g. ":order/placement" → "order"
@@ -124,109 +154,125 @@ func (o *Orchestrator) designManifest(ctx context.Context, cfg ProjectConfig, br
 		nsPrefix = nsPrefix[:idx]
 	}
 
-	prompt := fmt.Sprintf(`Design a Mycelium workflow manifest based on this specification.
-
-<spec>
-%s
-</spec>
-
-Requirements:
-- Manifest ID: %s
-- Each cell must have :id (namespaced keyword like :%s/cell-name), :doc, and :schema with :input/:output
-- Declare :requires for any resources cells need (e.g. :catalog, :inventory)
-
-**CRITICAL: Manifest Structure Rules**
-The manifest MUST follow this exact structure:
-
-1. The FIRST cell in :cells MUST have the key :start — the workflow engine begins BFS from :start
-2. All other cell keys are short unqualified keywords (e.g. :compute-tax, :check-fraud)
-3. Each edge MUST use a map with dispatch keys, even for unconditional transitions: {:done :next-cell}
-4. Every cell that appears as a source in :edges MUST have a matching entry in :dispatches
-5. Unconditional dispatches use: [[:done (constantly true)]]
-6. Conditional dispatches use predicate functions: [[:approved (fn [data] ...)] [:rejected (fn [data] ...)]]
-7. The terminal state keyword is :end
-
-Example structure:
-`+"```edn"+`
-{:id :example/workflow
- :cells
- {:start       {:id :%s/validate :doc "Validate input" :schema {:input [:map] :output [:map]}}
-  :process     {:id :%s/process :doc "Process data" :schema {:input [:map] :output [:map]}}
-  :check       {:id :%s/check :doc "Check result" :schema {:input [:map] :output {:ok [:map] :fail [:map]}}}
-  :finalize    {:id :%s/finalize :doc "Finalize" :schema {:input [:map] :output [:map]}}}
- :edges
- {:start    {:done :process}
-  :process  {:done :check}
-  :check    {:ok :finalize :fail :end}
-  :finalize {:done :end}}
- :dispatches
- {:start    [[:done (constantly true)]]
-  :process  [[:done (constantly true)]]
-  :check    [[:ok (fn [data] (:valid? data))] [:fail (fn [data] (not (:valid? data)))]]
-  :finalize [[:done (constantly true)]]}}
-`+"```"+`
-
-**Decomposition Guidelines**
-- Break complex logic into multiple small, focused cells. Each cell should do ONE thing.
-- A cell implementation must fit in ~80 lines of Clojure. If the logic would be longer, split it into multiple cells.
-- When a spec describes a multi-step process, create a separate cell for EACH step.
-- Keep schemas simple — prefer flat maps over deeply nested structures.
-
-Return the complete manifest in an EDN code block.`, cfg.Spec, cfg.ManifestID,
-		nsPrefix, nsPrefix, nsPrefix, nsPrefix, nsPrefix)
-
-	response, err := agent.ChatStreamWithFeedback(ctx, prompt, 3,
-		func(chunk string) { onChunk("graph", chunk) },
-		func(event FeedbackEvent) {
-			onEvent(OrchestratorEvent{Phase: "manifest", Status: event.Type, Message: event.Message})
-		})
-	if err != nil {
-		return "", err
+	dcfg := DecompositionConfig{
+		MaxStepsPerLevel: cfg.MaxStepsPerLevel,
+		MaxDepth:         cfg.MaxDepth,
+	}
+	if dcfg.MaxStepsPerLevel == 0 {
+		dcfg.MaxStepsPerLevel = DefaultDecompositionConfig().MaxStepsPerLevel
+	}
+	if dcfg.MaxDepth == 0 {
+		dcfg.MaxDepth = DefaultDecompositionConfig().MaxDepth
 	}
 
-	manifest := ExtractFirstCodeBlock(response)
-	if manifest == "" || !looksLikeManifest(manifest) {
-		// Log what we got for debugging
-		preview := response
-		if len(preview) > 500 {
-			preview = preview[:500] + "..."
+	tree, err := o.decompose(ctx, cfg.Spec, nsPrefix, nil, 0, dcfg, onChunk, onEvent)
+	if err != nil {
+		return "", nil, fmt.Errorf("decomposition: %w", err)
+	}
+
+	manifest := tree.Manifest
+
+	// Save manifest to store
+	agent := o.manager.GetGraphAgent(cfg.ManifestID)
+	version, saveErr := agent.SaveManifest(cfg.ManifestID, "```edn\n"+manifest+"\n```", "decompose-agent")
+	if saveErr != nil {
+		onEvent(OrchestratorEvent{Phase: "manifest", Status: "warning",
+			Message: fmt.Sprintf("Could not save manifest: %v", saveErr)})
+	} else {
+		onEvent(OrchestratorEvent{Phase: "manifest", Status: "saved",
+			Message: fmt.Sprintf("Manifest saved v%d", version)})
+	}
+
+	return manifest, tree, nil
+}
+
+// implementLeavesParallel implements all leaf cells from the decomposition tree in parallel.
+// Each leaf uses its parent's manifest as context for the TDD flow.
+// The CellBrief is built directly from the DecompositionNode, ensuring the cell ID,
+// schema, and doc match the decomposition contract.
+func (o *Orchestrator) implementLeavesParallel(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
+	tree *DecompositionNode, leaves []*DecompositionNode,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) []error {
+
+	rootManifest := tree.Manifest
+
+	errors := make([]error, len(leaves))
+	var wg sync.WaitGroup
+
+	for i, leaf := range leaves {
+		wg.Add(1)
+		go func(idx int, leaf *DecompositionNode) {
+			defer wg.Done()
+
+			// Build CellBrief directly from the decomposition node.
+			// This ensures the expected cell ID, schema, and doc are passed through
+			// to the LLM prompt and contract verification — no manifest lookup needed.
+			brief := CellBrief{
+				ID:       leaf.CellID,
+				Doc:      leaf.Doc,
+				Schema:   fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema)),
+				Requires: leaf.Requires,
+			}
+
+			// Use the root manifest for context in prompts
+			manifestCtx := rootManifest
+
+			session, err := br.CloneSession()
+			if err != nil {
+				errors[idx] = fmt.Errorf("clone session for %s: %w", leaf.CellID, err)
+				return
+			}
+			defer br.CloseSession(session)
+
+			errors[idx] = o.implementCellWithTDD(ctx, cfg, br, session, manifestCtx, brief, onChunk, onEvent)
+		}(i, leaf)
+	}
+
+	wg.Wait()
+	return errors
+}
+
+// registerSubWorkflows registers non-leaf nodes as workflow cells, bottom-up.
+func (o *Orchestrator) registerSubWorkflows(ctx context.Context, br *bridge.Bridge,
+	subWorkflows []*DecompositionNode, onEvent func(OrchestratorEvent)) {
+
+	for _, sw := range subWorkflows {
+		if sw.Manifest == "" {
+			onEvent(OrchestratorEvent{Phase: "register", CellID: sw.CellID, Status: "skipped",
+				Message: fmt.Sprintf("No manifest for sub-workflow %s", sw.CellID)})
+			continue
 		}
-		onEvent(OrchestratorEvent{Phase: "manifest", Status: "retry",
-			Message: fmt.Sprintf("No valid manifest extracted (response %d chars, preview: %s), retrying with explicit instruction", len(response), preview)})
 
-		// Retry with more explicit instruction
-		retryPrompt := `Your previous response did not contain a valid Mycelium manifest EDN code block.
+		onEvent(OrchestratorEvent{Phase: "register", CellID: sw.CellID, Status: "started",
+			Message: fmt.Sprintf("Registering sub-workflow %s", sw.CellID)})
 
-Please return ONLY the manifest as an EDN map inside a code block like:
+		// Build schema EDN from the node
+		schemaEDN := fmt.Sprintf("{:input %s :output %s}",
+			defaultSchema(sw.InputSchema), defaultSchema(sw.OutputSchema))
 
-` + "```edn\n{:id :order/placement\n :cells {:start {...} ...}\n :edges {:start {:done :next} ...}\n :dispatches {:start [[:done (constantly true)]] ...}}\n```" + `
-
-The manifest MUST contain :id, :cells, :edges, and :dispatches.
-The first cell key MUST be :start.
-Do NOT include any explanation outside the code block.`
-
-		response, err = agent.ChatStream(ctx, retryPrompt,
-			func(chunk string) { onChunk("graph", chunk) })
+		result, err := br.RegisterWorkflowCell(sw.CellID, sw.Manifest, schemaEDN)
 		if err != nil {
-			return "", fmt.Errorf("manifest retry: %w", err)
+			onEvent(OrchestratorEvent{Phase: "register", CellID: sw.CellID, Status: "error",
+				Message: fmt.Sprintf("Registration error: %v", err)})
+			continue
+		}
+		if result.IsError() {
+			onEvent(OrchestratorEvent{Phase: "register", CellID: sw.CellID, Status: "error",
+				Message: fmt.Sprintf("Registration failed: %s %s", result.Ex, result.Err)})
+			continue
 		}
 
-		manifest = ExtractFirstCodeBlock(response)
-		if manifest == "" || !looksLikeManifest(manifest) {
-			return "", fmt.Errorf("no valid manifest found in response (retry also failed, response %d chars)", len(response))
-		}
+		onEvent(OrchestratorEvent{Phase: "register", CellID: sw.CellID, Status: "success",
+			Message: fmt.Sprintf("Sub-workflow %s registered", sw.CellID)})
 	}
+}
 
-	// Save manifest
-	version, err := agent.SaveManifest(cfg.ManifestID, response, "graph-agent")
-	if err != nil {
-		return "", fmt.Errorf("save manifest: %w", err)
+// defaultSchema returns the schema or "[:map]" if empty.
+func defaultSchema(schema string) string {
+	if schema == "" {
+		return "[:map]"
 	}
-
-	onEvent(OrchestratorEvent{Phase: "manifest", Status: "saved",
-		Message: fmt.Sprintf("Manifest saved v%d", version)})
-
-	return manifest, nil
+	return schema
 }
 
 // extractCellNames gets the cell step names from the manifest via REPL.
@@ -287,7 +333,15 @@ func (o *Orchestrator) implementCellsParallel(ctx context.Context, cfg ProjectCo
 				return
 			}
 			defer br.CloseSession(session)
-			errors[idx] = o.implementCellWithTDD(ctx, cfg, br, session, manifest, cellName, onChunk, onEvent)
+
+			// Extract brief from manifest for flat-path cells
+			brief, specErr := o.extractCellSpec(br, manifest, cellName)
+			if specErr != nil {
+				errors[idx] = fmt.Errorf("extract spec for %s: %w", cellName, specErr)
+				return
+			}
+
+			errors[idx] = o.implementCellWithTDD(ctx, cfg, br, session, manifest, brief, onChunk, onEvent)
 		}(i, name)
 	}
 
@@ -300,26 +354,26 @@ func (o *Orchestrator) implementCellsParallel(ctx context.Context, cfg ProjectCo
 // 2. Write test file, eval in REPL
 // 3. Ask cell agent to implement the cell
 // 4. Write source file, eval in REPL
-// 5. Run tests, iterate on failures
+// 5. Verify cell contract (correct ID registered)
+// 6. Run tests, iterate on failures
 // Each cell gets its own nREPL session for isolation.
+// The CellBrief is passed directly from the caller (decomposition tree or manifest extraction),
+// ensuring contract expectations (cell ID, schema, doc) are authoritative.
 func (o *Orchestrator) implementCellWithTDD(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
-	session, manifest, stepName string,
+	session, manifest string, brief CellBrief,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
-
-	// Get the cell spec from the manifest (use main bridge session for manifest parsing)
-	brief, err := o.extractCellSpec(br, manifest, stepName)
-	if err != nil {
-		return fmt.Errorf("extract spec for %s: %w", stepName, err)
-	}
 
 	cellID := brief.ID
 	if cellID == "" {
-		cellID = ":" + stepName
+		return fmt.Errorf("CellBrief has empty ID")
 	}
 	agent := o.manager.NewCellAgent(cellID)
 
-	// Compute namespaces and file paths
-	cellNs := cfg.BaseNamespace + ".cells." + stepName
+	// Compute namespaces and file paths from cell ID
+	// Use cellIDToNsSuffix to derive a unique namespace that avoids collisions
+	// between cells with the same step name in different sub-workflows
+	nsSuffix := cellIDToNsSuffix(cellID)
+	cellNs := cfg.BaseNamespace + ".cells." + nsSuffix
 	testNs := cellNs + "-test"
 	srcFile := clojureNsToFile(cfg.ProjectPath, cfg.SourceDir, cellNs)
 	testFile := clojureNsToFile(cfg.ProjectPath, cfg.TestDir, testNs)
@@ -341,7 +395,7 @@ Here is the workflow manifest for context:
 `+"```edn\n%s\n```"+`
 
 Cell details:
-- **Cell ID:** %s
+- **Cell ID:** %s (EXACT — tests MUST use this ID)
 - **Doc:** %s
 - **Schema:** %s
 - **Requires:** %s
@@ -356,9 +410,11 @@ The test file should:
 - If you need a helper function (e.g. for approximate equality), define it in the test namespace — do NOT use undefined symbols
 - Use only clojure.test/is, clojure.test/deftest, clojure.test/testing — no external test libraries
 
+CRITICAL: The cell ID is %s — use EXACTLY this keyword in (cell/get-cell! %s) calls.
+
 Return ONLY the complete test namespace code in a single code block. Do NOT implement the cell yet.`,
 		cellID, cfg.Spec, manifest, cellID, brief.Doc, brief.Schema,
-		strings.Join(brief.Requires, ", "), testNs, cellNs, cellID)
+		strings.Join(brief.Requires, ", "), testNs, cellNs, cellID, cellID, cellID)
 
 	testResponse, err := agent.session.SendStream(ctx, agent.client, testPrompt,
 		func(chunk string) { onChunk(cellID+"/test", chunk) })
@@ -400,14 +456,33 @@ Return ONLY the complete test namespace code in a single code block. Do NOT impl
 
 	implPrompt := fmt.Sprintf(`Good. Now implement the cell to pass those tests.
 
-Write the source namespace `+"`%s`"+` containing the cell/defcell form for %s.
+Write the source namespace `+"`%s`"+` containing the cell/defcell form.
+
+CRITICAL CONTRACT — your code MUST satisfy ALL of these:
+1. The cell ID MUST be EXACTLY %s — the first argument to cell/defcell
+2. The schema MUST be %s
+3. The handler takes two arguments: [resources data]
+
+Example structure:
+`+"```clojure"+`
+(ns %s
+  (:require [mycelium.cell :as cell]))
+
+(cell/defcell %s
+  {:doc "%s"
+   :schema %s}
+  (fn [resources data]
+    ;; your implementation here
+    ))
+`+"```"+`
 
 The namespace should:
 - Require [mycelium.cell :as cell] and any other dependencies needed
-- Contain the complete (cell/defcell %s ...) form
+- Contain the complete (cell/defcell %s ...) form with EXACTLY that cell ID
 - Implement all the business logic described in the spec and tested in the test file
 
-Return ONLY the complete source namespace code in a single code block.`, cellNs, cellID, cellID)
+Return ONLY the complete source namespace code in a single code block.`,
+		cellNs, cellID, brief.Schema, cellNs, cellID, brief.Doc, brief.Schema, cellID)
 
 	implResponse, err := agent.session.SendStream(ctx, agent.client, implPrompt,
 		func(chunk string) { onChunk(cellID+"/impl", chunk) })
@@ -462,6 +537,16 @@ Return ONLY the complete source namespace code in a single code block.`, cellNs,
 			return fmt.Errorf("fix implementation %s: %w", cellID, fixErr)
 		}
 		implCode = fixResult
+	}
+
+	// Contract verification: ensure the cell registered under the expected ID.
+	// This catches the common failure where the LLM uses a different cell ID
+	// than what the manifest/decomposition tree expects.
+	implCode, err = o.verifyCellContract(ctx, agent, br, session, cellID, brief, implCode, srcFile, onChunk, onEvent)
+	if err != nil {
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
+			Message: fmt.Sprintf("Contract verification failed: %v", err)})
+		// Continue to test phase anyway — tests will also catch the issue
 	}
 
 	// Load test file in REPL — remove stale ns first
@@ -534,7 +619,8 @@ Here are the tests for reference:
 
 Fix the cell implementation to pass all tests.
 Return the COMPLETE updated source namespace in a single code block.
-Do NOT include any explanation outside the code block.`, testOutput, testCode)
+Do NOT include any explanation outside the code block.
+CRITICAL: The cell ID MUST remain EXACTLY %s in the (cell/defcell ...) form.`, testOutput, testCode, cellID)
 
 		fixResponse, fixErr := agent.session.SendStream(ctx, agent.client, fixPrompt,
 			func(chunk string) { onChunk(cellID+"/fix", chunk) })
@@ -570,10 +656,78 @@ Do NOT include any explanation outside the code block.`, testOutput, testCode)
 			} else {
 				implCode = fixResult
 			}
+		} else {
+			// Load succeeded — verify contract
+			implCode, _ = o.verifyCellContract(ctx, agent, br, session, cellID, brief, implCode, srcFile, onChunk, onEvent)
 		}
 	}
 
 	return nil
+}
+
+// verifyCellContract checks that a cell registered in the REPL matches the expected contract
+// from the decomposition tree. If the cell ID is wrong, it feeds a clear error to the LLM
+// and retries. Returns the (possibly fixed) implementation code.
+func (o *Orchestrator) verifyCellContract(ctx context.Context, agent *CellAgent, br *bridge.Bridge,
+	session, cellID string, brief CellBrief, implCode, srcFile string,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) (string, error) {
+
+	contract := bridge.CellContract{
+		CellID:       cellID,
+		InputSchema:  brief.Schema,
+		OutputSchema: brief.Schema,
+		Doc:          brief.Doc,
+	}
+
+	contractResult, contractErr := br.VerifyCellContract(contract)
+	if contractErr != nil {
+		return implCode, fmt.Errorf("contract check connection error: %w", contractErr)
+	}
+
+	if !contractResult.IsError() {
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "contract_ok",
+			Message: fmt.Sprintf("Cell %s registered correctly", cellID)})
+		return implCode, nil
+	}
+
+	// Contract violation — the cell wasn't registered under the expected ID.
+	// Feed a very explicit error to the LLM.
+	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "contract_violation",
+		Message: fmt.Sprintf("Contract violation: %s", contractResult.Err)})
+
+	contractFixResult := &bridge.EvalResult{
+		Ex: "CONTRACT VIOLATION: Cell ID mismatch",
+		Err: fmt.Sprintf(`The cell was NOT registered under the expected ID %s.
+
+Your (cell/defcell ...) form MUST use EXACTLY %s as the first argument.
+
+CORRECT:
+  (cell/defcell %s
+    {:doc "..." :schema {...}}
+    (fn [resources data] ...))
+
+WRONG (any other keyword):
+  (cell/defcell :some-other-id ...)
+
+Fix the cell ID and return the COMPLETE corrected namespace.`, cellID, cellID, cellID),
+	}
+
+	fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, contractFixResult, srcFile, br, session, onChunk)
+	if fixErr != nil {
+		return implCode, fmt.Errorf("contract fix failed: %w", fixErr)
+	}
+
+	// Re-verify after fix
+	contractResult2, _ := br.VerifyCellContract(contract)
+	if contractResult2 != nil && !contractResult2.IsError() {
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "contract_ok",
+			Message: fmt.Sprintf("Cell %s registered correctly after fix", cellID)})
+	} else {
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "contract_violation",
+			Message: fmt.Sprintf("Cell %s still not registered after contract fix", cellID)})
+	}
+
+	return fixResult, nil
 }
 
 // fixCellCode asks the cell agent to fix a compilation error and retries eval.
@@ -596,7 +750,8 @@ Here is the code that failed:
 
 Fix the issue and return the COMPLETE corrected namespace in a single code block.
 Do NOT include any explanation outside the code block.
-The code must start with (ns ...) and contain a (cell/defcell ...) form.`, errMsg, code)
+The code must start with (ns ...) and contain a (cell/defcell %s ...) form.
+CRITICAL: The cell ID MUST be EXACTLY %s.`, errMsg, code, cellID, cellID)
 
 	fixResponse, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 		func(chunk string) { onChunk(cellID+"/fix", chunk) })
@@ -942,52 +1097,44 @@ Start from the exact point the previous response ended.`
 	return balanceParens(combined)
 }
 
-// extractCellNamesRegex is a fallback that extracts cell step names from manifest
-// text using regex, when REPL-based extraction fails.
-// Looks for patterns like `:step-name {:id :namespace/cell-id` in the :cells map.
-var cellStepRe = regexp.MustCompile(`:cells\s*\{([\s\S]*?)\n\s*\}`)
-var cellKeyRe = regexp.MustCompile(`:(\w[\w-]*)\s*\{`)
-
-func extractCellNamesRegex(manifest string) []string {
-	// Find the :cells map
-	cellsMatch := cellStepRe.FindStringSubmatch(manifest)
-	if len(cellsMatch) < 2 {
-		// Try simpler: just find all :xxx {:id patterns
-		return extractCellNamesSimple(manifest)
+// cellIDToNsSuffix converts a cell ID keyword to a unique namespace suffix.
+// Examples:
+//
+//	":order/validate-input" → "validate-input"
+//	":order.validate-and-enrich-order/validate-input" → "validate-and-enrich-order.validate-input"
+//
+// This ensures cells in different sub-workflows with the same step name get unique namespaces.
+func cellIDToNsSuffix(cellID string) string {
+	id := strings.TrimPrefix(cellID, ":")
+	// Replace "/" with "." to flatten the namespace/name separator
+	id = strings.ReplaceAll(id, "/", ".")
+	// Strip the root segment (first dot-separated part, e.g. "order")
+	if idx := strings.Index(id, "."); idx >= 0 {
+		id = id[idx+1:]
 	}
-
-	cellsBody := cellsMatch[1]
-	matches := cellKeyRe.FindAllStringSubmatch(cellsBody, -1)
-	var names []string
-	seen := map[string]bool{}
-	for _, m := range matches {
-		name := m[1]
-		// Skip known non-step keys
-		if name == "id" || name == "doc" || name == "schema" || name == "on-error" || name == "requires" ||
-			name == "input" || name == "output" {
-			continue
-		}
-		if !seen[name] {
-			seen[name] = true
-			names = append(names, name)
-		}
-	}
-	return names
+	return id
 }
 
-// extractCellNamesSimple finds step names by looking for `:step-name {:id :namespace/` patterns.
-var cellIDRe = regexp.MustCompile(`:(\w[\w-]*)\s*\{\s*:id\s+:`)
+// extractCellNamesRegex is a fallback that extracts cell step names from manifest text.
+// Tries EDN parsing first, then falls back to regex patterns.
+func extractCellNamesRegex(manifest string) []string {
+	// Try EDN parsing first
+	names, err := parseManifestCellNames(manifest)
+	if err == nil && len(names) > 0 {
+		return names
+	}
 
-func extractCellNamesSimple(manifest string) []string {
+	// Fallback: regex for `:step-name {:id :namespace/` patterns
+	cellIDRe := regexp.MustCompile(`:(\w[\w-]*)\s*\{\s*:id\s+:`)
 	matches := cellIDRe.FindAllStringSubmatch(manifest, -1)
-	var names []string
+	var result []string
 	seen := map[string]bool{}
 	for _, m := range matches {
 		name := m[1]
 		if name != "cells" && !seen[name] {
 			seen[name] = true
-			names = append(names, name)
+			result = append(result, name)
 		}
 	}
-	return names
+	return result
 }
