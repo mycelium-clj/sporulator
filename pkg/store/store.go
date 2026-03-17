@@ -140,6 +140,51 @@ func (s *Store) migrate() error {
 			run_at       TEXT    NOT NULL DEFAULT (datetime('now')),
 			FOREIGN KEY (cell_id, cell_version) REFERENCES cells(id, version)
 		);
+
+		CREATE TABLE IF NOT EXISTS orchestration_runs (
+			id          TEXT PRIMARY KEY,
+			spec_hash   TEXT NOT NULL,
+			manifest_id TEXT NOT NULL,
+			config      TEXT NOT NULL DEFAULT '{}',
+			status      TEXT NOT NULL DEFAULT 'running',
+			tree_json   TEXT NOT NULL DEFAULT '',
+			started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+
+		CREATE TABLE IF NOT EXISTS cell_attempts (
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id          TEXT NOT NULL,
+			cell_id         TEXT NOT NULL,
+			attempt_type    TEXT NOT NULL DEFAULT 'test',
+			attempt_number  INTEGER NOT NULL,
+			code            TEXT NOT NULL DEFAULT '',
+			test_code       TEXT NOT NULL DEFAULT '',
+			output          TEXT NOT NULL DEFAULT '',
+			passed          INTEGER NOT NULL DEFAULT 0,
+			created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+			FOREIGN KEY (run_id) REFERENCES orchestration_runs(id)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_cell_attempts_run_cell
+			ON cell_attempts(run_id, cell_id);
+
+		CREATE TABLE IF NOT EXISTS test_contracts (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id       TEXT NOT NULL,
+			cell_id      TEXT NOT NULL,
+			test_code    TEXT NOT NULL DEFAULT '',
+			test_body    TEXT NOT NULL DEFAULT '',
+			review_notes TEXT NOT NULL DEFAULT '',
+			status       TEXT NOT NULL DEFAULT 'pending',
+			revision     INTEGER NOT NULL DEFAULT 0,
+			feedback     TEXT NOT NULL DEFAULT '',
+			approved_at  TEXT,
+			created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+			FOREIGN KEY (run_id) REFERENCES orchestration_runs(id),
+			UNIQUE(run_id, cell_id)
+		);
 	`)
 	return err
 }

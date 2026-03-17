@@ -2,6 +2,7 @@ package agents
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,15 +10,36 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mycelium-clj/sporulator/pkg/bridge"
 	"github.com/mycelium-clj/sporulator/pkg/store"
 )
 
+// mathPrecisionRules is injected into test and implementation prompts so
+// that the LLM uses consistent precision handling derived from the schema.
+const mathPrecisionRules = `NUMERICAL PRECISION — read the schema and spec carefully to decide precision for each field:
+1. Examine each :double field in the schema. Determine from the spec whether it represents
+   a value that needs rounding (e.g. currency, percentages) or should stay as raw :double.
+   When rounding is needed, use bigdec with the appropriate scale and rounding mode:
+   (.doubleValue (.setScale (bigdec x) <scale> java.math.RoundingMode/HALF_UP))
+2. Examine each :int field. Determine from the spec whether the value is computed from
+   floating-point math and needs truncation (floor/ceil) or is a direct count.
+3. When the spec describes distributing a total across items:
+   - round each item's share individually
+   - compute the remainder (total minus sum-of-rounded-shares)
+   - adjust the last item by the remainder so the sum is exact
+4. Tests and implementation MUST agree on precision. Test expectations should be the
+   rounded/truncated result, never the raw floating-point intermediate.
+   Use a tolerance (e.g. 0.01) for approximate comparisons of rounded values.
+5. Use bigdec for intermediate calculations to avoid floating-point accumulation errors.
+`
+
 // Orchestrator coordinates the full workflow: manifest design → cell TDD → integration testing.
 type Orchestrator struct {
 	manager *Manager
 	store   *store.Store
+	runID   string // set at the start of each Run()
 }
 
 // ProjectConfig describes the target Clojure project.
@@ -30,6 +52,7 @@ type ProjectConfig struct {
 	ManifestID       string // e.g. ":order/placement"
 	MaxStepsPerLevel int    // max steps per decomposition level (default 5)
 	MaxDepth         int    // max recursion depth (default 3); 0 = flat (one-level decomposition)
+	AutoApproveTests bool   // when true, skip approval gate (current behavior)
 }
 
 // OrchestratorEvent reports progress during orchestration.
@@ -39,6 +62,35 @@ type OrchestratorEvent struct {
 	Status  string `json:"status"`  // "started", "success", "error", "retry"
 	Message string `json:"message"`
 }
+
+// TestContract holds generated tests for a cell, ready for approval.
+type TestContract struct {
+	CellID      string    `json:"cell_id"`
+	Brief       CellBrief `json:"cell_brief"`
+	TestCode    string    `json:"test_code"`    // assembled full test namespace
+	TestBody    string    `json:"test_body"`     // raw deftest forms from LLM
+	ReviewNotes string    `json:"review_notes"`  // LLM self-review output
+	TestNs      string    `json:"test_ns"`
+	CellNs      string    `json:"cell_ns"`
+	TestFile    string    `json:"test_file"`
+	SrcFile     string    `json:"src_file"`
+	Session     string    `json:"-"` // nREPL session (preserved for impl phase)
+	Agent       *CellAgent `json:"-"` // LLM session (preserved — has conversation context)
+	Revision    int       `json:"revision"`
+	Err         error     `json:"-"` // non-nil if generation failed
+}
+
+// ReviewResponse is a single user decision on a test contract.
+type ReviewResponse struct {
+	CellID     string `json:"cell_id"`
+	Decision   string `json:"decision"`    // "approve", "edit", "revise", "skip"
+	EditedCode string `json:"edited_code"` // user-modified test code (for "edit")
+	Feedback   string `json:"feedback"`    // user notes (for "edit" or "revise")
+}
+
+// OnReviewFunc is the callback type for the test review gate.
+// The orchestrator calls it with a batch of contracts and blocks until the user responds.
+type OnReviewFunc func([]TestContract) ([]ReviewResponse, error)
 
 // NewOrchestrator creates an orchestrator.
 func NewOrchestrator(mgr *Manager, st *store.Store) *Orchestrator {
@@ -57,11 +109,30 @@ func NewOrchestrator(mgr *Manager, st *store.Store) *Orchestrator {
 //  5. Integration test on root manifest
 func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 	onChunk func(source string, chunk string),
-	onEvent func(OrchestratorEvent)) error {
+	onEvent func(OrchestratorEvent),
+	onReview ...OnReviewFunc) error {
+
+	// Extract optional onReview callback
+	var reviewFn OnReviewFunc
+	if len(onReview) > 0 {
+		reviewFn = onReview[0]
+	}
 
 	br := o.manager.GetBridge()
 	if br == nil {
 		return fmt.Errorf("no REPL bridge connected")
+	}
+
+	// Set up run tracking
+	o.runID = fmt.Sprintf("run-%d", time.Now().UnixNano())
+	specHash := fmt.Sprintf("%x", sha256.Sum256([]byte(cfg.Spec)))[:16]
+	if o.store != nil {
+		o.store.CreateOrchestrationRun(&store.OrchestrationRun{
+			ID:         o.runID,
+			SpecHash:   specHash,
+			ManifestID: cfg.ManifestID,
+			Status:     "running",
+		})
 	}
 
 	// Phase 1: Decompose spec into tree + manifest
@@ -69,7 +140,16 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 
 	manifest, tree, err := o.designManifest(ctx, cfg, br, onChunk, onEvent)
 	if err != nil {
+		if o.store != nil {
+			o.store.UpdateRunStatus(o.runID, "failed")
+		}
 		return fmt.Errorf("manifest design: %w", err)
+	}
+
+	// Persist the decomposition tree
+	if o.store != nil {
+		treeJSON, _ := SerializeTree(tree)
+		o.store.UpdateRunTree(o.runID, "running", treeJSON)
 	}
 
 	// Phase 2: Collect leaf cells from decomposition tree
@@ -110,8 +190,95 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 		onEvent(OrchestratorEvent{Phase: "cells", Status: "extracted",
 			Message: fmt.Sprintf("Found %d leaf cells: %s", len(leaves), strings.Join(leafNames, ", "))})
 
-		// Phase 3: Implement all leaf cells in parallel
-		cellErrors := o.implementLeavesParallel(ctx, cfg, br, tree, leaves, onChunk, onEvent)
+		// Phase 3: Implement all leaf cells with review gate
+		cellErrors := o.implementLeavesWithReview(ctx, cfg, br, tree, leaves, onChunk, onEvent, reviewFn)
+
+		// Phase 3b: Re-decompose failed leaves into sub-workflows
+		dcfg := DecompositionConfig{
+			MaxStepsPerLevel: cfg.MaxStepsPerLevel,
+			MaxDepth:         cfg.MaxDepth,
+		}
+		if dcfg.MaxStepsPerLevel == 0 {
+			dcfg.MaxStepsPerLevel = DefaultDecompositionConfig().MaxStepsPerLevel
+		}
+		if dcfg.MaxDepth == 0 {
+			dcfg.MaxDepth = DefaultDecompositionConfig().MaxDepth
+		}
+
+		var failedLeaves []*DecompositionNode
+		for i, e := range cellErrors {
+			if e != nil {
+				failedLeaves = append(failedLeaves, leaves[i])
+			}
+		}
+
+		if len(failedLeaves) > 0 {
+			onEvent(OrchestratorEvent{Phase: "redecompose", Status: "started",
+				Message: fmt.Sprintf("Re-decomposing %d failed cells", len(failedLeaves))})
+
+			// Allow re-decomposition one level beyond MaxDepth since this is a recovery step
+			redecomposeMaxDepth := dcfg.MaxDepth + 1
+
+			for _, failed := range failedLeaves {
+				if failed.Depth+1 > redecomposeMaxDepth {
+					onEvent(OrchestratorEvent{Phase: "redecompose", CellID: failed.CellID, Status: "skipped",
+						Message: fmt.Sprintf("Skipping %s: already at max depth %d", failed.CellID, failed.Depth)})
+					continue
+				}
+
+				onEvent(OrchestratorEvent{Phase: "redecompose", CellID: failed.CellID, Status: "decomposing",
+					Message: fmt.Sprintf("Breaking down failed cell %s", failed.CellID)})
+
+				subSpec := fmt.Sprintf("Implement this specific step as a sub-workflow.\n\nStep: %s\nDescription: %s\n\nFull spec:\n%s",
+					failed.StepName, failed.Doc, cfg.Spec)
+
+				subPrefix := strings.TrimPrefix(failed.CellID, ":")
+				subPrefix = strings.ReplaceAll(subPrefix, "/", ".")
+
+				redecomposeCfg := DecompositionConfig{
+					MaxStepsPerLevel: dcfg.MaxStepsPerLevel,
+					MaxDepth:         redecomposeMaxDepth,
+				}
+				subRoot, subErr := o.decompose(ctx, subSpec, subPrefix, nil, failed.Depth+1, redecomposeCfg, onChunk, onEvent)
+				if subErr != nil {
+					onEvent(OrchestratorEvent{Phase: "redecompose", CellID: failed.CellID, Status: "error",
+						Message: fmt.Sprintf("Could not decompose %s: %v", failed.CellID, subErr)})
+					continue
+				}
+
+				// Update the tree: this leaf becomes a sub-workflow
+				failed.IsLeaf = false
+				failed.Children = subRoot.Children
+				failed.Manifest = subRoot.Manifest
+
+				// Implement the new sub-leaves
+				subLeaves := collectLeaves(failed)
+				if len(subLeaves) > 0 {
+					subLeafNames := make([]string, len(subLeaves))
+					for j, sl := range subLeaves {
+						subLeafNames[j] = sl.CellID
+					}
+					onEvent(OrchestratorEvent{Phase: "redecompose", CellID: failed.CellID, Status: "implementing",
+						Message: fmt.Sprintf("Implementing %d sub-cells: %s", len(subLeaves), strings.Join(subLeafNames, ", "))})
+
+					subErrors := o.implementLeavesWithReview(ctx, cfg, br, failed, subLeaves, onChunk, onEvent, reviewFn)
+					subFails := 0
+					for _, se := range subErrors {
+						if se != nil {
+							subFails++
+						}
+					}
+					if subFails > 0 {
+						onEvent(OrchestratorEvent{Phase: "redecompose", CellID: failed.CellID, Status: "partial",
+							Message: fmt.Sprintf("%d/%d sub-cells still failing for %s", subFails, len(subLeaves), failed.CellID)})
+					} else {
+						onEvent(OrchestratorEvent{Phase: "redecompose", CellID: failed.CellID, Status: "success",
+							Message: fmt.Sprintf("All sub-cells passed for %s", failed.CellID)})
+					}
+				}
+			}
+		}
+
 		failCount := 0
 		for _, e := range cellErrors {
 			if e != nil {
@@ -120,10 +287,10 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 		}
 		if failCount > 0 {
 			onEvent(OrchestratorEvent{Phase: "cells", Status: "partial",
-				Message: fmt.Sprintf("%d/%d leaf cells had errors", failCount, len(leaves))})
+				Message: fmt.Sprintf("%d/%d leaf cells had errors (some may have been re-decomposed)", failCount, len(leaves))})
 		}
 
-		// Phase 4: Register sub-workflows bottom-up
+		// Phase 4: Register sub-workflows bottom-up (includes any newly created sub-workflows)
 		subWorkflows := collectSubWorkflows(tree)
 		if len(subWorkflows) > 0 {
 			o.registerSubWorkflows(ctx, br, subWorkflows, onEvent)
@@ -138,7 +305,181 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 		onEvent(OrchestratorEvent{Phase: "integration", Status: "error", Message: err.Error()})
 	}
 
+	// Mark run as completed
+	if o.store != nil {
+		o.store.UpdateRunStatus(o.runID, "completed")
+	}
+
 	onEvent(OrchestratorEvent{Phase: "complete", Status: "done", Message: "Orchestration complete"})
+	return nil
+}
+
+// RunResumable resumes a previous orchestration run if one exists with matching spec hash.
+// Passing cells are reloaded from the store; only failed cells are re-implemented.
+// If no matching run exists, falls through to a fresh Run().
+func (o *Orchestrator) RunResumable(ctx context.Context, cfg ProjectConfig,
+	onChunk func(source string, chunk string),
+	onEvent func(OrchestratorEvent),
+	onReview ...OnReviewFunc) error {
+
+	if o.store == nil {
+		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+	}
+
+	br := o.manager.GetBridge()
+	if br == nil {
+		return fmt.Errorf("no REPL bridge connected")
+	}
+
+	// Hash the spec to identify matching runs
+	specHash := fmt.Sprintf("%x", sha256.Sum256([]byte(cfg.Spec)))[:16]
+
+	// Look for a previous run with the same manifest and spec hash
+	prevRun, err := o.store.GetLatestRunForManifest(cfg.ManifestID)
+	if err != nil {
+		onEvent(OrchestratorEvent{Phase: "resume", Status: "warning",
+			Message: fmt.Sprintf("Could not check for previous run: %v", err)})
+		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+	}
+
+	if prevRun == nil || prevRun.SpecHash != specHash {
+		onEvent(OrchestratorEvent{Phase: "resume", Status: "fresh",
+			Message: "No matching previous run found, starting fresh"})
+		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+	}
+
+	onEvent(OrchestratorEvent{Phase: "resume", Status: "found",
+		Message: fmt.Sprintf("Found previous run %s (status: %s)", prevRun.ID, prevRun.Status)})
+
+	// Deserialize the tree from the previous run
+	if prevRun.TreeJSON == "" {
+		onEvent(OrchestratorEvent{Phase: "resume", Status: "warning",
+			Message: "Previous run has no tree data, starting fresh"})
+		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+	}
+
+	tree, err := DeserializeTree(prevRun.TreeJSON)
+	if err != nil {
+		onEvent(OrchestratorEvent{Phase: "resume", Status: "warning",
+			Message: fmt.Sprintf("Could not deserialize tree: %v, starting fresh", err)})
+		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+	}
+
+	// Get the summary of which cells passed
+	summary, err := o.store.GetRunSummary(prevRun.ID)
+	if err != nil {
+		onEvent(OrchestratorEvent{Phase: "resume", Status: "warning",
+			Message: fmt.Sprintf("Could not get run summary: %v, starting fresh", err)})
+		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+	}
+
+	// Create a new run record for this resumption
+	o.runID = fmt.Sprintf("run-%d", time.Now().UnixNano())
+	o.store.CreateOrchestrationRun(&store.OrchestrationRun{
+		ID:         o.runID,
+		SpecHash:   specHash,
+		ManifestID: cfg.ManifestID,
+		Status:     "running",
+		TreeJSON:   prevRun.TreeJSON,
+	})
+
+	// Load the manifest from the tree
+	manifest := tree.Manifest
+
+	// Collect leaves
+	leaves := collectLeaves(tree)
+	if len(leaves) == 0 {
+		onEvent(OrchestratorEvent{Phase: "resume", Status: "error",
+			Message: "No leaves in deserialized tree"})
+		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+	}
+
+	// Separate passed and failed leaves
+	var passedLeaves, failedLeaves []*DecompositionNode
+	for _, leaf := range leaves {
+		if summary[leaf.CellID] {
+			passedLeaves = append(passedLeaves, leaf)
+		} else {
+			failedLeaves = append(failedLeaves, leaf)
+		}
+	}
+
+	onEvent(OrchestratorEvent{Phase: "resume", Status: "summary",
+		Message: fmt.Sprintf("Previous run: %d passed, %d failed — re-implementing failed cells only",
+			len(passedLeaves), len(failedLeaves))})
+
+	// Reload passing cells from store into the REPL
+	for _, leaf := range passedLeaves {
+		onEvent(OrchestratorEvent{Phase: "resume", CellID: leaf.CellID, Status: "reloading",
+			Message: fmt.Sprintf("Reloading passing cell %s from store", leaf.CellID)})
+
+		result, err := br.InstantiateCellFromStore(leaf.CellID)
+		if err != nil {
+			onEvent(OrchestratorEvent{Phase: "resume", CellID: leaf.CellID, Status: "warning",
+				Message: fmt.Sprintf("Could not reload %s: %v, will re-implement", leaf.CellID, err)})
+			failedLeaves = append(failedLeaves, leaf)
+			continue
+		}
+		if result.IsError() {
+			onEvent(OrchestratorEvent{Phase: "resume", CellID: leaf.CellID, Status: "warning",
+				Message: fmt.Sprintf("Reload error for %s: %s, will re-implement", leaf.CellID, result.Ex)})
+			failedLeaves = append(failedLeaves, leaf)
+			continue
+		}
+
+		onEvent(OrchestratorEvent{Phase: "resume", CellID: leaf.CellID, Status: "reloaded",
+			Message: fmt.Sprintf("Cell %s reloaded from store", leaf.CellID)})
+	}
+
+	if len(failedLeaves) == 0 {
+		onEvent(OrchestratorEvent{Phase: "resume", Status: "all_passed",
+			Message: "All cells already passing, skipping to integration"})
+	} else {
+		// Implement only failed cells
+		leafNames := make([]string, len(failedLeaves))
+		for i, l := range failedLeaves {
+			leafNames[i] = l.CellID
+		}
+		onEvent(OrchestratorEvent{Phase: "resume", Status: "implementing",
+			Message: fmt.Sprintf("Re-implementing %d cells: %s", len(failedLeaves), strings.Join(leafNames, ", "))})
+
+		// Extract optional onReview callback for resume path
+		var resumeReviewFn OnReviewFunc
+		if len(onReview) > 0 {
+			resumeReviewFn = onReview[0]
+		}
+
+		cellErrors := o.implementLeavesWithReview(ctx, cfg, br, tree, failedLeaves, onChunk, onEvent, resumeReviewFn)
+
+		failCount := 0
+		for _, e := range cellErrors {
+			if e != nil {
+				failCount++
+			}
+		}
+		if failCount > 0 {
+			onEvent(OrchestratorEvent{Phase: "resume", Status: "partial",
+				Message: fmt.Sprintf("%d/%d re-implemented cells had errors", failCount, len(failedLeaves))})
+		}
+	}
+
+	// Register sub-workflows
+	subWorkflows := collectSubWorkflows(tree)
+	if len(subWorkflows) > 0 {
+		o.registerSubWorkflows(ctx, br, subWorkflows, onEvent)
+	}
+
+	// Integration testing
+	onEvent(OrchestratorEvent{Phase: "integration", Status: "started", Message: "Running integration tests..."})
+	err = o.integrationTest(ctx, cfg, br, manifest, onChunk, onEvent)
+	if err != nil {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "error", Message: err.Error()})
+	}
+
+	// Update run status
+	o.store.UpdateRunStatus(o.runID, "completed")
+
+	onEvent(OrchestratorEvent{Phase: "complete", Status: "done", Message: "Resumed orchestration complete"})
 	return nil
 }
 
@@ -186,16 +527,19 @@ func (o *Orchestrator) designManifest(ctx context.Context, cfg ProjectConfig, br
 	return manifest, tree, nil
 }
 
-// implementLeavesParallel implements all leaf cells from the decomposition tree in parallel.
-// Each leaf uses its parent's manifest as context for the TDD flow.
-// The CellBrief is built directly from the DecompositionNode, ensuring the cell ID,
-// schema, and doc match the decomposition contract.
-func (o *Orchestrator) implementLeavesParallel(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
+// implementLeavesWithReview implements all leaf cells with an optional test-review gate.
+// Phase A: generate test contracts in parallel
+// Phase B: review gate (loops until all approved/skipped) — skipped if onReview is nil or AutoApproveTests
+// Phase C: implement approved contracts in parallel
+func (o *Orchestrator) implementLeavesWithReview(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
 	tree *DecompositionNode, leaves []*DecompositionNode,
-	onChunk func(string, string), onEvent func(OrchestratorEvent)) []error {
+	onChunk func(string, string), onEvent func(OrchestratorEvent),
+	onReview OnReviewFunc) []error {
 
 	rootManifest := tree.Manifest
 
+	// Phase A: generate test contracts in parallel
+	contracts := make([]*TestContract, len(leaves))
 	errors := make([]error, len(leaves))
 	var wg sync.WaitGroup
 
@@ -204,9 +548,6 @@ func (o *Orchestrator) implementLeavesParallel(ctx context.Context, cfg ProjectC
 		go func(idx int, leaf *DecompositionNode) {
 			defer wg.Done()
 
-			// Build CellBrief directly from the decomposition node.
-			// This ensures the expected cell ID, schema, and doc are passed through
-			// to the LLM prompt and contract verification — no manifest lookup needed.
 			brief := CellBrief{
 				ID:       leaf.CellID,
 				Doc:      leaf.Doc,
@@ -214,22 +555,660 @@ func (o *Orchestrator) implementLeavesParallel(ctx context.Context, cfg ProjectC
 				Requires: leaf.Requires,
 			}
 
-			// Use the root manifest for context in prompts
-			manifestCtx := rootManifest
-
 			session, err := br.CloneSession()
 			if err != nil {
 				errors[idx] = fmt.Errorf("clone session for %s: %w", leaf.CellID, err)
 				return
 			}
-			defer br.CloseSession(session)
 
-			errors[idx] = o.implementCellWithTDD(ctx, cfg, br, session, manifestCtx, brief, onChunk, onEvent)
+			contract, genErr := o.generateTestContract(ctx, cfg, br, session, rootManifest, brief, onChunk, onEvent)
+			if genErr != nil {
+				br.CloseSession(session)
+				errors[idx] = genErr
+				return
+			}
+			contracts[idx] = contract
 		}(i, leaf)
 	}
-
 	wg.Wait()
+
+	// Phase B: review gate
+	if onReview != nil && !cfg.AutoApproveTests {
+		// Collect valid contracts that need review
+		var pending []*TestContract
+		for _, c := range contracts {
+			if c != nil && c.Err == nil {
+				pending = append(pending, c)
+			}
+		}
+
+		for len(pending) > 0 {
+			// Build slice of TestContracts to present
+			presentable := make([]TestContract, len(pending))
+			for i, c := range pending {
+				presentable[i] = *c
+			}
+
+			onEvent(OrchestratorEvent{Phase: "test_review", Status: "awaiting_review",
+				Message: fmt.Sprintf("Review test contracts for %d cells", len(pending))})
+
+			responses, err := onReview(presentable)
+			if err != nil {
+				onEvent(OrchestratorEvent{Phase: "test_review", Status: "error",
+					Message: fmt.Sprintf("Review error: %v — auto-approving all", err)})
+				break // auto-approve on error
+			}
+
+			// Build lookup
+			respMap := make(map[string]*ReviewResponse)
+			for i := range responses {
+				respMap[responses[i].CellID] = &responses[i]
+			}
+
+			var stillPending []*TestContract
+			for _, c := range pending {
+				resp, ok := respMap[c.CellID]
+				if !ok {
+					// No response for this cell — keep pending
+					stillPending = append(stillPending, c)
+					continue
+				}
+
+				switch resp.Decision {
+				case "approve":
+					onEvent(OrchestratorEvent{Phase: "test_review", CellID: c.CellID, Status: "approved",
+						Message: fmt.Sprintf("Tests approved for %s", c.CellID)})
+					// Persist to DB
+					if o.store != nil {
+						o.store.SaveTestContract(&store.TestContractRecord{
+							RunID: o.runID, CellID: c.CellID,
+							TestCode: c.TestCode, TestBody: c.TestBody,
+							ReviewNotes: c.ReviewNotes, Status: "approved",
+							Revision: c.Revision,
+						})
+					}
+
+				case "skip":
+					onEvent(OrchestratorEvent{Phase: "test_review", CellID: c.CellID, Status: "skipped",
+						Message: fmt.Sprintf("Cell %s skipped", c.CellID)})
+					c.Err = fmt.Errorf("skipped by user")
+					if o.store != nil {
+						o.store.SaveTestContract(&store.TestContractRecord{
+							RunID: o.runID, CellID: c.CellID,
+							TestCode: c.TestCode, TestBody: c.TestBody,
+							Status: "skipped", Revision: c.Revision,
+						})
+					}
+
+				case "edit":
+					// User modified test code directly
+					onEvent(OrchestratorEvent{Phase: "test_review", CellID: c.CellID, Status: "editing",
+						Message: fmt.Sprintf("Processing user edits for %s", c.CellID)})
+
+					c.Revision++
+					editPrompt := fmt.Sprintf(`The user edited the test code directly and provided these notes: %s
+
+Here is their updated code:
+`+"```clojure\n%s\n```"+`
+
+Review these tests for correctness — check that they compile, schemas match, and arithmetic is right.
+If you find issues, fix them and return corrected deftest forms in a code block.
+Otherwise say ALL TESTS VERIFIED.`, resp.Feedback, resp.EditedCode)
+
+					reviewResp, reviewErr := c.Agent.session.SendStream(ctx, c.Agent.client, editPrompt,
+						func(chunk string) { onChunk(c.CellID+"/review", chunk) })
+					if reviewErr != nil {
+						// Use user's edits as-is
+						c.TestBody = resp.EditedCode
+					} else {
+						corrected := extractSelfReviewCorrections(reviewResp)
+						if corrected != "" {
+							c.TestBody = corrected
+						} else {
+							c.TestBody = resp.EditedCode
+						}
+						c.ReviewNotes = reviewResp
+					}
+
+					// Reassemble and rewrite test file
+					c.TestCode = assembleTestSource(c.TestNs, c.CellNs, c.CellID, c.TestBody)
+					writeClojureFile(c.TestFile, c.TestCode)
+
+					// Re-present for next round
+					stillPending = append(stillPending, c)
+
+				case "revise":
+					// User provided notes, LLM regenerates
+					onEvent(OrchestratorEvent{Phase: "test_review", CellID: c.CellID, Status: "revising",
+						Message: fmt.Sprintf("Regenerating tests for %s with feedback", c.CellID)})
+
+					c.Revision++
+					revisePrompt := fmt.Sprintf(`The user reviewed your tests and wants these changes: %s
+
+Regenerate the deftest forms incorporating this feedback.
+Return ONLY deftest forms in a single code block.`, resp.Feedback)
+
+					reviseResp, reviseErr := c.Agent.session.SendStream(ctx, c.Agent.client, revisePrompt,
+						func(chunk string) { onChunk(c.CellID+"/revise", chunk) })
+					if reviseErr != nil {
+						stillPending = append(stillPending, c)
+						continue
+					}
+
+					newBody := ExtractFirstCodeBlock(reviseResp)
+					if newBody == "" {
+						stillPending = append(stillPending, c)
+						continue
+					}
+					newBody = requestContinuation(ctx, c.Agent, newBody, onChunk, c.CellID+"/revise")
+					c.TestBody = newBody
+
+					// Self-review the regenerated tests
+					reviewNotes := o.selfReviewTests(ctx, c, onChunk)
+					c.ReviewNotes = reviewNotes
+
+					// Reassemble
+					c.TestCode = assembleTestSource(c.TestNs, c.CellNs, c.CellID, c.TestBody)
+					writeClojureFile(c.TestFile, c.TestCode)
+
+					stillPending = append(stillPending, c)
+				}
+			}
+			pending = stillPending
+		}
+	} else {
+		// Auto-approve: persist all contracts
+		for _, c := range contracts {
+			if c != nil && c.Err == nil && o.store != nil {
+				o.store.SaveTestContract(&store.TestContractRecord{
+					RunID: o.runID, CellID: c.CellID,
+					TestCode: c.TestCode, TestBody: c.TestBody,
+					ReviewNotes: c.ReviewNotes, Status: "approved",
+					Revision: c.Revision,
+				})
+			}
+		}
+	}
+
+	// Phase C: implement approved contracts in parallel
+	var wg2 sync.WaitGroup
+	for i, c := range contracts {
+		if c == nil || c.Err != nil {
+			if c != nil && c.Err != nil {
+				errors[i] = c.Err
+			}
+			continue
+		}
+		wg2.Add(1)
+		go func(idx int, contract *TestContract) {
+			defer wg2.Done()
+			defer br.CloseSession(contract.Session)
+			errors[idx] = o.implementFromContract(ctx, cfg, br, contract, onChunk, onEvent)
+		}(i, c)
+	}
+	wg2.Wait()
 	return errors
+}
+
+// implementLeavesParallel is a backward-compatible wrapper that auto-approves all tests.
+func (o *Orchestrator) implementLeavesParallel(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
+	tree *DecompositionNode, leaves []*DecompositionNode,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) []error {
+	autoCfg := cfg
+	autoCfg.AutoApproveTests = true
+	return o.implementLeavesWithReview(ctx, autoCfg, br, tree, leaves, onChunk, onEvent, nil)
+}
+
+// generateTestContract generates tests for a single cell with LLM self-review.
+// Returns a TestContract holding the test code, LLM session, and nREPL session
+// (both preserved for the implementation phase).
+func (o *Orchestrator) generateTestContract(ctx context.Context, cfg ProjectConfig,
+	br *bridge.Bridge, session, manifest string, brief CellBrief,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) (*TestContract, error) {
+
+	cellID := brief.ID
+	if cellID == "" {
+		return nil, fmt.Errorf("CellBrief has empty ID")
+	}
+
+	agent := o.manager.NewCellAgent(cellID)
+
+	// Compute namespaces and file paths
+	nsSuffix := cellIDToNsSuffix(cellID)
+	cellNs := cfg.BaseNamespace + ".cells." + nsSuffix
+	testNs := cellNs + "-test"
+	srcFile := clojureNsToFile(cfg.ProjectPath, cfg.SourceDir, cellNs)
+	testFile := clojureNsToFile(cfg.ProjectPath, cfg.TestDir, testNs)
+
+	onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "started",
+		Message: fmt.Sprintf("Writing tests for %s", cellID)})
+
+	// Ask cell agent to write tests
+	testPrompt := fmt.Sprintf(`You are implementing cell %s using TDD (test-driven development).
+
+**Step 1: Write the test assertions first.**
+
+Here is the full specification:
+<spec>
+%s
+</spec>
+
+Here is the workflow manifest for context:
+`+"```edn\n%s\n```"+`
+
+Cell details:
+- **Cell ID:** %s
+- **Doc:** %s
+- **Schema:** %s
+- **Requires:** %s
+
+%s
+
+The test namespace already has these set up for you:
+- handler bound via: (def handler (:handler (cell/get-cell! %s)))
+- approx= helper: (defn approx= [x y tolerance] (< (Math/abs (- (double x) (double y))) tolerance))
+- clojure.test is required with [deftest is testing]
+
+Write ONLY deftest forms. Do NOT include:
+- (ns ...) declaration
+- require forms
+- handler binding
+- helper function definitions (approx= is already available)
+
+Call the handler as: (handler resources data)
+
+Example:
+`+"```clojure"+`
+(deftest test-basic-case
+  (let [resources {}
+        data {:amount 100.0}
+        result (handler resources data)]
+    (is (approx= (:total result) 110.0 0.01))))
+`+"```"+`
+
+Return ONLY deftest forms in a single code block.`,
+		cellID, cfg.Spec, manifest, cellID, brief.Doc, brief.Schema,
+		strings.Join(brief.Requires, ", "), mathPrecisionRules, cellID)
+
+	testResponse, err := agent.session.SendStream(ctx, agent.client, testPrompt,
+		func(chunk string) { onChunk(cellID+"/test", chunk) })
+	if err != nil {
+		return nil, fmt.Errorf("test generation for %s: %w", cellID, err)
+	}
+
+	testBody := ExtractFirstCodeBlock(testResponse)
+	if testBody == "" {
+		return nil, fmt.Errorf("no code block found in test response for %s", cellID)
+	}
+	testBody = requestContinuation(ctx, agent, testBody, onChunk, cellID+"/test")
+
+	// Assemble test code
+	var testCode string
+	if strings.Contains(testBody, "(ns ") {
+		testCode = testBody
+	} else {
+		testCode = assembleTestSource(testNs, cellNs, cellID, testBody)
+	}
+
+	// Write test file
+	if err := writeClojureFile(testFile, testCode); err != nil {
+		return nil, fmt.Errorf("write test file %s: %w", testFile, err)
+	}
+
+	// Lint fix loop
+	testCode, _ = o.lintFixLoop(ctx, agent, cellID, testCode, testFile, 3, onChunk, onEvent)
+
+	// Self-review: ask LLM to verify its own test expectations
+	contract := &TestContract{
+		CellID:   cellID,
+		Brief:    brief,
+		TestCode: testCode,
+		TestBody: testBody,
+		TestNs:   testNs,
+		CellNs:   cellNs,
+		TestFile: testFile,
+		SrcFile:  srcFile,
+		Session:  session,
+		Agent:    agent,
+	}
+
+	reviewNotes := o.selfReviewTests(ctx, contract, onChunk)
+	contract.ReviewNotes = reviewNotes
+
+	// Persist pending contract to DB
+	if o.store != nil {
+		o.store.SaveTestContract(&store.TestContractRecord{
+			RunID:       o.runID,
+			CellID:      cellID,
+			TestCode:    contract.TestCode,
+			TestBody:    contract.TestBody,
+			ReviewNotes: contract.ReviewNotes,
+			Status:      "pending",
+			Revision:    0,
+		})
+	}
+
+	onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "written",
+		Message: fmt.Sprintf("Test file written: %s", testFile)})
+
+	return contract, nil
+}
+
+// selfReviewTests sends the self-review prompt to the LLM in the same session
+// and applies any corrections it finds.
+func (o *Orchestrator) selfReviewTests(ctx context.Context, c *TestContract,
+	onChunk func(string, string)) string {
+
+	reviewPrompt := fmt.Sprintf(`You just wrote tests for cell %s. Review them critically.
+
+For EACH test case:
+1. Derive each expected numeric value step-by-step from the spec's rules.
+   Show your arithmetic. If the spec doesn't provide worked examples, work through your own.
+2. Quote the spec section that justifies each test scenario.
+3. Check: do inputs match the declared schema? Do expected outputs?
+
+For each test:
+- CORRECT: [name] — [reasoning]
+- WRONG: [name] — [error] — [corrected value]
+
+If any are WRONG, return corrected deftest forms in a code block.
+If all CORRECT, say "ALL TESTS VERIFIED" (no code block).`, c.CellID)
+
+	reviewResp, err := c.Agent.session.SendStream(ctx, c.Agent.client, reviewPrompt,
+		func(chunk string) { onChunk(c.CellID+"/self-review", chunk) })
+	if err != nil {
+		return "self-review failed: " + err.Error()
+	}
+
+	// Check if corrections were provided
+	corrected := extractSelfReviewCorrections(reviewResp)
+	if corrected != "" {
+		c.TestBody = corrected
+		c.TestCode = assembleTestSource(c.TestNs, c.CellNs, c.CellID, c.TestBody)
+		writeClojureFile(c.TestFile, c.TestCode)
+	}
+
+	return reviewResp
+}
+
+// extractSelfReviewCorrections extracts corrected deftest forms from a self-review response.
+// Returns empty string if the response indicates all tests are correct ("ALL TESTS VERIFIED").
+func extractSelfReviewCorrections(response string) string {
+	if strings.Contains(response, "ALL TESTS VERIFIED") {
+		return ""
+	}
+	code := ExtractFirstCodeBlock(response)
+	if code == "" {
+		return ""
+	}
+	// Only return if it looks like deftest forms
+	if strings.Contains(code, "deftest") {
+		return code
+	}
+	return ""
+}
+
+// implementFromContract implements a cell against locked (approved) test contracts.
+// Uses the preserved LLM session (which has full conversation context from test generation).
+func (o *Orchestrator) implementFromContract(ctx context.Context, cfg ProjectConfig,
+	br *bridge.Bridge, contract *TestContract,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
+
+	cellID := contract.CellID
+	brief := contract.Brief
+	agent := contract.Agent
+	session := contract.Session
+	cellNs := contract.CellNs
+	testNs := contract.TestNs
+	srcFile := contract.SrcFile
+	testFile := contract.TestFile
+	testCode := contract.TestCode
+
+	runID := o.runID
+
+	// Ask cell agent to implement the cell
+	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "started",
+		Message: fmt.Sprintf("Implementing %s", cellID)})
+
+	implPrompt := fmt.Sprintf(`Good. Now implement the cell to pass those tests.
+
+The cell namespace and defcell wrapper are generated for you.
+The cell will be:
+  Cell ID: %s
+  Schema: %s
+  Namespace: %s
+
+Write ONLY:
+1. (OPTIONAL) Helper functions — define any helper functions you need
+2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
+
+If you need extra requires beyond [mycelium.cell :as cell], list each as a comment:
+;; REQUIRE: [clojure.string :as str]
+;; REQUIRE: [clojure.set :as set]
+
+%s
+
+Example:
+`+"```clojure"+`
+;; REQUIRE: [clojure.string :as str]
+
+(defn round2 [x]
+  (.doubleValue (.setScale (bigdec x) 2 java.math.RoundingMode/HALF_UP)))
+
+(fn [resources data]
+  (let [items (:items data)
+        total (reduce + (map :price items))]
+    {:total (round2 total)}))
+`+"```"+`
+
+Return ONLY helper functions and the (fn ...) form in a single code block.
+Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
+		cellID, brief.Schema, cellNs, mathPrecisionRules)
+
+	implResponse, err := agent.session.SendStream(ctx, agent.client, implPrompt,
+		func(chunk string) { onChunk(cellID+"/impl", chunk) })
+	if err != nil {
+		return fmt.Errorf("implementation for %s: %w", cellID, err)
+	}
+
+	rawImpl := ExtractFirstCodeBlock(implResponse)
+	if rawImpl == "" {
+		return fmt.Errorf("no code block found in implementation response for %s", cellID)
+	}
+	rawImpl = requestContinuation(ctx, agent, rawImpl, onChunk, cellID+"/impl")
+
+	// Assemble implementation
+	var implCode string
+	if strings.Contains(rawImpl, "(ns ") {
+		implCode = rawImpl
+	} else {
+		fnBody := ExtractFnBody(rawImpl)
+		if fnBody == "" {
+			fnBody = rawImpl
+		}
+		helpers := ExtractHelpers(rawImpl)
+		extraReqs := ExtractExtraRequires(rawImpl)
+		implCode = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+			brief.Requires, extraReqs, helpers, fnBody)
+	}
+
+	// Write source file
+	if err := writeClojureFile(srcFile, implCode); err != nil {
+		return fmt.Errorf("write source file %s: %w", srcFile, err)
+	}
+
+	// Lint fix loop
+	implCode, _ = o.lintFixLoop(ctx, agent, cellID, implCode, srcFile, 3, onChunk, onEvent)
+
+	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "written",
+		Message: fmt.Sprintf("Source file written: %s", srcFile)})
+
+	// Load implementation in REPL
+	br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, cellNs, cellNs))
+	evalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
+	if err != nil {
+		return fmt.Errorf("eval implementation %s: %w", cellID, err)
+	}
+
+	if evalResult.IsError() {
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
+			Message: fmt.Sprintf("Compilation error: %s", evalResult.Ex)})
+
+		fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, evalResult, srcFile, br, session, brief, cellNs, onChunk)
+		if fixErr != nil {
+			return fmt.Errorf("fix implementation %s: %w", cellID, fixErr)
+		}
+		implCode = fixResult
+	}
+
+	// Contract verification
+	implCode, err = o.verifyCellContract(ctx, agent, br, session, cellID, brief, implCode, srcFile, cellNs, onChunk, onEvent)
+	if err != nil {
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
+			Message: fmt.Sprintf("Contract verification failed: %v", err)})
+	}
+
+	// Load test file
+	br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, testNs, testNs))
+	testEvalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, testFile))
+	if err != nil {
+		return fmt.Errorf("eval test %s: %w", cellID, err)
+	}
+	if testEvalResult.IsError() {
+		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
+			Message: fmt.Sprintf("Test compilation error: %s", testEvalResult.Ex)})
+
+		fixResult, fixErr := o.fixTestCode(ctx, agent, cellID, testCode, testEvalResult, testFile, br, session, testNs, cellNs, onChunk)
+		if fixErr != nil {
+			return fmt.Errorf("fix tests %s: %w", cellID, fixErr)
+		}
+		testCode = fixResult
+	}
+
+	// Run tests with fix cycle
+	maxAttempts := 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "running",
+			Message: fmt.Sprintf("Running tests (attempt %d/%d)", attempt, maxAttempts)})
+
+		testOutput, testErr := runTestsInSession(br, session, srcFile, testFile, cellNs, testNs)
+		if testErr != nil {
+			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
+				Message: fmt.Sprintf("Test run error: %v", testErr)})
+			break
+		}
+
+		if o.store != nil && runID != "" {
+			o.store.SaveCellAttempt(&store.CellAttempt{
+				RunID:         runID,
+				CellID:        cellID,
+				AttemptType:   "test",
+				AttemptNumber: attempt,
+				Code:          implCode,
+				TestCode:      testCode,
+				Output:        testOutput,
+				Passed:        isTestSuccess(testOutput),
+			})
+		}
+
+		if isTestSuccess(testOutput) {
+			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "passed",
+				Message: fmt.Sprintf("All tests passed for %s", cellID)})
+
+			_, saveErr := o.store.SaveCell(&store.Cell{
+				ID:        cellID,
+				Handler:   ExtractDefcell(implCode),
+				Schema:    brief.Schema,
+				Doc:       brief.Doc,
+				Requires:  fmt.Sprintf("[%s]", strings.Join(brief.Requires, " ")),
+				CreatedBy: "cell-agent-tdd",
+			})
+			if saveErr != nil {
+				onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "warning",
+					Message: fmt.Sprintf("Save to store failed: %v", saveErr)})
+			}
+			return nil
+		}
+
+		if attempt >= maxAttempts {
+			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "failed",
+				Message: fmt.Sprintf("Tests still failing after %d attempts", maxAttempts)})
+			return fmt.Errorf("tests still failing after %d attempts for %s", maxAttempts, cellID)
+		}
+
+		// Ask cell agent to fix
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "fixing",
+			Message: "Tests failed, asking for fix..."})
+
+		fixPrompt := fmt.Sprintf(`The tests are failing. Test output:
+
+`+"```\n%s\n```"+`
+
+Here are the tests for reference:
+
+`+"```clojure\n%s\n```"+`
+
+%s
+
+Fix the implementation. Return ONLY:
+1. (OPTIONAL) Helper functions
+2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
+
+If you need extra requires, add: ;; REQUIRE: [lib.name :as alias]
+Do NOT include (ns ...) or (cell/defcell ...).
+CRITICAL: The cell ID is %s.`, testOutput, testCode, mathPrecisionRules, cellID)
+
+		fixResponse, fixErr := agent.session.SendStream(ctx, agent.client, fixPrompt,
+			func(chunk string) { onChunk(cellID+"/fix", chunk) })
+		if fixErr != nil {
+			return fmt.Errorf("fix iteration %d for %s: %w", attempt, cellID, fixErr)
+		}
+
+		extracted := ExtractFirstCodeBlock(fixResponse)
+		if extracted == "" {
+			continue
+		}
+		extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/fix")
+
+		if strings.Contains(extracted, "(ns ") {
+			implCode = extracted
+		} else {
+			fnBody := ExtractFnBody(extracted)
+			if fnBody == "" {
+				fnBody = extracted
+			}
+			helpers := ExtractHelpers(extracted)
+			extraReqs := ExtractExtraRequires(extracted)
+			implCode = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+				brief.Requires, extraReqs, helpers, fnBody)
+		}
+		if err := writeClojureFile(srcFile, implCode); err != nil {
+			return fmt.Errorf("write fixed source %s: %w", srcFile, err)
+		}
+
+		implCode, _ = o.lintFixLoop(ctx, agent, cellID, implCode, srcFile, 2, onChunk, onEvent)
+
+		evalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
+		if err != nil {
+			return fmt.Errorf("eval fixed implementation %s: %w", cellID, err)
+		}
+		if evalResult.IsError() {
+			onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
+				Message: fmt.Sprintf("Fix compilation error: %s", evalResult.Ex)})
+
+			fixResult, compFixErr := o.fixCellCode(ctx, agent, cellID, implCode, evalResult, srcFile, br, session, brief, cellNs, onChunk)
+			if compFixErr != nil {
+				onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
+					Message: fmt.Sprintf("Could not fix compilation: %v", compFixErr)})
+			} else {
+				implCode = fixResult
+			}
+		} else {
+			implCode, _ = o.verifyCellContract(ctx, agent, br, session, cellID, brief, implCode, srcFile, cellNs, onChunk, onEvent)
+		}
+	}
+
+	return nil
 }
 
 // registerSubWorkflows registers non-leaf nodes as workflow cells, bottom-up.
@@ -349,327 +1328,25 @@ func (o *Orchestrator) implementCellsParallel(ctx context.Context, cfg ProjectCo
 	return errors
 }
 
-// implementCellWithTDD implements a single cell using TDD:
-// 1. Ask cell agent to write tests
-// 2. Write test file, eval in REPL
-// 3. Ask cell agent to implement the cell
-// 4. Write source file, eval in REPL
-// 5. Verify cell contract (correct ID registered)
-// 6. Run tests, iterate on failures
-// Each cell gets its own nREPL session for isolation.
-// The CellBrief is passed directly from the caller (decomposition tree or manifest extraction),
-// ensuring contract expectations (cell ID, schema, doc) are authoritative.
+// implementCellWithTDD implements a single cell using TDD (generate tests → implement → iterate).
+// This is a convenience wrapper used by implementCellsParallel (flat path).
+// It delegates to generateTestContract + implementFromContract with auto-approval.
 func (o *Orchestrator) implementCellWithTDD(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
 	session, manifest string, brief CellBrief,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
 
-	cellID := brief.ID
-	if cellID == "" {
-		return fmt.Errorf("CellBrief has empty ID")
-	}
-	agent := o.manager.NewCellAgent(cellID)
-
-	// Compute namespaces and file paths from cell ID
-	// Use cellIDToNsSuffix to derive a unique namespace that avoids collisions
-	// between cells with the same step name in different sub-workflows
-	nsSuffix := cellIDToNsSuffix(cellID)
-	cellNs := cfg.BaseNamespace + ".cells." + nsSuffix
-	testNs := cellNs + "-test"
-	srcFile := clojureNsToFile(cfg.ProjectPath, cfg.SourceDir, cellNs)
-	testFile := clojureNsToFile(cfg.ProjectPath, cfg.TestDir, testNs)
-
-	onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "started",
-		Message: fmt.Sprintf("Writing tests for %s", cellID)})
-
-	// Turn 1: Ask cell agent to write tests
-	testPrompt := fmt.Sprintf(`You are implementing cell %s using TDD (test-driven development).
-
-**Step 1: Write the test file first.**
-
-Here is the full specification:
-<spec>
-%s
-</spec>
-
-Here is the workflow manifest for context:
-`+"```edn\n%s\n```"+`
-
-Cell details:
-- **Cell ID:** %s (EXACT — tests MUST use this ID)
-- **Doc:** %s
-- **Schema:** %s
-- **Requires:** %s
-
-Write the test namespace `+"`%s`"+` using clojure.test.
-The test file should:
-- Require the cell namespace %s (which will contain the defcell)
-- Define test cases that cover the business logic described in the spec
-- Test the cell handler by calling: (let [handler (:handler (cell/get-cell! %s))] (handler resources data))
-- Include edge cases and boundary conditions
-- Set up realistic test data (resources, input maps) based on the spec
-- If you need a helper function (e.g. for approximate equality), define it in the test namespace — do NOT use undefined symbols
-- Use only clojure.test/is, clojure.test/deftest, clojure.test/testing — no external test libraries
-
-CRITICAL: The cell ID is %s — use EXACTLY this keyword in (cell/get-cell! %s) calls.
-
-Return ONLY the complete test namespace code in a single code block. Do NOT implement the cell yet.`,
-		cellID, cfg.Spec, manifest, cellID, brief.Doc, brief.Schema,
-		strings.Join(brief.Requires, ", "), testNs, cellNs, cellID, cellID, cellID)
-
-	testResponse, err := agent.session.SendStream(ctx, agent.client, testPrompt,
-		func(chunk string) { onChunk(cellID+"/test", chunk) })
+	contract, err := o.generateTestContract(ctx, cfg, br, session, manifest, brief, onChunk, onEvent)
 	if err != nil {
-		return fmt.Errorf("test generation for %s: %w", cellID, err)
+		return err
 	}
-
-	testCode := ExtractFirstCodeBlock(testResponse)
-	if testCode == "" {
-		return fmt.Errorf("no code block found in test response for %s", cellID)
-	}
-	testCode = requestContinuation(ctx, agent, testCode, onChunk, cellID+"/test")
-
-	// Write test file
-	if err := writeClojureFile(testFile, testCode); err != nil {
-		return fmt.Errorf("write test file %s: %w", testFile, err)
-	}
-
-	// Lint test file with clj-kondo
-	if lintErrors := lintClojureFile(testFile); lintErrors != "" {
-		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "lint_error",
-			Message: fmt.Sprintf("Test lint errors: %s", lintErrors)})
-		lintResult := &bridge.EvalResult{Ex: "clj-kondo lint errors", Err: lintErrors}
-		fixResult, fixErr := o.fixTestCode(ctx, agent, cellID, testCode, lintResult, testFile, br, session, onChunk)
-		if fixErr != nil {
-			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
-				Message: fmt.Sprintf("Could not fix test lint errors: %v", fixErr)})
-		} else {
-			testCode = fixResult
-		}
-	}
-
-	onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "written",
-		Message: fmt.Sprintf("Test file written: %s", testFile)})
-
-	// Turn 2: Ask cell agent to implement the cell
-	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "started",
-		Message: fmt.Sprintf("Implementing %s", cellID)})
-
-	implPrompt := fmt.Sprintf(`Good. Now implement the cell to pass those tests.
-
-Write the source namespace `+"`%s`"+` containing the cell/defcell form.
-
-CRITICAL CONTRACT — your code MUST satisfy ALL of these:
-1. The cell ID MUST be EXACTLY %s — the first argument to cell/defcell
-2. The schema MUST be %s
-3. The handler takes two arguments: [resources data]
-
-Example structure:
-`+"```clojure"+`
-(ns %s
-  (:require [mycelium.cell :as cell]))
-
-(cell/defcell %s
-  {:doc "%s"
-   :schema %s}
-  (fn [resources data]
-    ;; your implementation here
-    ))
-`+"```"+`
-
-The namespace should:
-- Require [mycelium.cell :as cell] and any other dependencies needed
-- Contain the complete (cell/defcell %s ...) form with EXACTLY that cell ID
-- Implement all the business logic described in the spec and tested in the test file
-
-Return ONLY the complete source namespace code in a single code block.`,
-		cellNs, cellID, brief.Schema, cellNs, cellID, brief.Doc, brief.Schema, cellID)
-
-	implResponse, err := agent.session.SendStream(ctx, agent.client, implPrompt,
-		func(chunk string) { onChunk(cellID+"/impl", chunk) })
-	if err != nil {
-		return fmt.Errorf("implementation for %s: %w", cellID, err)
-	}
-
-	implCode := ExtractFirstCodeBlock(implResponse)
-	if implCode == "" {
-		return fmt.Errorf("no code block found in implementation response for %s", cellID)
-	}
-	implCode = requestContinuation(ctx, agent, implCode, onChunk, cellID+"/impl")
-
-	// Write source file
-	if err := writeClojureFile(srcFile, implCode); err != nil {
-		return fmt.Errorf("write source file %s: %w", srcFile, err)
-	}
-
-	// Lint with clj-kondo before loading in REPL
-	if lintErrors := lintClojureFile(srcFile); lintErrors != "" {
-		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "lint_error",
-			Message: fmt.Sprintf("Lint errors: %s", lintErrors)})
-		// Feed lint errors to LLM for fix before even trying REPL
-		lintResult := &bridge.EvalResult{Ex: "clj-kondo lint errors", Err: lintErrors}
-		fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, lintResult, srcFile, br, session, onChunk)
-		if fixErr != nil {
-			onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
-				Message: fmt.Sprintf("Could not fix lint errors: %v", fixErr)})
-		} else {
-			implCode = fixResult
-		}
-	}
-
-	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "written",
-		Message: fmt.Sprintf("Source file written: %s", srcFile)})
-
-	// Load implementation in REPL via load-file in this cell's session
-	// Remove existing ns first to clear stale definitions from previous runs
-	br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, cellNs, cellNs))
-	evalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
-	if err != nil {
-		return fmt.Errorf("eval implementation %s: %w", cellID, err)
-	}
-
-	if evalResult.IsError() {
-		// Try to fix with one iteration
-		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
-			Message: fmt.Sprintf("Compilation error: %s", evalResult.Ex)})
-
-		fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, evalResult, srcFile, br, session, onChunk)
-		if fixErr != nil {
-			return fmt.Errorf("fix implementation %s: %w", cellID, fixErr)
-		}
-		implCode = fixResult
-	}
-
-	// Contract verification: ensure the cell registered under the expected ID.
-	// This catches the common failure where the LLM uses a different cell ID
-	// than what the manifest/decomposition tree expects.
-	implCode, err = o.verifyCellContract(ctx, agent, br, session, cellID, brief, implCode, srcFile, onChunk, onEvent)
-	if err != nil {
-		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
-			Message: fmt.Sprintf("Contract verification failed: %v", err)})
-		// Continue to test phase anyway — tests will also catch the issue
-	}
-
-	// Load test file in REPL — remove stale ns first
-	br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, testNs, testNs))
-	testEvalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, testFile))
-	if err != nil {
-		return fmt.Errorf("eval test %s: %w", cellID, err)
-	}
-	if testEvalResult.IsError() {
-		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
-			Message: fmt.Sprintf("Test compilation error: %s", testEvalResult.Ex)})
-
-		fixResult, fixErr := o.fixTestCode(ctx, agent, cellID, testCode, testEvalResult, testFile, br, session, onChunk)
-		if fixErr != nil {
-			return fmt.Errorf("fix tests %s: %w", cellID, fixErr)
-		}
-		testCode = fixResult
-	}
-
-	// Run tests with fix cycle
-	maxAttempts := 5
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "running",
-			Message: fmt.Sprintf("Running tests (attempt %d/%d)", attempt, maxAttempts)})
-
-		testOutput, testErr := runTestsInSession(br, session, srcFile, testFile, cellNs, testNs)
-		if testErr != nil {
-			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
-				Message: fmt.Sprintf("Test run error: %v", testErr)})
-			break
-		}
-
-		if isTestSuccess(testOutput) {
-			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "passed",
-				Message: fmt.Sprintf("All tests passed for %s", cellID)})
-
-			// Save to store
-			_, saveErr := o.store.SaveCell(&store.Cell{
-				ID:        cellID,
-				Handler:   ExtractDefcell(implCode),
-				Schema:    brief.Schema,
-				Doc:       brief.Doc,
-				Requires:  fmt.Sprintf("[%s]", strings.Join(brief.Requires, " ")),
-				CreatedBy: "cell-agent-tdd",
-			})
-			if saveErr != nil {
-				onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "warning",
-					Message: fmt.Sprintf("Save to store failed: %v", saveErr)})
-			}
-			return nil
-		}
-
-		if attempt >= maxAttempts {
-			onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "failed",
-				Message: fmt.Sprintf("Tests still failing after %d attempts", maxAttempts)})
-			break
-		}
-
-		// Ask cell agent to fix
-		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "fixing",
-			Message: "Tests failed, asking for fix..."})
-
-		fixPrompt := fmt.Sprintf(`The tests are failing. Test output:
-
-`+"```\n%s\n```"+`
-
-Here are the tests for reference:
-
-`+"```clojure\n%s\n```"+`
-
-Fix the cell implementation to pass all tests.
-Return the COMPLETE updated source namespace in a single code block.
-Do NOT include any explanation outside the code block.
-CRITICAL: The cell ID MUST remain EXACTLY %s in the (cell/defcell ...) form.`, testOutput, testCode, cellID)
-
-		fixResponse, fixErr := agent.session.SendStream(ctx, agent.client, fixPrompt,
-			func(chunk string) { onChunk(cellID+"/fix", chunk) })
-		if fixErr != nil {
-			return fmt.Errorf("fix iteration %d for %s: %w", attempt, cellID, fixErr)
-		}
-
-		extracted := ExtractFirstCodeBlock(fixResponse)
-		if extracted == "" {
-			// No code block found — keep previous version and continue to next attempt
-			continue
-		}
-		extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/fix")
-		implCode = extracted
-		if err := writeClojureFile(srcFile, implCode); err != nil {
-			return fmt.Errorf("write fixed source %s: %w", srcFile, err)
-		}
-
-		evalResult, err := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
-		if err != nil {
-			return fmt.Errorf("eval fixed implementation %s: %w", cellID, err)
-		}
-		if evalResult.IsError() {
-			// Compilation error — try to fix immediately rather than wasting a test run
-			onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
-				Message: fmt.Sprintf("Fix compilation error: %s", evalResult.Ex)})
-
-			fixResult, compFixErr := o.fixCellCode(ctx, agent, cellID, implCode, evalResult, srcFile, br, session, onChunk)
-			if compFixErr != nil {
-				onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "error",
-					Message: fmt.Sprintf("Could not fix compilation: %v", compFixErr)})
-				// Continue to next attempt — runTests reload will show the error
-			} else {
-				implCode = fixResult
-			}
-		} else {
-			// Load succeeded — verify contract
-			implCode, _ = o.verifyCellContract(ctx, agent, br, session, cellID, brief, implCode, srcFile, onChunk, onEvent)
-		}
-	}
-
-	return nil
+	return o.implementFromContract(ctx, cfg, br, contract, onChunk, onEvent)
 }
 
 // verifyCellContract checks that a cell registered in the REPL matches the expected contract
 // from the decomposition tree. If the cell ID is wrong, it feeds a clear error to the LLM
 // and retries. Returns the (possibly fixed) implementation code.
 func (o *Orchestrator) verifyCellContract(ctx context.Context, agent *CellAgent, br *bridge.Bridge,
-	session, cellID string, brief CellBrief, implCode, srcFile string,
+	session, cellID string, brief CellBrief, implCode, srcFile, cellNs string,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) (string, error) {
 
 	contract := bridge.CellContract{
@@ -712,7 +1389,7 @@ WRONG (any other keyword):
 Fix the cell ID and return the COMPLETE corrected namespace.`, cellID, cellID, cellID),
 	}
 
-	fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, contractFixResult, srcFile, br, session, onChunk)
+	fixResult, fixErr := o.fixCellCode(ctx, agent, cellID, implCode, contractFixResult, srcFile, br, session, brief, cellNs, onChunk)
 	if fixErr != nil {
 		return implCode, fmt.Errorf("contract fix failed: %w", fixErr)
 	}
@@ -730,9 +1407,64 @@ Fix the cell ID and return the COMPLETE corrected namespace.`, cellID, cellID, c
 	return fixResult, nil
 }
 
+// lintFixLoop runs clj-kondo on a file and asks LLM to fix syntax errors.
+// Does NOT count against the TDD test-attempt budget.
+// Returns the fixed code or error after maxLintAttempts.
+func (o *Orchestrator) lintFixLoop(ctx context.Context, agent *CellAgent, cellID, code, filePath string,
+	maxLintAttempts int, onChunk func(string, string), onEvent func(OrchestratorEvent)) (string, error) {
+
+	for i := 0; i < maxLintAttempts; i++ {
+		lintErrors := lintClojureFile(filePath)
+		if lintErrors == "" {
+			return code, nil // clean
+		}
+
+		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "lint_fix",
+			Message: fmt.Sprintf("Lint error (fix %d/%d): %s", i+1, maxLintAttempts, lintErrors)})
+
+		// Targeted syntax-only fix prompt
+		fixPrompt := fmt.Sprintf(`The code has syntax errors detected by clj-kondo:
+
+%s
+
+Here is the code:
+
+`+"```clojure\n%s\n```"+`
+
+Fix ONLY the syntax errors. Do not change any logic.
+Return the COMPLETE corrected code in a single code block.`, lintErrors, code)
+
+		fixResponse, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
+			func(chunk string) { onChunk(cellID+"/lint-fix", chunk) })
+		if err != nil {
+			return code, fmt.Errorf("lint fix %d: %w", i+1, err)
+		}
+
+		fixed := ExtractFirstCodeBlock(fixResponse)
+		if fixed == "" {
+			continue
+		}
+		fixed = requestContinuation(ctx, agent, fixed, onChunk, cellID+"/lint-fix")
+		code = fixed
+
+		if err := writeClojureFile(filePath, code); err != nil {
+			return code, err
+		}
+	}
+
+	// Check one more time after all attempts
+	if lintErrors := lintClojureFile(filePath); lintErrors != "" {
+		return code, fmt.Errorf("lint errors persist after %d attempts: %s", maxLintAttempts, lintErrors)
+	}
+	return code, nil
+}
+
 // fixCellCode asks the cell agent to fix a compilation error and retries eval.
+// Uses deterministic scaffolding: the LLM only returns fn body + helpers,
+// which are assembled into the full namespace in Go.
 func (o *Orchestrator) fixCellCode(ctx context.Context, agent *CellAgent, cellID, code string,
 	evalResult *bridge.EvalResult, filePath string, br *bridge.Bridge, session string,
+	brief CellBrief, cellNs string,
 	onChunk func(string, string)) (string, error) {
 
 	errMsg := evalResult.Ex
@@ -748,10 +1480,13 @@ Here is the code that failed:
 
 `+"```clojure\n%s\n```"+`
 
-Fix the issue and return the COMPLETE corrected namespace in a single code block.
-Do NOT include any explanation outside the code block.
-The code must start with (ns ...) and contain a (cell/defcell %s ...) form.
-CRITICAL: The cell ID MUST be EXACTLY %s.`, errMsg, code, cellID, cellID)
+Fix the issue. Return ONLY:
+1. (OPTIONAL) Helper functions
+2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
+
+If you need extra requires, add: ;; REQUIRE: [lib.name :as alias]
+Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.
+CRITICAL: The cell ID is %s.`, errMsg, code, cellID)
 
 	fixResponse, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 		func(chunk string) { onChunk(cellID+"/fix", chunk) })
@@ -759,11 +1494,26 @@ CRITICAL: The cell ID MUST be EXACTLY %s.`, errMsg, code, cellID, cellID)
 		return "", err
 	}
 
-	fixed := ExtractFirstCodeBlock(fixResponse)
-	if fixed == "" {
+	extracted := ExtractFirstCodeBlock(fixResponse)
+	if extracted == "" {
 		return code, fmt.Errorf("no code block in fix response")
 	}
-	fixed = requestContinuation(ctx, agent, fixed, onChunk, cellID+"/fix")
+	extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/fix")
+
+	// Assemble deterministically or use as-is if full namespace
+	var fixed string
+	if strings.Contains(extracted, "(ns ") {
+		fixed = extracted
+	} else {
+		fnBody := ExtractFnBody(extracted)
+		if fnBody == "" {
+			fnBody = extracted
+		}
+		helpers := ExtractHelpers(extracted)
+		extraReqs := ExtractExtraRequires(extracted)
+		fixed = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+			brief.Requires, extraReqs, helpers, fnBody)
+	}
 
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
@@ -781,8 +1531,11 @@ CRITICAL: The cell ID MUST be EXACTLY %s.`, errMsg, code, cellID, cellID)
 }
 
 // fixTestCode asks the cell agent to fix a test compilation error.
+// Uses deterministic scaffolding: the LLM only returns deftest forms,
+// which are assembled into the full test namespace in Go.
 func (o *Orchestrator) fixTestCode(ctx context.Context, agent *CellAgent, cellID, code string,
 	evalResult *bridge.EvalResult, filePath string, br *bridge.Bridge, session string,
+	testNs, cellNs string,
 	onChunk func(string, string)) (string, error) {
 
 	errMsg := evalResult.Ex
@@ -798,9 +1551,13 @@ Here is the test code that failed:
 
 `+"```clojure\n%s\n```"+`
 
-Fix the test file and return the COMPLETE corrected test namespace in a single code block.
-Do NOT include any explanation outside the code block.
-The code must start with (ns ...) and contain deftest forms.`, errMsg, code)
+Fix the test. Return ONLY deftest forms. Do NOT include:
+- (ns ...) declaration
+- require forms
+- handler binding
+- helper function definitions (approx= is already available)
+
+Call the handler as: (handler resources data)`, errMsg, code)
 
 	fixResponse, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 		func(chunk string) { onChunk(cellID+"/test-fix", chunk) })
@@ -808,11 +1565,19 @@ The code must start with (ns ...) and contain deftest forms.`, errMsg, code)
 		return "", err
 	}
 
-	fixed := ExtractFirstCodeBlock(fixResponse)
-	if fixed == "" {
+	extracted := ExtractFirstCodeBlock(fixResponse)
+	if extracted == "" {
 		return code, fmt.Errorf("no code block in test fix response")
 	}
-	fixed = requestContinuation(ctx, agent, fixed, onChunk, cellID+"/test-fix")
+	extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/test-fix")
+
+	// Assemble deterministically or use as-is if full namespace
+	var fixed string
+	if strings.Contains(extracted, "(ns ") {
+		fixed = extracted
+	} else {
+		fixed = assembleTestSource(testNs, cellNs, cellID, extracted)
+	}
 
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
@@ -927,6 +1692,62 @@ Return the code in a single code block. I will evaluate it in the REPL.`, manife
 		Message: fmt.Sprintf("Integration test output:\n%s", output)})
 
 	return nil
+}
+
+// assembleCellSource builds the complete cell namespace deterministically.
+// Only fnBody and helpers come from the LLM.
+func assembleCellSource(cellNs, cellID, doc, schema string,
+	requires []string, extraReqs []string, helpers, fnBody string) string {
+	var b strings.Builder
+
+	// Namespace declaration
+	fmt.Fprintf(&b, "(ns %s\n", cellNs)
+	b.WriteString("  (:require [mycelium.cell :as cell]")
+	for _, r := range extraReqs {
+		fmt.Fprintf(&b, "\n            %s", r)
+	}
+	b.WriteString("))\n")
+
+	// Helper functions
+	if helpers != "" {
+		b.WriteString("\n")
+		b.WriteString(helpers)
+		b.WriteString("\n")
+	}
+
+	// defcell form
+	b.WriteString("\n(cell/defcell ")
+	b.WriteString(cellID)
+	b.WriteString("\n  {:doc \"")
+	b.WriteString(strings.ReplaceAll(doc, `"`, `\"`))
+	b.WriteString("\"\n   :schema ")
+	b.WriteString(schema)
+	b.WriteString("}\n  ")
+	b.WriteString(fnBody)
+	b.WriteString(")\n")
+
+	return b.String()
+}
+
+// assembleTestSource builds the complete test namespace deterministically.
+// Only testBody (deftest forms) comes from the LLM.
+func assembleTestSource(testNs, cellNs, cellID string, testBody string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "(ns %s\n", testNs)
+	fmt.Fprintf(&b, "  (:require [clojure.test :refer [deftest is testing]]\n")
+	fmt.Fprintf(&b, "            [mycelium.cell :as cell]\n")
+	fmt.Fprintf(&b, "            [%s]))\n", cellNs)
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "(def handler (:handler (cell/get-cell! %s)))\n", cellID)
+	b.WriteString("\n")
+	b.WriteString("(defn approx= [x y tolerance]\n")
+	b.WriteString("  (< (Math/abs (- (double x) (double y))) tolerance))\n")
+	b.WriteString("\n")
+	b.WriteString(testBody)
+	b.WriteString("\n")
+
+	return b.String()
 }
 
 // --- Helpers ---

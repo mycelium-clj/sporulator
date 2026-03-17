@@ -14,14 +14,21 @@ import (
 	"github.com/mycelium-clj/sporulator/pkg/store"
 )
 
+// reviewGate is a channel-based gate for blocking until the user responds to a test review.
+type reviewGate struct {
+	ch chan []agents.ReviewResponse
+}
+
 // Server is the Sporulator HTTP/WebSocket server.
 type Server struct {
-	store   *store.Store
-	manager *agents.Manager
-	bridgeMu sync.RWMutex
-	bridge   *bridge.Bridge // nil if no REPL connected
-	hub      *Hub
-	mux      *http.ServeMux
+	store        *store.Store
+	manager      *agents.Manager
+	bridgeMu     sync.RWMutex
+	bridge       *bridge.Bridge // nil if no REPL connected
+	hub          *Hub
+	mux          *http.ServeMux
+	reviewGates  map[string]*reviewGate // runID → gate
+	reviewGatesMu sync.Mutex
 }
 
 // Config configures the API server.
@@ -34,11 +41,12 @@ type Config struct {
 // NewServer creates a new API server.
 func NewServer(cfg Config) *Server {
 	s := &Server{
-		store:   cfg.Store,
-		manager: cfg.Manager,
-		bridge:  cfg.Bridge,
-		hub:     NewHub(),
-		mux:     http.NewServeMux(),
+		store:       cfg.Store,
+		manager:     cfg.Manager,
+		bridge:      cfg.Bridge,
+		hub:         NewHub(),
+		mux:         http.NewServeMux(),
+		reviewGates: make(map[string]*reviewGate),
 	}
 	s.routes()
 	go s.hub.Run()

@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -304,5 +305,228 @@ func TestParseManifestCellNames(t *testing.T) {
 	}
 	if len(names) != 2 {
 		t.Fatalf("expected 2 names, got %d: %v", len(names), names)
+	}
+}
+
+func TestCountUnvisitedTargets(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "a"}, {StepName: "b"}, {StepName: "c"},
+	}
+	visited := map[string]bool{"a": true}
+
+	// From "a", two unvisited: b, c
+	if got := countUnvisitedTargets(steps, visited, "a"); got != 2 {
+		t.Errorf("expected 2, got %d", got)
+	}
+
+	// Visit b too
+	visited["b"] = true
+	if got := countUnvisitedTargets(steps, visited, "a"); got != 1 {
+		t.Errorf("expected 1, got %d", got)
+	}
+
+	// Visit c too
+	visited["c"] = true
+	if got := countUnvisitedTargets(steps, visited, "a"); got != 0 {
+		t.Errorf("expected 0, got %d", got)
+	}
+}
+
+func TestFindSingleUnvisitedTarget(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "a"}, {StepName: "b"}, {StepName: "c"},
+	}
+	visited := map[string]bool{"a": true, "b": true}
+
+	target := findSingleUnvisitedTarget(steps, visited, "a")
+	if target != "c" {
+		t.Errorf("expected 'c', got %q", target)
+	}
+}
+
+func TestSerializeDeserializeTree(t *testing.T) {
+	root := &DecompositionNode{
+		StepName:     "root",
+		CellID:       ":ns/root",
+		Doc:          "Root node",
+		InputSchema:  "[:map]",
+		OutputSchema: "[:map]",
+		IsLeaf:       false,
+		Depth:        0,
+		Children: []*DecompositionNode{
+			{StepName: "a", CellID: ":ns/a", Doc: "Step A", IsLeaf: true, Depth: 1},
+			{StepName: "b", CellID: ":ns/b", Doc: "Step B", IsLeaf: true, Depth: 1,
+				Requires: []string{"db"}},
+		},
+	}
+
+	jsonStr, err := SerializeTree(root)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+
+	restored, err := DeserializeTree(jsonStr)
+	if err != nil {
+		t.Fatalf("deserialize: %v", err)
+	}
+
+	if restored.StepName != "root" {
+		t.Errorf("root name: %q", restored.StepName)
+	}
+	if len(restored.Children) != 2 {
+		t.Fatalf("expected 2 children, got %d", len(restored.Children))
+	}
+	if restored.Children[0].StepName != "a" {
+		t.Errorf("child 0: %q", restored.Children[0].StepName)
+	}
+	if len(restored.Children[1].Requires) == 0 || restored.Children[1].Requires[0] != "db" {
+		t.Errorf("child 1 requires: %v", restored.Children[1].Requires)
+	}
+}
+
+func TestDeterministicEdgesTwoStepFlow(t *testing.T) {
+	// Simulate walkGraph for a 2-step linear flow: a -> b -> :end
+	// "a" has 1 unvisited target (b) -> deterministic
+	// "b" has 0 unvisited targets -> deterministic (goes to :end)
+	// Both edges should be deterministic (no LLM needed)
+	steps := []*DecompositionNode{
+		{StepName: "a", CellID: ":ns/a"},
+		{StepName: "b", CellID: ":ns/b"},
+	}
+
+	visited := make(map[string]bool)
+	result := &GraphWalkResult{
+		Edges:      make(map[string]string),
+		Dispatches: make(map[string]string),
+	}
+
+	// Simulate BFS with deterministic fast path
+	frontier := []string{"a"}
+	for len(frontier) > 0 {
+		current := frontier[0]
+		frontier = frontier[1:]
+		if visited[current] {
+			continue
+		}
+		visited[current] = true
+
+		unvisited := countUnvisitedTargets(steps, visited, current)
+		if unvisited <= 1 {
+			target := ":end"
+			if unvisited == 1 {
+				target = ":" + findSingleUnvisitedTarget(steps, visited, current)
+				frontier = append(frontier, findSingleUnvisitedTarget(steps, visited, current))
+			}
+			result.Edges[current] = fmt.Sprintf("{:done %s}", target)
+			result.Dispatches[current] = "[[:done (constantly true)]]"
+			result.DeterministicEdges++
+		}
+	}
+
+	// Both should be deterministic
+	if result.DeterministicEdges != 2 {
+		t.Errorf("expected 2 deterministic edges, got %d", result.DeterministicEdges)
+	}
+	if result.Edges["a"] != "{:done :b}" {
+		t.Errorf("a edge: %q", result.Edges["a"])
+	}
+	if result.Edges["b"] != "{:done :end}" {
+		t.Errorf("b edge: %q", result.Edges["b"])
+	}
+}
+
+func TestDeterministicEdgesThreeStepFlow(t *testing.T) {
+	// For a 3-step flow a -> b -> c -> :end:
+	// "a" has 2 unvisited targets (b, c) -> needs LLM (not deterministic)
+	// "b" has 1 unvisited target (c) -> deterministic
+	// "c" has 0 unvisited targets -> deterministic (goes to :end)
+	// This simulates the deterministic portion (b and c after a is handled by LLM)
+	steps := []*DecompositionNode{
+		{StepName: "a", CellID: ":ns/a"},
+		{StepName: "b", CellID: ":ns/b"},
+		{StepName: "c", CellID: ":ns/c"},
+	}
+
+	visited := make(map[string]bool)
+	result := &GraphWalkResult{
+		Edges:      make(map[string]string),
+		Dispatches: make(map[string]string),
+	}
+
+	// Simulate BFS: "a" is visited first but has 2 unvisited targets (needs LLM)
+	visited["a"] = true
+	unvisitedFromA := countUnvisitedTargets(steps, visited, "a")
+	if unvisitedFromA != 2 {
+		t.Fatalf("expected 2 unvisited from a, got %d", unvisitedFromA)
+	}
+	// LLM would decide a -> b, so simulate that
+	result.Edges["a"] = "{:done :b}"
+	result.Dispatches["a"] = "[[:done (constantly true)]]"
+	result.LLMEdges++
+
+	// Now continue BFS from "b" - deterministic fast path should apply
+	frontier := []string{"b"}
+	for len(frontier) > 0 {
+		current := frontier[0]
+		frontier = frontier[1:]
+		if visited[current] {
+			continue
+		}
+		visited[current] = true
+
+		unvisited := countUnvisitedTargets(steps, visited, current)
+		if unvisited <= 1 {
+			target := ":end"
+			if unvisited == 1 {
+				target = ":" + findSingleUnvisitedTarget(steps, visited, current)
+				frontier = append(frontier, findSingleUnvisitedTarget(steps, visited, current))
+			}
+			result.Edges[current] = fmt.Sprintf("{:done %s}", target)
+			result.Dispatches[current] = "[[:done (constantly true)]]"
+			result.DeterministicEdges++
+		}
+	}
+
+	// 1 LLM edge (a), 2 deterministic edges (b, c)
+	if result.LLMEdges != 1 {
+		t.Errorf("expected 1 LLM edge, got %d", result.LLMEdges)
+	}
+	if result.DeterministicEdges != 2 {
+		t.Errorf("expected 2 deterministic edges, got %d", result.DeterministicEdges)
+	}
+	if result.Edges["b"] != "{:done :c}" {
+		t.Errorf("b edge: %q", result.Edges["b"])
+	}
+	if result.Edges["c"] != "{:done :end}" {
+		t.Errorf("c edge: %q", result.Edges["c"])
+	}
+}
+
+func TestDeterministicEdgeSingleStep(t *testing.T) {
+	// A single step has 0 unvisited targets -> deterministic to :end
+	steps := []*DecompositionNode{
+		{StepName: "only", CellID: ":ns/only"},
+	}
+
+	visited := make(map[string]bool)
+	visited["only"] = true
+	unvisited := countUnvisitedTargets(steps, visited, "only")
+	if unvisited != 0 {
+		t.Fatalf("expected 0 unvisited, got %d", unvisited)
+	}
+
+	result := &GraphWalkResult{
+		Edges:      make(map[string]string),
+		Dispatches: make(map[string]string),
+	}
+	result.Edges["only"] = fmt.Sprintf("{:done :end}")
+	result.Dispatches["only"] = "[[:done (constantly true)]]"
+	result.DeterministicEdges++
+
+	if result.DeterministicEdges != 1 {
+		t.Errorf("expected 1 deterministic edge, got %d", result.DeterministicEdges)
+	}
+	if result.Edges["only"] != "{:done :end}" {
+		t.Errorf("only edge: %q", result.Edges["only"])
 	}
 }

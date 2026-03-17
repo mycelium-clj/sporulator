@@ -178,6 +178,74 @@ func ExtractAllDefcells(response string) []string {
 	return forms
 }
 
+// findFnFormIndices returns the indices of all top-level "(fn " occurrences in code,
+// skipping any that appear inside string literals.
+func findFnFormIndices(code string) []int {
+	var indices []int
+	inString := false
+	escaped := false
+	for i, ch := range code {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if ch == '(' && strings.HasPrefix(code[i:], "(fn ") {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+// ExtractFnBody finds the last (fn ...) form in code.
+// Returns the complete balanced form. Skips matches inside string literals.
+func ExtractFnBody(code string) string {
+	indices := findFnFormIndices(code)
+	if len(indices) == 0 {
+		return ""
+	}
+	lastIdx := indices[len(indices)-1]
+	return extractBalancedForm(code[lastIdx:])
+}
+
+// ExtractHelpers returns everything before the last (fn ...) form in code.
+// This captures helper functions defined before the main handler.
+// Skips matches inside string literals.
+func ExtractHelpers(code string) string {
+	indices := findFnFormIndices(code)
+	if len(indices) == 0 {
+		return ""
+	}
+	lastIdx := indices[len(indices)-1]
+	if lastIdx <= 0 {
+		return ""
+	}
+	helpers := strings.TrimSpace(code[:lastIdx])
+	return helpers
+}
+
+// ExtractExtraRequires parses ";; REQUIRE: [...]" comment directives from code.
+// Returns a list of require vectors like "[clojure.string :as str]".
+func ExtractExtraRequires(code string) []string {
+	var requires []string
+	re := regexp.MustCompile(`(?m)^;;\s*REQUIRE:\s*(\[.+\])\s*$`)
+	matches := re.FindAllStringSubmatch(code, -1)
+	for _, m := range matches {
+		requires = append(requires, m[1])
+	}
+	return requires
+}
+
 // extractBalancedForm extracts a balanced parenthesized form starting at s[0]='('.
 func extractBalancedForm(s string) string {
 	if len(s) == 0 || s[0] != '(' {

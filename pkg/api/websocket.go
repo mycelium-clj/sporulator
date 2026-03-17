@@ -204,6 +204,10 @@ func (s *Server) handleWSMessage(c *wsClient, msg WSMessage) {
 		go s.handleCellIterate(c, msg)
 	case "orchestrate":
 		go s.handleOrchestrate(c, msg)
+	case "orchestrate_resume":
+		go s.handleOrchestrateResume(c, msg)
+	case "test_review":
+		s.handleTestReview(c, msg)
 	default:
 		c.sendError("unknown message type: " + msg.Type)
 	}
@@ -500,6 +504,7 @@ type orchestratePayload struct {
 	ManifestID       string `json:"manifest_id"`
 	MaxStepsPerLevel int    `json:"max_steps_per_level"`
 	MaxDepth         int    `json:"max_depth"`
+	AutoApproveTests bool   `json:"auto_approve_tests"`
 }
 
 func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
@@ -523,7 +528,7 @@ func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
 
 	orch := agents.NewOrchestrator(s.manager, s.store)
 
-	err = orch.Run(c.ctx, agents.ProjectConfig{
+	cfg := agents.ProjectConfig{
 		ProjectPath:      payload.ProjectPath,
 		BaseNamespace:    payload.BaseNamespace,
 		SourceDir:        payload.SourceDir,
@@ -532,24 +537,32 @@ func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
 		ManifestID:       payload.ManifestID,
 		MaxStepsPerLevel: payload.MaxStepsPerLevel,
 		MaxDepth:         payload.MaxDepth,
-	},
-		func(source string, chunk string) {
-			c.sendMsg(WSMessage{
-				Type: "stream_chunk",
-				ID:   source,
-				Payload: map[string]string{
-					"chunk": chunk,
-				},
-			})
-		},
-		func(event agents.OrchestratorEvent) {
-			c.sendMsg(WSMessage{
-				Type: "orchestrator_event",
-				ID:   msg.ID,
-				Payload: event,
-			})
-		},
-	)
+		AutoApproveTests: payload.AutoApproveTests,
+	}
+
+	onChunk := func(source string, chunk string) {
+		c.sendMsg(WSMessage{
+			Type: "stream_chunk",
+			ID:   source,
+			Payload: map[string]string{
+				"chunk": chunk,
+			},
+		})
+	}
+
+	onEvent := func(event agents.OrchestratorEvent) {
+		c.sendMsg(WSMessage{
+			Type:    "orchestrator_event",
+			ID:      msg.ID,
+			Payload: event,
+		})
+	}
+
+	// Build the onReview callback — creates a gate keyed by runID
+	// that blocks until the client sends a test_review response.
+	onReview := s.makeReviewCallback(c, msg.ID)
+
+	err = orch.Run(c.ctx, cfg, onChunk, onEvent, onReview)
 
 	if err != nil {
 		c.sendMsg(WSMessage{
@@ -564,4 +577,174 @@ func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
 		Type: "orchestrator_complete",
 		ID:   msg.ID,
 	})
+}
+
+func (s *Server) handleOrchestrateResume(c *wsClient, msg WSMessage) {
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		c.sendError("invalid payload")
+		return
+	}
+	var payload orchestratePayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		c.sendError("invalid orchestrate_resume payload")
+		return
+	}
+
+	if payload.SourceDir == "" {
+		payload.SourceDir = "src/clj"
+	}
+	if payload.TestDir == "" {
+		payload.TestDir = "test/clj"
+	}
+
+	orch := agents.NewOrchestrator(s.manager, s.store)
+
+	cfg := agents.ProjectConfig{
+		ProjectPath:      payload.ProjectPath,
+		BaseNamespace:    payload.BaseNamespace,
+		SourceDir:        payload.SourceDir,
+		TestDir:          payload.TestDir,
+		Spec:             payload.Spec,
+		ManifestID:       payload.ManifestID,
+		MaxStepsPerLevel: payload.MaxStepsPerLevel,
+		MaxDepth:         payload.MaxDepth,
+		AutoApproveTests: payload.AutoApproveTests,
+	}
+
+	onChunk := func(source string, chunk string) {
+		c.sendMsg(WSMessage{
+			Type: "stream_chunk",
+			ID:   source,
+			Payload: map[string]string{
+				"chunk": chunk,
+			},
+		})
+	}
+
+	onEvent := func(event agents.OrchestratorEvent) {
+		c.sendMsg(WSMessage{
+			Type:    "orchestrator_event",
+			ID:      msg.ID,
+			Payload: event,
+		})
+	}
+
+	onReview := s.makeReviewCallback(c, msg.ID)
+
+	err = orch.RunResumable(c.ctx, cfg, onChunk, onEvent, onReview)
+
+	if err != nil {
+		c.sendMsg(WSMessage{
+			Type:    "orchestrator_error",
+			ID:      msg.ID,
+			Payload: err.Error(),
+		})
+		return
+	}
+
+	c.sendMsg(WSMessage{
+		Type: "orchestrator_complete",
+		ID:   msg.ID,
+	})
+}
+
+// makeReviewCallback creates an OnReviewFunc that sends contracts to the client via WebSocket
+// and blocks until the client sends a test_review response.
+func (s *Server) makeReviewCallback(c *wsClient, msgID string) agents.OnReviewFunc {
+	return func(contracts []agents.TestContract) ([]agents.ReviewResponse, error) {
+		// Use the WS message ID as the gate key
+		runID := msgID
+
+		// Create a gate for this review round
+		gate := &reviewGate{ch: make(chan []agents.ReviewResponse, 1)}
+		s.reviewGatesMu.Lock()
+		s.reviewGates[runID] = gate
+		s.reviewGatesMu.Unlock()
+
+		defer func() {
+			s.reviewGatesMu.Lock()
+			delete(s.reviewGates, runID)
+			s.reviewGatesMu.Unlock()
+		}()
+
+		// Build contract data for the client
+		contractData := make([]map[string]any, len(contracts))
+		for i, tc := range contracts {
+			contractData[i] = map[string]any{
+				"cell_id":      tc.CellID,
+				"test_code":    tc.TestCode,
+				"review_notes": tc.ReviewNotes,
+				"cell_brief": map[string]any{
+					"id":     tc.Brief.ID,
+					"doc":    tc.Brief.Doc,
+					"schema": tc.Brief.Schema,
+				},
+				"revision": tc.Revision,
+			}
+		}
+
+		// Send review event + contract data to client
+		c.sendMsg(WSMessage{
+			Type: "orchestrator_event",
+			ID:   msgID,
+			Payload: agents.OrchestratorEvent{
+				Phase:   "test_review",
+				Status:  "awaiting_review",
+				Message: "Review test contracts",
+			},
+		})
+		c.sendMsg(WSMessage{
+			Type: "test_review_contracts",
+			ID:   msgID,
+			Payload: map[string]any{
+				"run_id":    runID,
+				"contracts": contractData,
+			},
+		})
+
+		// Block until response arrives via handleTestReview
+		select {
+		case responses := <-gate.ch:
+			return responses, nil
+		case <-c.ctx.Done():
+			return nil, c.ctx.Err()
+		}
+	}
+}
+
+// testReviewPayload is the client's response to a test_review_contracts message.
+type testReviewPayload struct {
+	RunID     string                  `json:"run_id"`
+	Responses []agents.ReviewResponse `json:"responses"`
+}
+
+// handleTestReview processes a test_review message from the client (user review responses).
+// It unblocks the waiting review gate for the corresponding run.
+func (s *Server) handleTestReview(c *wsClient, msg WSMessage) {
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		c.sendError("invalid payload")
+		return
+	}
+	var payload testReviewPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		c.sendError("invalid test_review payload")
+		return
+	}
+
+	s.reviewGatesMu.Lock()
+	gate, ok := s.reviewGates[payload.RunID]
+	s.reviewGatesMu.Unlock()
+
+	if !ok {
+		c.sendError("no pending review for run_id: " + payload.RunID)
+		return
+	}
+
+	// Non-blocking send — if the channel already has a value this is a duplicate
+	select {
+	case gate.ch <- payload.Responses:
+	default:
+	}
 }

@@ -128,6 +128,164 @@ func TestLooksLikeClojure(t *testing.T) {
 	}
 }
 
+func TestExtractFnBody(t *testing.T) {
+	tests := []struct {
+		name, input, expected string
+	}{
+		{
+			"simple fn",
+			"(fn [resources data] {:result 1})",
+			"(fn [resources data] {:result 1})",
+		},
+		{
+			"with helpers",
+			"(defn helper [x] (* x 2))\n\n(fn [resources data] (helper (:x data)))",
+			"(fn [resources data] (helper (:x data)))",
+		},
+		{
+			"nested fn - picks last",
+			"(defn pred [x] (fn [y] (= x y)))\n\n(fn [resources data] data)",
+			"(fn [resources data] data)",
+		},
+		{
+			"no fn",
+			"(defn foo [] 42)",
+			"",
+		},
+		{
+			"fn inside string literal ignored",
+			`(defn helper [] (str "(fn ")) (fn [resources data] data)`,
+			"(fn [resources data] data)",
+		},
+		{
+			"fn inside string only",
+			`(defn helper [] (str "(fn [x] x"))`,
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractFnBody(tt.input)
+			if got != tt.expected {
+				t.Errorf("ExtractFnBody:\n got  %q\n want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractHelpers(t *testing.T) {
+	tests := []struct {
+		name, input, expected string
+	}{
+		{
+			"with helpers",
+			"(defn round2 [x] (.doubleValue x))\n\n(fn [r d] d)",
+			"(defn round2 [x] (.doubleValue x))",
+		},
+		{
+			"no helpers",
+			"(fn [r d] d)",
+			"",
+		},
+		{
+			"multiple helpers",
+			"(defn a [] 1)\n(defn b [] 2)\n\n(fn [r d] d)",
+			"(defn a [] 1)\n(defn b [] 2)",
+		},
+		{
+			"fn inside string not treated as boundary",
+			"(defn helper [] (str \"(fn \"))\n\n(fn [r d] d)",
+			"(defn helper [] (str \"(fn \"))",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractHelpers(tt.input)
+			if got != tt.expected {
+				t.Errorf("ExtractHelpers:\n got  %q\n want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractExtraRequires(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			"single require",
+			";; REQUIRE: [clojure.string :as str]\n\n(fn [r d] d)",
+			[]string{"[clojure.string :as str]"},
+		},
+		{
+			"multiple requires",
+			";; REQUIRE: [clojure.string :as str]\n;; REQUIRE: [clojure.set :as set]\n\n(fn [r d] d)",
+			[]string{"[clojure.string :as str]", "[clojure.set :as set]"},
+		},
+		{
+			"no requires",
+			"(fn [r d] d)",
+			nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractExtraRequires(tt.input)
+			if len(got) != len(tt.expected) {
+				t.Errorf("ExtractExtraRequires: got %v, want %v", got, tt.expected)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("ExtractExtraRequires[%d]: got %q, want %q", i, got[i], tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestExtractSelfReviewCorrections(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantCode bool
+	}{
+		{
+			"all verified",
+			"CORRECT: test-basic — values match spec\nCORRECT: test-edge — edge case is fine\n\nALL TESTS VERIFIED",
+			false,
+		},
+		{
+			"corrections with code block",
+			"WRONG: test-basic — expected 82.67 but should be 85.08\n\nCorrected:\n```clojure\n(deftest test-basic\n  (is (= 85.08 result)))\n```",
+			true,
+		},
+		{
+			"no deftest in code block",
+			"Here's a helper:\n```clojure\n(defn round2 [x] x)\n```",
+			false,
+		},
+		{
+			"no code block and no verified marker",
+			"I think the tests look fine overall.",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractSelfReviewCorrections(tt.input)
+			if tt.wantCode && result == "" {
+				t.Error("expected corrections, got empty string")
+			}
+			if !tt.wantCode && result != "" {
+				t.Errorf("expected empty string, got %q", result)
+			}
+		})
+	}
+}
+
 func TestExtractCodeBlocks_MultilineContent(t *testing.T) {
 	input := "```clojure\n(ns my.ns\n  (:require [foo.bar]))\n\n(defn hello []\n  \"world\")\n```"
 	blocks := ExtractCodeBlocks(input)

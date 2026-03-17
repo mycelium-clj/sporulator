@@ -3,6 +3,7 @@ package agents
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -35,8 +36,10 @@ type DecompositionConfig struct {
 
 // GraphWalkResult holds the edges and dispatches decided during BFS graph walk.
 type GraphWalkResult struct {
-	Edges      map[string]string // stepName → EDN edges entry e.g. "{:done :process}"
-	Dispatches map[string]string // stepName → EDN dispatches entry e.g. "[[:done (constantly true)]]"
+	Edges              map[string]string // stepName → EDN edges entry e.g. "{:done :process}"
+	Dispatches         map[string]string // stepName → EDN dispatches entry e.g. "[[:done (constantly true)]]"
+	DeterministicEdges int               // count of edges decided without LLM (linear fast path)
+	LLMEdges           int               // count of edges decided via LLM call
 }
 
 // DefaultDecompositionConfig returns sensible defaults.
@@ -45,6 +48,24 @@ func DefaultDecompositionConfig() DecompositionConfig {
 		MaxStepsPerLevel: 5,
 		MaxDepth:         3,
 	}
+}
+
+// SerializeTree marshals a DecompositionNode tree to JSON.
+func SerializeTree(root *DecompositionNode) (string, error) {
+	data, err := json.Marshal(root)
+	if err != nil {
+		return "", fmt.Errorf("serialize tree: %w", err)
+	}
+	return string(data), nil
+}
+
+// DeserializeTree unmarshals a JSON string into a DecompositionNode tree.
+func DeserializeTree(jsonStr string) (*DecompositionNode, error) {
+	var root DecompositionNode
+	if err := json.Unmarshal([]byte(jsonStr), &root); err != nil {
+		return nil, fmt.Errorf("deserialize tree: %w", err)
+	}
+	return &root, nil
 }
 
 // --- Pure functions ---
@@ -251,6 +272,28 @@ func ednToString(v interface{}) string {
 		return "[:map]"
 	}
 	return result
+}
+
+// countUnvisitedTargets counts how many unvisited non-end steps remain as potential targets.
+func countUnvisitedTargets(steps []*DecompositionNode, visited map[string]bool, current string) int {
+	count := 0
+	for _, s := range steps {
+		if !visited[s.StepName] && s.StepName != current {
+			count++
+		}
+	}
+	return count
+}
+
+// findSingleUnvisitedTarget returns the name of the single unvisited target (excluding current).
+// Should only be called when countUnvisitedTargets returns 1.
+func findSingleUnvisitedTarget(steps []*DecompositionNode, visited map[string]bool, current string) string {
+	for _, s := range steps {
+		if !visited[s.StepName] && s.StepName != current {
+			return s.StepName
+		}
+	}
+	return ""
 }
 
 // parseManifestCellNames extracts cell step names from a manifest EDN string
@@ -524,6 +567,30 @@ func (o *Orchestrator) walkGraph(ctx context.Context, steps []*DecompositionNode
 			}
 			availableTargets = append(availableTargets, ":end")
 
+			// Fast path: single unvisited non-:end target → deterministic linear edge
+			unvisitedNonEnd := countUnvisitedTargets(steps, visited, current)
+			if unvisitedNonEnd <= 1 {
+				target := ":end"
+				if unvisitedNonEnd == 1 {
+					singleTarget := findSingleUnvisitedTarget(steps, visited, current)
+					target = ":" + singleTarget
+					if !visited[singleTarget] {
+						frontier = append(frontier, singleTarget)
+					}
+				}
+				result.Edges[current] = fmt.Sprintf("{:done %s}", target)
+				result.Dispatches[current] = "[[:done (constantly true)]]"
+				result.DeterministicEdges++
+
+				edgeSummary.WriteString(fmt.Sprintf(":%s → {:done %s}\n", current, target))
+
+				onEvent(OrchestratorEvent{Phase: "graph_walk", CellID: step.CellID, Status: "deterministic",
+					Message: fmt.Sprintf("%s edges: {:done %s} (deterministic)", step.StepName, target)})
+				continue // skip LLM call
+			}
+
+			result.LLMEdges++
+
 			prompt := buildGraphWalkPrompt(step, availableTargets, edgeSummary.String())
 
 			onEvent(OrchestratorEvent{Phase: "graph_walk", CellID: step.CellID, Status: "started",
@@ -680,18 +747,22 @@ func buildDecomposePrompt(spec, nsPrefix string, parentSteps []string, maxSteps 
 	b.WriteString(`For each step return an EDN map with:
 - :name — short keyword name (string, e.g. "validate-input")
 - :doc — what this step does (1-2 sentences, string)
-- :input-schema — EDN schema for input data (e.g. [:map [:x :int]])
-- :output-schema — EDN schema for output data
+- :input-schema — Malli EDN schema with field-level detail (see example)
+- :output-schema — Malli EDN schema with field-level detail
 - :requires — vector of resource keywords (e.g. [:db :cache])
 - :simple? — true if implementable as one cell (~80 lines of Clojure), false if complex
+
+IMPORTANT — schemas MUST list fields and their types. Use Malli types:
+  :string, :int, :double, :boolean, :keyword for primitives
+  [:vector <type>] for collections, [:map [:field :type] ...] for structs
+  [:map-of :keyword :type] for dynamic maps, [:maybe :type] for optional
 
 Return the steps as an EDN vector in a code block. Example:
 
 `)
 	b.WriteString("```edn\n")
-	b.WriteString(`[{:name "validate-input" :doc "Validate and normalize input data" :input-schema [:map] :output-schema [:map] :requires [] :simple? true}
- {:name "process-data" :doc "Transform and enrich the data" :input-schema [:map] :output-schema [:map] :requires [:db] :simple? true}
- {:name "finalize" :doc "Produce final output" :input-schema [:map] :output-schema [:map] :requires [] :simple? true}]`)
+	b.WriteString(`[{:name "calculate-totals" :doc "Calculate order totals with tax" :input-schema [:map [:items [:vector [:map [:product-id :string] [:quantity :int] [:unit-price :double]]]] [:tax-rate :double]] :output-schema [:map [:subtotal :double] [:tax-amount :double] [:total :double]] :requires [:catalog] :simple? true}
+ {:name "process-payment" :doc "Charge the customer" :input-schema [:map [:total :double] [:payment-method :keyword]] :output-schema [:map [:transaction-id :string] [:status :keyword]] :requires [:payment-gateway] :simple? true}]`)
 	b.WriteString("\n```\n")
 
 	fmt.Fprintf(&b, "\nCell IDs will be namespaced as :%s/<step-name>.", nsPrefix)
