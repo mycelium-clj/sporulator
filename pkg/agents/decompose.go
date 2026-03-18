@@ -1303,7 +1303,7 @@ func (o *Orchestrator) validateEdgeSchemas(ctx context.Context, spec string,
 	agent *GraphAgent, onChunk func(string, string),
 	onEvent func(OrchestratorEvent)) error {
 
-	const maxRounds = 3 // outer rounds (full pass over all edges)
+	const maxRounds = 5 // outer rounds (full pass over all edges; pass-through propagation needs multiple rounds)
 
 	pairs := deduplicateEdgePairs(extractEdgePairs(steps, walk))
 	if len(pairs) == 0 {
@@ -1546,19 +1546,18 @@ Rules:
 
 // buildEdgeFixPrompt creates a focused prompt for fixing a single mismatched edge.
 // This gives the LLM a simpler task than fixing all mismatches at once.
+// It also shows downstream successors so the LLM knows which fields need to be
+// passed through the target cell's output.
 func buildEdgeFixPrompt(spec string, steps []*DecompositionNode, m SchemaMismatch) string {
 	var b strings.Builder
 
-	// Find the source and target steps for full context
-	var source, target *DecompositionNode
+	// Build step lookup
+	stepByName := make(map[string]*DecompositionNode)
 	for _, s := range steps {
-		if s.StepName == m.SourceName {
-			source = s
-		}
-		if s.StepName == m.TargetName {
-			target = s
-		}
+		stepByName[s.StepName] = s
 	}
+	source := stepByName[m.SourceName]
+	target := stepByName[m.TargetName]
 
 	b.WriteString("Fix ONE schema incompatibility between two connected cells.\n\n")
 
@@ -1585,7 +1584,19 @@ func buildEdgeFixPrompt(spec string, steps []*DecompositionNode, m SchemaMismatc
 		fmt.Fprintf(&b, "  Type mismatches: %s\n", strings.Join(m.TypeDiffs, "; "))
 	}
 
+	// Show downstream context: what does the target's successors need?
+	// This helps the LLM understand pass-through requirements.
+	b.WriteString("\nPASS-THROUGH CONTEXT — all cells in this workflow:\n")
+	for _, s := range steps {
+		fmt.Fprintf(&b, "  :%s  input: %s  output: %s\n",
+			s.StepName, defaultSchema(s.InputSchema), defaultSchema(s.OutputSchema))
+	}
+
 	fmt.Fprintf(&b, `
+IMPORTANT: When you expand :%s output, you MUST also include those fields in :%s output
+if ANY downstream cell needs them. Cells pass data forward — if a field enters a cell's input,
+it must appear in the cell's output for subsequent cells to receive it.
+
 Fix this by correcting one or both schemas. Output ONLY corrections in this format:
 
 CORRECTED :<step-name> output-schema
@@ -1596,10 +1607,11 @@ CORRECTED :<step-name> input-schema
 
 Rules:
 - Prefer expanding :%s output to include missing fields (pass-through from input).
+- When adding fields to a cell's input, ALSO add them to its output for downstream propagation.
 - Only narrow :%s input if the field genuinely shouldn't be there.
 - Use lite Malli syntax: {:field-name :type} for maps.
 - The corrected schemas must be consistent with each cell's documented purpose.
-`, m.SourceName, m.TargetName)
+`, m.SourceName, m.TargetName, m.SourceName, m.TargetName)
 
 	return b.String()
 }
