@@ -1084,6 +1084,116 @@ func TestBuildBoundaryConstrainedSpecEmptySchemas(t *testing.T) {
 	}
 }
 
+func TestBuildRedecomposeSpec(t *testing.T) {
+	step := &DecompositionNode{
+		StepName:     "apply-combo75",
+		Doc:          "Apply combo75 discount to qualifying items",
+		InputSchema:  "{:items [:vector {:product-id :string :price :double}] :coupons [:vector :string]}",
+		OutputSchema: "{:items [:vector {:product-id :string :price :double :discount :double}] :total-discount :double}",
+	}
+
+	fullSpec := "COMBO75: if laptop, headphones, and novel present, apply $75 discount proportionally."
+	result := buildRedecomposeSpec(step, fullSpec)
+
+	// Must contain cell info
+	if !strings.Contains(result, "apply-combo75") {
+		t.Error("should contain cell name")
+	}
+	if !strings.Contains(result, "Apply combo75 discount") {
+		t.Error("should contain cell description")
+	}
+
+	// Must contain locked schemas
+	if !strings.Contains(result, ":items") {
+		t.Error("should contain input schema")
+	}
+	if !strings.Contains(result, ":total-discount") {
+		t.Error("should contain output schema")
+	}
+
+	// Must include spec as reference for business rules
+	if !strings.Contains(result, "COMBO75: if laptop") {
+		t.Error("should include spec as reference")
+	}
+	if !strings.Contains(result, "REFERENCE ONLY") {
+		t.Error("should frame spec as reference only")
+	}
+
+	// Must scope to cell's purpose
+	if !strings.Contains(result, `ONLY generate steps directly related to "apply-combo75"`) {
+		t.Error("should scope steps to cell's purpose")
+	}
+}
+
+func TestBuildRedecomposeSpecEmptySchemas(t *testing.T) {
+	step := &DecompositionNode{
+		StepName:    "simple-step",
+		Doc:         "A simple step",
+		InputSchema: "", OutputSchema: "",
+	}
+
+	result := buildRedecomposeSpec(step, "some spec")
+	if !strings.Contains(result, "{}") {
+		t.Error("should use default schema for empty schemas")
+	}
+}
+
+func TestBuildGraphReview(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "validate-input", Doc: "Validate order", InputSchema: "{:items [:vector :map]}", OutputSchema: "{:items [:vector :map] :valid? :boolean}", IsLeaf: true},
+		{StepName: "compute-tax", Doc: "Calculate tax", InputSchema: "{:items [:vector :map]}", OutputSchema: "{:tax :double}", IsLeaf: true},
+	}
+	walk := &GraphWalkResult{
+		Edges:      map[string]string{"validate-input": "{:done :compute-tax}", "compute-tax": "{:done :end}"},
+		Dispatches: map[string]string{"validate-input": "[[:done (constantly true)]]", "compute-tax": "[[:done (constantly true)]]"},
+	}
+
+	review := buildGraphReview(0, "order", steps, walk)
+
+	if review.Depth != 0 {
+		t.Errorf("depth: got %d, want 0", review.Depth)
+	}
+	if review.NsPrefix != "order" {
+		t.Errorf("ns_prefix: got %q, want %q", review.NsPrefix, "order")
+	}
+	if len(review.Steps) != 2 {
+		t.Fatalf("steps: got %d, want 2", len(review.Steps))
+	}
+	if review.Steps[0].Name != "validate-input" {
+		t.Errorf("step 0 name: got %q", review.Steps[0].Name)
+	}
+	if review.Edges["validate-input"] != "{:done :compute-tax}" {
+		t.Errorf("edge: got %q", review.Edges["validate-input"])
+	}
+	if review.Manifest == "" {
+		t.Error("manifest should not be empty")
+	}
+}
+
+func TestBuildGraphRevisePrompt(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "step-a", Doc: "Does A", InputSchema: "{:x :int}", OutputSchema: "{:y :int}"},
+	}
+	walk := &GraphWalkResult{
+		Edges: map[string]string{"step-a": "{:done :end}"},
+	}
+
+	result := buildGraphRevisePrompt(steps, walk, "Add a validation step before step-a")
+
+	if !strings.Contains(result, "User feedback:") {
+		t.Error("should contain user feedback section")
+	}
+	if !strings.Contains(result, "Add a validation step") {
+		t.Error("should contain the actual feedback")
+	}
+	if !strings.Contains(result, "step-a") {
+		t.Error("should show current graph steps")
+	}
+	if !strings.Contains(result, "Regenerate the COMPLETE graph") {
+		t.Error("should instruct to regenerate")
+	}
+}
+
 func TestTruncSchema(t *testing.T) {
 	tests := []struct {
 		input    string

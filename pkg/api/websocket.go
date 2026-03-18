@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -208,6 +209,8 @@ func (s *Server) handleWSMessage(c *wsClient, msg WSMessage) {
 		go s.handleOrchestrateResume(c, msg)
 	case "test_review":
 		s.handleTestReview(c, msg)
+	case "graph_review":
+		s.handleGraphReview(c, msg)
 	default:
 		c.sendError("unknown message type: " + msg.Type)
 	}
@@ -505,6 +508,7 @@ type orchestratePayload struct {
 	MaxStepsPerLevel int    `json:"max_steps_per_level"`
 	MaxDepth         int    `json:"max_depth"`
 	AutoApproveTests bool   `json:"auto_approve_tests"`
+	AutoApproveGraph bool   `json:"auto_approve_graph"`
 }
 
 func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
@@ -538,6 +542,7 @@ func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
 		MaxStepsPerLevel: payload.MaxStepsPerLevel,
 		MaxDepth:         payload.MaxDepth,
 		AutoApproveTests: payload.AutoApproveTests,
+		AutoApproveGraph: payload.AutoApproveGraph,
 	}
 
 	onChunk := func(source string, chunk string) {
@@ -558,11 +563,12 @@ func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
 		})
 	}
 
-	// Build the onReview callback — creates a gate keyed by runID
-	// that blocks until the client sends a test_review response.
-	onReview := s.makeReviewCallback(c, msg.ID)
+	cbs := agents.ReviewCallbacks{
+		OnTestReview:  s.makeReviewCallback(c, msg.ID),
+		OnGraphReview: s.makeGraphReviewCallback(c, msg.ID),
+	}
 
-	err = orch.Run(c.ctx, cfg, onChunk, onEvent, onReview)
+	err = orch.Run(c.ctx, cfg, onChunk, onEvent, cbs)
 
 	if err != nil {
 		c.sendMsg(WSMessage{
@@ -610,6 +616,7 @@ func (s *Server) handleOrchestrateResume(c *wsClient, msg WSMessage) {
 		MaxStepsPerLevel: payload.MaxStepsPerLevel,
 		MaxDepth:         payload.MaxDepth,
 		AutoApproveTests: payload.AutoApproveTests,
+		AutoApproveGraph: payload.AutoApproveGraph,
 	}
 
 	onChunk := func(source string, chunk string) {
@@ -630,9 +637,12 @@ func (s *Server) handleOrchestrateResume(c *wsClient, msg WSMessage) {
 		})
 	}
 
-	onReview := s.makeReviewCallback(c, msg.ID)
+	cbs := agents.ReviewCallbacks{
+		OnTestReview:  s.makeReviewCallback(c, msg.ID),
+		OnGraphReview: s.makeGraphReviewCallback(c, msg.ID),
+	}
 
-	err = orch.RunResumable(c.ctx, cfg, onChunk, onEvent, onReview)
+	err = orch.RunResumable(c.ctx, cfg, onChunk, onEvent, cbs)
 
 	if err != nil {
 		c.sendMsg(WSMessage{
@@ -745,6 +755,86 @@ func (s *Server) handleTestReview(c *wsClient, msg WSMessage) {
 	// Non-blocking send — if the channel already has a value this is a duplicate
 	select {
 	case gate.ch <- payload.Responses:
+	default:
+	}
+}
+
+// makeGraphReviewCallback creates an OnGraphReviewFunc that sends the graph to the client
+// via WebSocket and blocks until the client sends a graph_review response.
+func (s *Server) makeGraphReviewCallback(c *wsClient, msgID string) agents.OnGraphReviewFunc {
+	return func(review agents.GraphReview) (*agents.GraphReviewResponse, error) {
+		runID := msgID
+
+		gate := &graphReviewGate{ch: make(chan *agents.GraphReviewResponse, 1)}
+		s.graphReviewMu.Lock()
+		s.graphReviewGates[runID] = gate
+		s.graphReviewMu.Unlock()
+
+		defer func() {
+			s.graphReviewMu.Lock()
+			delete(s.graphReviewGates, runID)
+			s.graphReviewMu.Unlock()
+		}()
+
+		// Send graph review data to client
+		c.sendMsg(WSMessage{
+			Type: "orchestrator_event",
+			ID:   msgID,
+			Payload: agents.OrchestratorEvent{
+				Phase:   "graph_review",
+				Status:  "awaiting_review",
+				Message: fmt.Sprintf("Review graph at depth %d", review.Depth),
+			},
+		})
+		c.sendMsg(WSMessage{
+			Type: "graph_review_data",
+			ID:   msgID,
+			Payload: map[string]any{
+				"run_id": runID,
+				"graph":  review,
+			},
+		})
+
+		// Block until response arrives via handleGraphReview
+		select {
+		case resp := <-gate.ch:
+			return resp, nil
+		case <-c.ctx.Done():
+			return nil, c.ctx.Err()
+		}
+	}
+}
+
+// graphReviewPayload is the client's response to a graph_review_data message.
+type graphReviewPayload struct {
+	RunID    string                       `json:"run_id"`
+	Response agents.GraphReviewResponse   `json:"response"`
+}
+
+// handleGraphReview processes a graph_review message from the client.
+func (s *Server) handleGraphReview(c *wsClient, msg WSMessage) {
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		c.sendError("invalid payload")
+		return
+	}
+	var payload graphReviewPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		c.sendError("invalid graph_review payload")
+		return
+	}
+
+	s.graphReviewMu.Lock()
+	gate, ok := s.graphReviewGates[payload.RunID]
+	s.graphReviewMu.Unlock()
+
+	if !ok {
+		c.sendError("no pending graph review for run_id: " + payload.RunID)
+		return
+	}
+
+	select {
+	case gate.ch <- &payload.Response:
 	default:
 	}
 }

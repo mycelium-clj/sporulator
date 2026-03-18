@@ -661,6 +661,78 @@ func (o *Orchestrator) decompose(ctx context.Context, spec, nsPrefix string,
 	onEvent(OrchestratorEvent{Phase: "decompose", Status: "level_locked",
 		Message: fmt.Sprintf("Depth %d: graph validated and locked for %d steps", depth, len(steps))})
 
+	// --- Graph review gate ---
+	// Present the validated graph to the user for approval before proceeding.
+	if o.onGraphReview != nil && !o.cfg.AutoApproveGraph {
+		review := buildGraphReview(depth, nsPrefix, steps, walk)
+
+		for {
+			onEvent(OrchestratorEvent{Phase: "graph_review", Status: "awaiting_review",
+				Message: fmt.Sprintf("Depth %d: review graph with %d steps", depth, len(steps))})
+
+			resp, reviewErr := o.onGraphReview(review)
+			if reviewErr != nil {
+				return nil, fmt.Errorf("graph review at depth %d: %w", depth, reviewErr)
+			}
+
+			if resp.Decision == "approve" {
+				onEvent(OrchestratorEvent{Phase: "graph_review", Status: "approved",
+					Message: fmt.Sprintf("Depth %d: graph approved", depth)})
+				break
+			}
+
+			// "revise" — feed user feedback to LLM, regenerate, re-validate
+			onEvent(OrchestratorEvent{Phase: "graph_review", Status: "revising",
+				Message: fmt.Sprintf("Depth %d: revising graph per user feedback", depth)})
+
+			revisePrompt := buildGraphRevisePrompt(steps, walk, resp.Feedback)
+			response, revErr := agent.ChatStream(ctx, revisePrompt,
+				func(chunk string) { onChunk("decompose/"+nodeID, chunk) })
+			if revErr != nil {
+				return nil, fmt.Errorf("graph revision at depth %d: %w", depth, revErr)
+			}
+
+			newSteps, newWalk, parseErr := parseGraphResponse(response, nsPrefix)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse revised graph at depth %d: %w", depth, parseErr)
+			}
+			if newWalk == nil {
+				newWalk, err = o.walkGraph(ctx, newSteps, agent, onChunk, onEvent)
+				if err != nil {
+					return nil, fmt.Errorf("graph walk after revision at depth %d: %w", depth, err)
+				}
+			} else {
+				rawBlock := ExtractFirstCodeBlock(response)
+				stepNameSet := make(map[string]bool)
+				for _, s := range newSteps {
+					stepNameSet[s.StepName] = true
+				}
+				rawDispatches := parseDispatchesFromRaw(rawBlock, stepNameSet)
+				for name, disp := range rawDispatches {
+					newWalk.Dispatches[name] = disp
+				}
+			}
+			for _, s := range newSteps {
+				s.Depth = depth
+			}
+			if depth >= cfg.MaxDepth {
+				for _, s := range newSteps {
+					s.IsLeaf = true
+				}
+			}
+
+			// Re-validate the revised graph
+			newWalk, err = o.validateGraph(ctx, spec, newSteps, newWalk, agent, onChunk, onEvent)
+			if err != nil {
+				return nil, fmt.Errorf("graph re-validation at depth %d: %w", depth, err)
+			}
+
+			steps = newSteps
+			walk = newWalk
+			review = buildGraphReview(depth, nsPrefix, steps, walk)
+		}
+	}
+
 	// --- Recurse into non-leaf children with boundary constraints ---
 	if depth < cfg.MaxDepth {
 		for _, step := range steps {
@@ -1338,6 +1410,94 @@ Full spec:
 		defaultSchema(parentStep.InputSchema),
 		defaultSchema(parentStep.OutputSchema),
 		fullSpec)
+
+	return b.String()
+}
+
+// buildRedecomposeSpec creates a focused spec for re-decomposing a failed leaf cell.
+// Includes the full spec as reference material for business logic details, but frames
+// the task tightly around the cell's own contract so the LLM doesn't generate
+// irrelevant steps (e.g., fraud-check when re-decomposing a promotion cell).
+func buildRedecomposeSpec(failed *DecompositionNode, fullSpec string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, `Break this cell into a small focused sub-workflow.
+
+Cell: %s
+Description: %s
+
+CONTRACT — this sub-workflow has a locked contract:
+  Input schema (first cell MUST accept):  %s
+  Output schema (last cell MUST produce): %s
+
+RULES:
+- Design a focused sub-workflow that transforms the input into the output.
+- The first cell must accept the input schema exactly.
+- The last cell must produce the output schema exactly.
+- Internal cells can have any schemas as long as they chain correctly from input to output.
+- Do NOT add or remove fields from the boundary schemas.
+- ONLY generate steps directly related to "%s". Do NOT add steps for other parts of the system.
+- Keep it minimal — 2-4 steps max.
+
+The spec below is for REFERENCE ONLY — use it to understand the business rules for "%s",
+but do NOT decompose unrelated sections of the spec.
+
+Reference spec:
+%s`,
+		failed.StepName, failed.Doc,
+		defaultSchema(failed.InputSchema),
+		defaultSchema(failed.OutputSchema),
+		failed.StepName,
+		failed.StepName,
+		fullSpec)
+
+	return b.String()
+}
+
+// buildGraphReview creates a GraphReview from validated steps and walk result.
+func buildGraphReview(depth int, nsPrefix string, steps []*DecompositionNode, walk *GraphWalkResult) GraphReview {
+	reviewSteps := make([]GraphReviewStep, len(steps))
+	for i, s := range steps {
+		reviewSteps[i] = GraphReviewStep{
+			Name:         s.StepName,
+			Doc:          s.Doc,
+			InputSchema:  s.InputSchema,
+			OutputSchema: s.OutputSchema,
+			IsLeaf:       s.IsLeaf,
+		}
+	}
+
+	// Assemble a preview manifest so the user can see the full picture
+	manifest := assembleManifest(":"+nsPrefix+"/workflow", nsPrefix, steps, walk)
+
+	return GraphReview{
+		Depth:      depth,
+		NsPrefix:   nsPrefix,
+		Steps:      reviewSteps,
+		Edges:      walk.Edges,
+		Dispatches: walk.Dispatches,
+		Manifest:   manifest,
+	}
+}
+
+// buildGraphRevisePrompt creates a prompt for revising a graph based on user feedback.
+func buildGraphRevisePrompt(steps []*DecompositionNode, walk *GraphWalkResult, feedback string) string {
+	var b strings.Builder
+
+	b.WriteString("The user reviewed the graph and wants changes.\n\n")
+	b.WriteString("Current graph:\n")
+	for _, s := range steps {
+		fmt.Fprintf(&b, "  - %s: %s (input: %s, output: %s, leaf: %v)\n",
+			s.StepName, s.Doc, truncSchema(s.InputSchema, 80), truncSchema(s.OutputSchema, 80), s.IsLeaf)
+	}
+	b.WriteString("\nEdges:\n")
+	for name, edges := range walk.Edges {
+		fmt.Fprintf(&b, "  %s: %s\n", name, edges)
+	}
+
+	fmt.Fprintf(&b, "\nUser feedback:\n%s\n", feedback)
+	b.WriteString("\nRegenerate the COMPLETE graph as a single EDN map incorporating this feedback.\n")
+	b.WriteString("Return the full {:steps [...] :edges {...} :dispatches {...}} map in a code block.\n")
 
 	return b.String()
 }

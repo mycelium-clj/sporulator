@@ -19,16 +19,23 @@ type reviewGate struct {
 	ch chan []agents.ReviewResponse
 }
 
+// graphReviewGate is a channel-based gate for blocking until the user responds to a graph review.
+type graphReviewGate struct {
+	ch chan *agents.GraphReviewResponse
+}
+
 // Server is the Sporulator HTTP/WebSocket server.
 type Server struct {
-	store        *store.Store
-	manager      *agents.Manager
-	bridgeMu     sync.RWMutex
-	bridge       *bridge.Bridge // nil if no REPL connected
-	hub          *Hub
-	mux          *http.ServeMux
-	reviewGates  map[string]*reviewGate // runID → gate
-	reviewGatesMu sync.Mutex
+	store             *store.Store
+	manager           *agents.Manager
+	bridgeMu          sync.RWMutex
+	bridge            *bridge.Bridge // nil if no REPL connected
+	hub               *Hub
+	mux               *http.ServeMux
+	reviewGates       map[string]*reviewGate      // runID → gate
+	reviewGatesMu     sync.Mutex
+	graphReviewGates  map[string]*graphReviewGate  // runID → gate
+	graphReviewMu     sync.Mutex
 }
 
 // Config configures the API server.
@@ -46,7 +53,8 @@ func NewServer(cfg Config) *Server {
 		bridge:      cfg.Bridge,
 		hub:         NewHub(),
 		mux:         http.NewServeMux(),
-		reviewGates: make(map[string]*reviewGate),
+		reviewGates:      make(map[string]*reviewGate),
+		graphReviewGates: make(map[string]*graphReviewGate),
 	}
 	s.routes()
 	go s.hub.Run()

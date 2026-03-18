@@ -37,9 +37,11 @@ const mathPrecisionRules = `NUMERICAL PRECISION — read the schema and spec car
 
 // Orchestrator coordinates the full workflow: manifest design → cell TDD → integration testing.
 type Orchestrator struct {
-	manager *Manager
-	store   *store.Store
-	runID   string // set at the start of each Run()
+	manager        *Manager
+	store          *store.Store
+	runID          string // set at the start of each Run()
+	cfg            ProjectConfig       // set at the start of each Run()
+	onGraphReview  OnGraphReviewFunc   // set at the start of each Run(); nil = auto-approve
 }
 
 // ProjectConfig describes the target Clojure project.
@@ -52,7 +54,8 @@ type ProjectConfig struct {
 	ManifestID       string // e.g. ":order/placement"
 	MaxStepsPerLevel int    // max steps per decomposition level (default 5)
 	MaxDepth         int    // max recursion depth (default 3); 0 = flat (one-level decomposition)
-	AutoApproveTests bool   // when true, skip approval gate (current behavior)
+	AutoApproveTests bool   // when true, skip test approval gate (current behavior)
+	AutoApproveGraph bool   // when true, skip graph approval gate
 }
 
 // OrchestratorEvent reports progress during orchestration.
@@ -92,9 +95,43 @@ type ReviewResponse struct {
 // The orchestrator calls it with a batch of contracts and blocks until the user responds.
 type OnReviewFunc func([]TestContract) ([]ReviewResponse, error)
 
+// GraphReview presents a validated decomposition graph for user approval.
+type GraphReview struct {
+	Depth    int                  `json:"depth"`
+	NsPrefix string              `json:"ns_prefix"`
+	Steps    []GraphReviewStep   `json:"steps"`
+	Edges    map[string]string   `json:"edges"`     // stepName → EDN edges
+	Dispatches map[string]string `json:"dispatches"` // stepName → EDN dispatches
+	Manifest string              `json:"manifest"`   // assembled EDN manifest for reference
+}
+
+// GraphReviewStep is a single step in the graph presented for review.
+type GraphReviewStep struct {
+	Name         string `json:"name"`
+	Doc          string `json:"doc"`
+	InputSchema  string `json:"input_schema"`
+	OutputSchema string `json:"output_schema"`
+	IsLeaf       bool   `json:"is_leaf"`
+}
+
+// GraphReviewResponse is the user's decision on a graph review.
+type GraphReviewResponse struct {
+	Decision string `json:"decision"` // "approve", "revise"
+	Feedback string `json:"feedback"` // user notes for "revise"
+}
+
+// OnGraphReviewFunc is the callback type for the graph review gate.
+type OnGraphReviewFunc func(GraphReview) (*GraphReviewResponse, error)
+
 // NewOrchestrator creates an orchestrator.
 func NewOrchestrator(mgr *Manager, st *store.Store) *Orchestrator {
 	return &Orchestrator{manager: mgr, store: st}
+}
+
+// ReviewCallbacks holds optional review gate callbacks for Run/RunResumable.
+type ReviewCallbacks struct {
+	OnTestReview  OnReviewFunc       // test contract review; nil = auto-approve
+	OnGraphReview OnGraphReviewFunc  // graph review; nil = auto-approve
 }
 
 // Run executes the full orchestrated workflow using recursive decomposition.
@@ -110,13 +147,15 @@ func NewOrchestrator(mgr *Manager, st *store.Store) *Orchestrator {
 func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 	onChunk func(source string, chunk string),
 	onEvent func(OrchestratorEvent),
-	onReview ...OnReviewFunc) error {
+	callbacks ...ReviewCallbacks) error {
 
-	// Extract optional onReview callback
+	// Extract optional callbacks
 	var reviewFn OnReviewFunc
-	if len(onReview) > 0 {
-		reviewFn = onReview[0]
+	if len(callbacks) > 0 {
+		reviewFn = callbacks[0].OnTestReview
+		o.onGraphReview = callbacks[0].OnGraphReview
 	}
+	o.cfg = cfg
 
 	br := o.manager.GetBridge()
 	if br == nil {
@@ -151,6 +190,29 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 		treeJSON, _ := SerializeTree(tree)
 		o.store.UpdateRunTree(o.runID, "running", treeJSON)
 	}
+
+	// Phase 1b: Validate entire graph schema consistency before implementation
+	allMismatches := validateTreeSchemas(tree)
+	if len(allMismatches) > 0 {
+		onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "tree_check",
+			Message: fmt.Sprintf("Found %d schema mismatches across full decomposition tree", len(allMismatches))})
+		for _, m := range allMismatches {
+			detail := fmt.Sprintf(":%s → :%s", m.SourceName, m.TargetName)
+			if len(m.Missing) > 0 {
+				detail += fmt.Sprintf(" missing=[%s]", strings.Join(m.Missing, ", "))
+			}
+			if len(m.TypeDiffs) > 0 {
+				detail += fmt.Sprintf(" type_diffs=[%s]", strings.Join(m.TypeDiffs, "; "))
+			}
+			onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "mismatch", Message: detail})
+		}
+		if o.store != nil {
+			o.store.UpdateRunStatus(o.runID, "failed")
+		}
+		return fmt.Errorf("graph schema validation failed: %d mismatches remain after decomposition", len(allMismatches))
+	}
+	onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "tree_passed",
+		Message: "Full decomposition tree has consistent schemas across all edges"})
 
 	// Phase 2: Collect leaf cells from decomposition tree
 	leaves := collectLeaves(tree)
@@ -229,14 +291,21 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 				onEvent(OrchestratorEvent{Phase: "redecompose", CellID: failed.CellID, Status: "decomposing",
 					Message: fmt.Sprintf("Breaking down failed cell %s", failed.CellID)})
 
-				subSpec := fmt.Sprintf("Implement this specific step as a sub-workflow.\n\nStep: %s\nDescription: %s\n\nFull spec:\n%s",
-					failed.StepName, failed.Doc, cfg.Spec)
+				// Scope re-decomposition to the failed cell's functionality.
+				// The full spec is included as reference for business rules, but the prompt
+				// is framed tightly around the cell's locked contract.
+				subSpec := buildRedecomposeSpec(failed, cfg.Spec)
 
 				subPrefix := strings.TrimPrefix(failed.CellID, ":")
 				subPrefix = strings.ReplaceAll(subPrefix, "/", ".")
 
+				// Use fewer steps for re-decomposition — these are focused recovery sub-workflows
+				redecomposeSteps := dcfg.MaxStepsPerLevel
+				if redecomposeSteps > 4 {
+					redecomposeSteps = 4
+				}
 				redecomposeCfg := DecompositionConfig{
-					MaxStepsPerLevel: dcfg.MaxStepsPerLevel,
+					MaxStepsPerLevel: redecomposeSteps,
 					MaxDepth:         redecomposeMaxDepth,
 				}
 				subRoot, subErr := o.decompose(ctx, subSpec, subPrefix, nil, failed.Depth+1, redecomposeCfg, onChunk, onEvent)
@@ -320,10 +389,10 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 func (o *Orchestrator) RunResumable(ctx context.Context, cfg ProjectConfig,
 	onChunk func(source string, chunk string),
 	onEvent func(OrchestratorEvent),
-	onReview ...OnReviewFunc) error {
+	callbacks ...ReviewCallbacks) error {
 
 	if o.store == nil {
-		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+		return o.Run(ctx, cfg, onChunk, onEvent, callbacks...)
 	}
 
 	br := o.manager.GetBridge()
@@ -339,13 +408,13 @@ func (o *Orchestrator) RunResumable(ctx context.Context, cfg ProjectConfig,
 	if err != nil {
 		onEvent(OrchestratorEvent{Phase: "resume", Status: "warning",
 			Message: fmt.Sprintf("Could not check for previous run: %v", err)})
-		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+		return o.Run(ctx, cfg, onChunk, onEvent, callbacks...)
 	}
 
 	if prevRun == nil || prevRun.SpecHash != specHash {
 		onEvent(OrchestratorEvent{Phase: "resume", Status: "fresh",
 			Message: "No matching previous run found, starting fresh"})
-		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+		return o.Run(ctx, cfg, onChunk, onEvent, callbacks...)
 	}
 
 	onEvent(OrchestratorEvent{Phase: "resume", Status: "found",
@@ -355,14 +424,14 @@ func (o *Orchestrator) RunResumable(ctx context.Context, cfg ProjectConfig,
 	if prevRun.TreeJSON == "" {
 		onEvent(OrchestratorEvent{Phase: "resume", Status: "warning",
 			Message: "Previous run has no tree data, starting fresh"})
-		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+		return o.Run(ctx, cfg, onChunk, onEvent, callbacks...)
 	}
 
 	tree, err := DeserializeTree(prevRun.TreeJSON)
 	if err != nil {
 		onEvent(OrchestratorEvent{Phase: "resume", Status: "warning",
 			Message: fmt.Sprintf("Could not deserialize tree: %v, starting fresh", err)})
-		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+		return o.Run(ctx, cfg, onChunk, onEvent, callbacks...)
 	}
 
 	// Get the summary of which cells passed
@@ -370,7 +439,7 @@ func (o *Orchestrator) RunResumable(ctx context.Context, cfg ProjectConfig,
 	if err != nil {
 		onEvent(OrchestratorEvent{Phase: "resume", Status: "warning",
 			Message: fmt.Sprintf("Could not get run summary: %v, starting fresh", err)})
-		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+		return o.Run(ctx, cfg, onChunk, onEvent, callbacks...)
 	}
 
 	// Create a new run record for this resumption
@@ -391,7 +460,7 @@ func (o *Orchestrator) RunResumable(ctx context.Context, cfg ProjectConfig,
 	if len(leaves) == 0 {
 		onEvent(OrchestratorEvent{Phase: "resume", Status: "error",
 			Message: "No leaves in deserialized tree"})
-		return o.Run(ctx, cfg, onChunk, onEvent, onReview...)
+		return o.Run(ctx, cfg, onChunk, onEvent, callbacks...)
 	}
 
 	// Separate passed and failed leaves
@@ -445,9 +514,11 @@ func (o *Orchestrator) RunResumable(ctx context.Context, cfg ProjectConfig,
 
 		// Extract optional onReview callback for resume path
 		var resumeReviewFn OnReviewFunc
-		if len(onReview) > 0 {
-			resumeReviewFn = onReview[0]
+		if len(callbacks) > 0 {
+			resumeReviewFn = callbacks[0].OnTestReview
+			o.onGraphReview = callbacks[0].OnGraphReview
 		}
+		o.cfg = cfg
 
 		cellErrors := o.implementLeavesWithReview(ctx, cfg, br, tree, failedLeaves, onChunk, onEvent, resumeReviewFn)
 
@@ -553,6 +624,12 @@ func (o *Orchestrator) implementLeavesWithReview(ctx context.Context, cfg Projec
 				Doc:      leaf.Doc,
 				Schema:   fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema)),
 				Requires: leaf.Requires,
+			}
+
+			// Enrich brief with graph context (predecessors/successors)
+			if parent := findParent(tree, leaf.StepName); parent != nil {
+				graphCtx := buildGraphContext(parent, leaf.StepName)
+				brief.Context = formatGraphContext(graphCtx)
 			}
 
 			session, err := br.CloneSession()
@@ -731,6 +808,22 @@ Return ONLY deftest forms in a single code block.`, resp.Feedback)
 	}
 
 	// Phase C: implement approved contracts in parallel
+	// First, refresh any stale nREPL sessions (can happen after long review gates)
+	for _, c := range contracts {
+		if c == nil || c.Err != nil {
+			continue
+		}
+		if newSession, refreshed, err := refreshSession(br, c.Session); err != nil {
+			c.Err = fmt.Errorf("session refresh failed for %s: %w", c.CellID, err)
+			onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: c.CellID, Status: "error",
+				Message: fmt.Sprintf("Failed to refresh session for %s, skipping: %v", c.CellID, err)})
+		} else if refreshed {
+			c.Session = newSession
+			onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: c.CellID, Status: "info",
+				Message: fmt.Sprintf("Refreshed stale nREPL session for %s", c.CellID)})
+		}
+	}
+
 	var wg2 sync.WaitGroup
 	for i, c := range contracts {
 		if c == nil || c.Err != nil {
@@ -970,13 +1063,21 @@ func (o *Orchestrator) implementFromContract(ctx context.Context, cfg ProjectCon
 	onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "started",
 		Message: fmt.Sprintf("Implementing %s", cellID)})
 
+	// Build context section from brief
+	contextSection := ""
+	if brief.Context != "" {
+		contextSection = "\n" + brief.Context
+	}
+
 	implPrompt := fmt.Sprintf(`Good. Now implement the cell to pass those tests.
 
+## Cell Contract
+- **Cell ID:** %s
+- **Purpose:** %s
+- **Schema:** %s
+- **Namespace:** %s
+%s
 The cell namespace and defcell wrapper are generated for you.
-The cell will be:
-  Cell ID: %s
-  Schema: %s
-  Namespace: %s
 
 Write ONLY:
 1. (OPTIONAL) Helper functions — define any helper functions you need
@@ -1003,7 +1104,7 @@ Example:
 
 Return ONLY helper functions and the (fn ...) form in a single code block.
 Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
-		cellID, brief.Schema, cellNs, mathPrecisionRules)
+		cellID, brief.Doc, brief.Schema, cellNs, contextSection, mathPrecisionRules)
 
 	implResponse, err := agent.session.SendStream(ctx, agent.client, implPrompt,
 		func(chunk string) { onChunk(cellID+"/impl", chunk) })
@@ -1140,23 +1241,16 @@ Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
 		onEvent(OrchestratorEvent{Phase: "cell_implement", CellID: cellID, Status: "fixing",
 			Message: "Tests failed, asking for fix..."})
 
-		fixPrompt := fmt.Sprintf(`The tests are failing. Test output:
-
-`+"```\n%s\n```"+`
-
-Here are the tests for reference:
-
-`+"```clojure\n%s\n```"+`
-
-%s
-
-Fix the implementation. Return ONLY:
-1. (OPTIONAL) Helper functions
-2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
-
-If you need extra requires, add: ;; REQUIRE: [lib.name :as alias]
-Do NOT include (ns ...) or (cell/defcell ...).
-CRITICAL: The cell ID is %s.`, testOutput, testCode, mathPrecisionRules, cellID)
+		fixPrompt := buildGraduatedFixPrompt(FixPromptParams{
+			TestOutput:   testOutput,
+			TestCode:     testCode,
+			ImplCode:     implCode,
+			Brief:        brief,
+			CellID:       cellID,
+			Attempt:      attempt,
+			MaxAttempts:  maxAttempts,
+			GraphContext: brief.Context,
+		})
 
 		fixResponse, fixErr := agent.session.SendStream(ctx, agent.client, fixPrompt,
 			func(chunk string) { onChunk(cellID+"/fix", chunk) })
@@ -1246,10 +1340,29 @@ func (o *Orchestrator) registerSubWorkflows(ctx context.Context, br *bridge.Brid
 	}
 }
 
+// refreshSession checks if an nREPL session is still alive by evaluating a trivial expression.
+// If the session is stale, it closes it and clones a new one.
+// Returns (session, wasRefreshed, error).
+func refreshSession(br *bridge.Bridge, session string) (string, bool, error) {
+	// Quick liveness check
+	result, err := br.EvalInSession(session, "1")
+	if err == nil && result.Ex == "" {
+		return session, false, nil
+	}
+
+	// Session is stale — close it and clone a new one
+	br.CloseSession(session)
+	newSession, cloneErr := br.CloneSession()
+	if cloneErr != nil {
+		return "", false, fmt.Errorf("clone replacement session: %w", cloneErr)
+	}
+	return newSession, true, nil
+}
+
 // defaultSchema returns the schema or "[:map]" if empty.
 func defaultSchema(schema string) string {
 	if schema == "" {
-		return "[:map]"
+		return "{}"
 	}
 	return schema
 }
