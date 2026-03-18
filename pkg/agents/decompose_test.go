@@ -1192,3 +1192,317 @@ func TestBuildEdgeFixPromptMissingSteps(t *testing.T) {
 		t.Error("should show target cell name even if not found")
 	}
 }
+
+// --- Tests for structured graph validation ---
+
+func TestValidateGraphStructureClean(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "validate", Doc: "Validate"},
+		{StepName: "process", Doc: "Process"},
+		{StepName: "finalize", Doc: "Finalize"},
+	}
+	walk := &GraphWalkResult{
+		Edges: map[string]string{
+			"validate": "{:done :process}",
+			"process":  "{:done :finalize}",
+			"finalize": "{:done :end}",
+		},
+		Dispatches: map[string]string{
+			"validate": "[[:done (constantly true)]]",
+			"process":  "[[:done (constantly true)]]",
+			"finalize": "[[:done (constantly true)]]",
+		},
+	}
+
+	issues := validateGraphStructure(steps, walk)
+	if len(issues) != 0 {
+		t.Errorf("expected 0 issues, got %d: %v", len(issues), issues)
+	}
+}
+
+func TestValidateGraphStructureMissingEdge(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "a", Doc: "A"},
+		{StepName: "b", Doc: "B"},
+	}
+	walk := &GraphWalkResult{
+		Edges: map[string]string{
+			"a": "{:done :b}",
+			// "b" is missing
+		},
+		Dispatches: map[string]string{
+			"a": "[[:done (constantly true)]]",
+			"b": "[[:done (constantly true)]]",
+		},
+	}
+
+	issues := validateGraphStructure(steps, walk)
+	hasEdgeIssue := false
+	hasStuckIssue := false
+	for _, issue := range issues {
+		if issue.Type == "missing_edge" && strings.Contains(issue.Message, ":b") {
+			hasEdgeIssue = true
+		}
+		if issue.Type == "stuck" && strings.Contains(issue.Message, ":b") {
+			hasStuckIssue = true
+		}
+	}
+	if !hasEdgeIssue {
+		t.Error("expected missing_edge issue for :b")
+	}
+	if !hasStuckIssue {
+		t.Error("expected stuck issue for :b")
+	}
+}
+
+func TestValidateGraphStructureMissingDispatch(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "a", Doc: "A"},
+		{StepName: "b", Doc: "B"},
+	}
+	walk := &GraphWalkResult{
+		Edges: map[string]string{
+			"a": "{:done :b}",
+			"b": "{:done :end}",
+		},
+		Dispatches: map[string]string{
+			"a": "[[:done (constantly true)]]",
+			// "b" dispatch is missing
+		},
+	}
+
+	issues := validateGraphStructure(steps, walk)
+	hasMissing := false
+	for _, issue := range issues {
+		if issue.Type == "missing_dispatch" && strings.Contains(issue.Message, ":b") {
+			hasMissing = true
+		}
+	}
+	if !hasMissing {
+		t.Error("expected missing_dispatch issue for :b")
+	}
+}
+
+func TestValidateGraphStructureUnreachable(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "a", Doc: "A"},
+		{StepName: "b", Doc: "B"},
+		{StepName: "c", Doc: "C (orphan)"},
+	}
+	walk := &GraphWalkResult{
+		Edges: map[string]string{
+			"a": "{:done :b}",
+			"b": "{:done :end}",
+			"c": "{:done :end}",
+		},
+		Dispatches: map[string]string{
+			"a": "[[:done (constantly true)]]",
+			"b": "[[:done (constantly true)]]",
+			"c": "[[:done (constantly true)]]",
+		},
+	}
+
+	issues := validateGraphStructure(steps, walk)
+	hasUnreachable := false
+	for _, issue := range issues {
+		if issue.Type == "unreachable" && strings.Contains(issue.Message, ":c") {
+			hasUnreachable = true
+		}
+	}
+	if !hasUnreachable {
+		t.Error("expected unreachable issue for :c")
+	}
+}
+
+func TestValidateGraphStructureNoEnd(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "a", Doc: "A"},
+		{StepName: "b", Doc: "B"},
+	}
+	walk := &GraphWalkResult{
+		Edges: map[string]string{
+			"a": "{:done :b}",
+			"b": "{:done :a}", // circular, no :end
+		},
+		Dispatches: map[string]string{
+			"a": "[[:done (constantly true)]]",
+			"b": "[[:done (constantly true)]]",
+		},
+	}
+
+	issues := validateGraphStructure(steps, walk)
+	hasNoEnd := false
+	for _, issue := range issues {
+		if issue.Type == "no_end" {
+			hasNoEnd = true
+		}
+	}
+	if !hasNoEnd {
+		t.Error("expected no_end issue for circular graph")
+	}
+}
+
+func TestValidateGraphStructureInvalidTarget(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "a", Doc: "A"},
+	}
+	walk := &GraphWalkResult{
+		Edges: map[string]string{
+			"a": "{:done :nonexistent}",
+		},
+		Dispatches: map[string]string{
+			"a": "[[:done (constantly true)]]",
+		},
+	}
+
+	issues := validateGraphStructure(steps, walk)
+	hasInvalid := false
+	for _, issue := range issues {
+		if issue.Type == "missing_edge" && strings.Contains(issue.Message, ":nonexistent") {
+			hasInvalid = true
+		}
+	}
+	if !hasInvalid {
+		t.Error("expected missing_edge issue for :nonexistent target")
+	}
+}
+
+func TestValidateGraphStructureBranching(t *testing.T) {
+	// Branching graph: a → b or c, both → end
+	steps := []*DecompositionNode{
+		{StepName: "a", Doc: "A"},
+		{StepName: "b", Doc: "B"},
+		{StepName: "c", Doc: "C"},
+	}
+	walk := &GraphWalkResult{
+		Edges: map[string]string{
+			"a": "{:ok :b :fail :c}",
+			"b": "{:done :end}",
+			"c": "{:done :end}",
+		},
+		Dispatches: map[string]string{
+			"a": "[[:ok (fn [d] (:ok? d))] [:fail (fn [d] (not (:ok? d)))]]",
+			"b": "[[:done (constantly true)]]",
+			"c": "[[:done (constantly true)]]",
+		},
+	}
+
+	issues := validateGraphStructure(steps, walk)
+	if len(issues) != 0 {
+		t.Errorf("expected 0 issues for valid branching graph, got %d: %v", len(issues), issues)
+	}
+}
+
+func TestValidateGraphStructureEmpty(t *testing.T) {
+	issues := validateGraphStructure(nil, &GraphWalkResult{})
+	if len(issues) != 0 {
+		t.Errorf("expected 0 issues for empty graph, got %d", len(issues))
+	}
+}
+
+func TestBuildGraphFixPrompt(t *testing.T) {
+	steps := []*DecompositionNode{
+		{StepName: "a", Doc: "Step A", InputSchema: "{:x :int}", OutputSchema: "{:y :string}"},
+		{StepName: "b", Doc: "Step B", InputSchema: "{:y :string}", OutputSchema: "{:result :boolean}"},
+	}
+	walk := &GraphWalkResult{
+		Edges:      map[string]string{"a": "{:done :b}"},
+		Dispatches: map[string]string{"a": "[[:done (constantly true)]]"},
+	}
+	issues := []GraphIssue{
+		{Type: "missing_edge", Message: "Step :b has no edge entry"},
+		{Type: "missing_dispatch", Message: "Step :b has no dispatch entry"},
+	}
+
+	prompt := buildGraphFixPrompt(steps, walk, issues)
+
+	if !strings.Contains(prompt, "ISSUES TO FIX") {
+		t.Error("should contain issues section")
+	}
+	if !strings.Contains(prompt, "missing_edge") {
+		t.Error("should contain issue type")
+	}
+	if !strings.Contains(prompt, ":b") {
+		t.Error("should mention step :b")
+	}
+	if !strings.Contains(prompt, "Current edges") {
+		t.Error("should show current edges")
+	}
+	if !strings.Contains(prompt, "(MISSING)") {
+		t.Error("should show MISSING for step without edges")
+	}
+}
+
+func TestParseGraphResponse(t *testing.T) {
+	response := "```edn\n" +
+		`{:steps [{:name "validate" :doc "Validate input" :input-schema {:x :int} :output-schema {:x :int :valid? :boolean} :requires [] :simple? true}
+  {:name "process" :doc "Process data" :input-schema {:x :int :valid? :boolean} :output-schema {:result :string} :requires [:db] :simple? true}]
+ :edges {:validate {:done :process}
+         :process {:done :end}}
+ :dispatches {:validate [[:done (constantly true)]]
+              :process [[:done (constantly true)]]}}` +
+		"\n```"
+
+	nodes, walk, err := parseGraphResponse(response, "test")
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(nodes))
+	}
+	if nodes[0].StepName != "validate" {
+		t.Errorf("node 0 name: %q", nodes[0].StepName)
+	}
+	if nodes[0].CellID != ":test/validate" {
+		t.Errorf("node 0 cell ID: %q", nodes[0].CellID)
+	}
+	if nodes[1].StepName != "process" {
+		t.Errorf("node 1 name: %q", nodes[1].StepName)
+	}
+
+	if walk == nil {
+		t.Fatal("expected non-nil walk")
+	}
+	if len(walk.Edges) != 2 {
+		t.Errorf("expected 2 edges, got %d: %v", len(walk.Edges), walk.Edges)
+	}
+}
+
+func TestParseGraphResponseFallbackToStepsOnly(t *testing.T) {
+	// Old format: just a steps vector
+	response := "```edn\n" +
+		`[{:name "only" :doc "Only step" :input-schema [:map] :output-schema [:map] :requires [] :simple? true}]` +
+		"\n```"
+
+	nodes, walk, err := parseGraphResponse(response, "ns")
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if walk != nil {
+		t.Error("expected nil walk for steps-only fallback")
+	}
+}
+
+func TestParseDispatchesFromRaw(t *testing.T) {
+	block := `{:steps [...]
+ :edges {:a {:done :b} :b {:done :end}}
+ :dispatches {:a [[:done (constantly true)]]
+              :b [[:ok (fn [data] (:ok? data))] [:fail (fn [data] (not (:ok? data)))]]}}`
+
+	stepNames := map[string]bool{"a": true, "b": true}
+	dispatches := parseDispatchesFromRaw(block, stepNames)
+
+	if len(dispatches) != 2 {
+		t.Fatalf("expected 2 dispatches, got %d: %v", len(dispatches), dispatches)
+	}
+	if !strings.Contains(dispatches["a"], "constantly true") {
+		t.Errorf("a dispatch: %q", dispatches["a"])
+	}
+	if !strings.Contains(dispatches["b"], "fn [data]") {
+		t.Errorf("b dispatch: %q", dispatches["b"])
+	}
+}

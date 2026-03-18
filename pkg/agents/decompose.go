@@ -258,6 +258,162 @@ func parseDecompositionResponse(response, nsPrefix string) ([]*DecompositionNode
 	return nodes, nil
 }
 
+// graphResponse is the EDN-deserialized form of the full graph from the LLM.
+type graphResponse struct {
+	Steps      []decompositionStep         `edn:"steps"`
+	Edges      map[edn.Keyword]interface{} `edn:"edges"`
+	Dispatches map[edn.Keyword]interface{} `edn:"dispatches"`
+}
+
+// parseGraphResponse parses the LLM's combined graph response containing steps, edges, and dispatches.
+// Returns the nodes and a GraphWalkResult.
+func parseGraphResponse(response, nsPrefix string) ([]*DecompositionNode, *GraphWalkResult, error) {
+	block := ExtractFirstCodeBlock(response)
+	if block == "" {
+		block = response
+	}
+
+	var graph graphResponse
+	if err := edn.Unmarshal([]byte(block), &graph); err != nil {
+		// Fall back: maybe the LLM returned just a steps vector (old format)
+		nodes, parseErr := parseDecompositionResponse(response, nsPrefix)
+		if parseErr != nil {
+			return nil, nil, fmt.Errorf("EDN parse error (tried graph format and steps-only): %w", err)
+		}
+		return nodes, nil, nil // nil walk = caller needs to generate edges separately
+	}
+
+	if len(graph.Steps) == 0 {
+		return nil, nil, fmt.Errorf("no steps found in graph response")
+	}
+
+	// Parse steps into nodes
+	var nodes []*DecompositionNode
+	for _, step := range graph.Steps {
+		if step.Name == "" {
+			continue
+		}
+		node := &DecompositionNode{
+			StepName:     step.Name,
+			CellID:       ":" + nsPrefix + "/" + step.Name,
+			Doc:          step.Doc,
+			InputSchema:  ednToString(step.InputSchema),
+			OutputSchema: ednToString(step.OutputSchema),
+			IsLeaf:       step.Simple,
+		}
+		for _, r := range step.Requires {
+			node.Requires = append(node.Requires, string(r))
+		}
+		nodes = append(nodes, node)
+	}
+
+	if len(nodes) == 0 {
+		return nil, nil, fmt.Errorf("no valid steps parsed from graph response")
+	}
+
+	// Parse edges and dispatches into GraphWalkResult
+	walk := &GraphWalkResult{
+		Edges:      make(map[string]string),
+		Dispatches: make(map[string]string),
+	}
+
+	for stepKW, edgeVal := range graph.Edges {
+		stepName := string(stepKW)
+		edgeEDN := ednToString(edgeVal)
+		walk.Edges[stepName] = edgeEDN
+	}
+
+	for stepKW, dispVal := range graph.Dispatches {
+		stepName := string(stepKW)
+		// Dispatches contain fn forms that can't round-trip through EDN parsing,
+		// so we extract them from the raw code block instead.
+		walk.Dispatches[stepName] = ednToString(dispVal)
+	}
+
+	return nodes, walk, nil
+}
+
+// parseDispatchesFromRaw extracts dispatch entries from the raw code block text,
+// since dispatch fn forms like (fn [data] ...) can't round-trip through EDN parsing.
+func parseDispatchesFromRaw(block string, stepNames map[string]bool) map[string]string {
+	dispatches := make(map[string]string)
+
+	// Find :dispatches section in the raw block
+	idx := strings.Index(block, ":dispatches")
+	if idx < 0 {
+		return dispatches
+	}
+	rest := block[idx+len(":dispatches"):]
+
+	// Find the opening { after :dispatches
+	braceStart := strings.Index(rest, "{")
+	if braceStart < 0 {
+		return dispatches
+	}
+	rest = rest[braceStart:]
+
+	// Find matching closing } — track brace depth
+	depth := 0
+	end := -1
+	for i, ch := range rest {
+		switch ch {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return dispatches
+	}
+	dispSection := rest[1:end] // contents between outer braces
+
+	// Parse each :step-name [...] pair
+	for name := range stepNames {
+		needle := ":" + name
+		pos := strings.Index(dispSection, needle)
+		if pos < 0 {
+			continue
+		}
+		// Find the [ after the step name
+		after := dispSection[pos+len(needle):]
+		bracketStart := strings.Index(after, "[")
+		if bracketStart < 0 {
+			continue
+		}
+		after = after[bracketStart:]
+
+		// Find matching ] — track bracket depth
+		bdepth := 0
+		bend := -1
+		for i, ch := range after {
+			switch ch {
+			case '[':
+				bdepth++
+			case ']':
+				bdepth--
+				if bdepth == 0 {
+					bend = i
+				}
+			}
+			if bend >= 0 {
+				break
+			}
+		}
+		if bend >= 0 {
+			dispatches[name] = after[:bend+1]
+		}
+	}
+
+	return dispatches
+}
+
 // ednToString marshals an arbitrary EDN value back to its string representation.
 // Returns "{}" (generic lite map) if the value is nil or marshaling fails.
 func ednToString(v interface{}) string {
@@ -417,6 +573,12 @@ func extractFirstBalancedBrackets(s string) string {
 // decompose recursively breaks a specification into a tree of steps.
 // Each level has at most cfg.MaxStepsPerLevel steps.
 // Complex steps are recursed into sub-workflows up to cfg.MaxDepth.
+//
+// Flow:
+// 1. Ask LLM for complete graph (cells + edges + dispatches) in one shot
+// 2. Validate graph structure: reachability, dispatches, schemas
+// 3. Iterate with LLM on specific failures until graph passes
+// 4. Lock contracts, recurse into non-leaf children with boundary constraints
 func (o *Orchestrator) decompose(ctx context.Context, spec, nsPrefix string,
 	parentSteps []string, depth int, cfg DecompositionConfig,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) (*DecompositionNode, error) {
@@ -424,7 +586,7 @@ func (o *Orchestrator) decompose(ctx context.Context, spec, nsPrefix string,
 	nodeID := fmt.Sprintf("decompose-d%d-%s", depth, nsPrefix)
 	agent := o.manager.NewDecomposeAgent(nodeID)
 
-	// Build decomposition prompt
+	// Build combined prompt requesting full graph (steps + edges + dispatches)
 	prompt := buildDecomposePrompt(spec, nsPrefix, parentSteps, cfg.MaxStepsPerLevel)
 
 	onEvent(OrchestratorEvent{Phase: "decompose", Status: "started",
@@ -436,37 +598,46 @@ func (o *Orchestrator) decompose(ctx context.Context, spec, nsPrefix string,
 		return nil, fmt.Errorf("decompose at depth %d: %w", depth, err)
 	}
 
-	steps, err := parseDecompositionResponse(response, nsPrefix)
+	// Parse full graph response (steps + edges + dispatches)
+	steps, walk, err := parseGraphResponse(response, nsPrefix)
 	if err != nil {
-		// Retry with more explicit instruction
-		retryPrompt := `Your response could not be parsed. Return ONLY an EDN vector of maps in a code block.
-
-Each map must have these keys:
-- :name — a short keyword name (string, e.g. "validate-input")
-- :doc — what this step does (string)
-- :input-schema — EDN schema (e.g. [:map])
-- :output-schema — EDN schema (e.g. [:map])
-- :requires — vector of resource keywords (e.g. [:db])
-- :simple? — true or false
-
-Example:
-` + "```edn\n" + `[{:name "validate" :doc "Validate the input data" :input-schema [:map] :output-schema [:map] :requires [] :simple? true}
- {:name "process" :doc "Process the validated data" :input-schema [:map] :output-schema [:map] :requires [:db] :simple? false}]
-` + "```"
-
+		// Retry with explicit format instruction
+		retryPrompt := buildGraphRetryPrompt()
 		response, err = agent.ChatStream(ctx, retryPrompt,
 			func(chunk string) { onChunk("decompose/"+nodeID, chunk) })
 		if err != nil {
 			return nil, fmt.Errorf("decompose retry at depth %d: %w", depth, err)
 		}
-		steps, err = parseDecompositionResponse(response, nsPrefix)
+		steps, walk, err = parseGraphResponse(response, nsPrefix)
 		if err != nil {
-			return nil, fmt.Errorf("parse decomposition at depth %d: %w", depth, err)
+			return nil, fmt.Errorf("parse graph at depth %d: %w", depth, err)
+		}
+	}
+
+	// If the LLM returned steps-only (old format fallback), generate edges via walkGraph
+	if walk == nil {
+		onEvent(OrchestratorEvent{Phase: "decompose", Status: "info",
+			Message: "LLM returned steps only, generating edges via graph walk"})
+		walk, err = o.walkGraph(ctx, steps, agent, onChunk, onEvent)
+		if err != nil {
+			return nil, fmt.Errorf("graph walk fallback at depth %d: %w", depth, err)
+		}
+	} else {
+		// Extract dispatches from raw text (fn forms don't survive EDN round-trip)
+		rawBlock := ExtractFirstCodeBlock(response)
+		stepNameSet := make(map[string]bool)
+		for _, s := range steps {
+			stepNameSet[s.StepName] = true
+		}
+		rawDispatches := parseDispatchesFromRaw(rawBlock, stepNameSet)
+		for name, disp := range rawDispatches {
+			walk.Dispatches[name] = disp
 		}
 	}
 
 	onEvent(OrchestratorEvent{Phase: "decompose", Status: "parsed",
-		Message: fmt.Sprintf("Depth %d: %d steps", depth, len(steps))})
+		Message: fmt.Sprintf("Depth %d: %d steps, %d edges, %d dispatches",
+			depth, len(steps), len(walk.Edges), len(walk.Dispatches))})
 
 	// Set depth on all steps
 	for _, step := range steps {
@@ -480,26 +651,17 @@ Example:
 		}
 	}
 
-	// --- Level-by-level validation: walk + validate + fix BEFORE recursion ---
-	// This ensures the current level's contracts are locked before descending.
-
-	// Walk the graph to determine edges and dispatches
-	walk, err := o.walkGraph(ctx, steps, agent, onChunk, onEvent)
+	// --- Structured graph validation pipeline ---
+	// Validate the graph iteratively, fixing issues with targeted LLM feedback.
+	walk, err = o.validateGraph(ctx, spec, steps, walk, agent, onChunk, onEvent)
 	if err != nil {
-		return nil, fmt.Errorf("graph walk at depth %d: %w", depth, err)
-	}
-
-	// Validate and reconcile schema compatibility across all edges (edge-by-edge)
-	if err := o.validateEdgeSchemas(ctx, spec, steps, walk, agent, onChunk, onEvent); err != nil {
-		return nil, fmt.Errorf("edge schema validation at depth %d: %w", depth, err)
+		return nil, fmt.Errorf("graph validation at depth %d: %w", depth, err)
 	}
 
 	onEvent(OrchestratorEvent{Phase: "decompose", Status: "level_locked",
-		Message: fmt.Sprintf("Depth %d: schemas locked for %d steps", depth, len(steps))})
+		Message: fmt.Sprintf("Depth %d: graph validated and locked for %d steps", depth, len(steps))})
 
 	// --- Recurse into non-leaf children with boundary constraints ---
-	// Each child's outer contract (input→output) is already fixed by the
-	// validated schemas above. Sub-decomposition must stay within those bounds.
 	if depth < cfg.MaxDepth {
 		for _, step := range steps {
 			if !step.IsLeaf {
@@ -508,9 +670,6 @@ Example:
 						step.StepName, truncSchema(step.InputSchema, 60), truncSchema(step.OutputSchema, 60))})
 
 				subPrefix := nsPrefix + "." + step.StepName
-
-				// Build boundary-constrained spec: sub-workflow must accept
-				// parent's input schema and produce parent's output schema
 				subSpec := buildBoundaryConstrainedSpec(step, spec)
 
 				stepNames := make([]string, len(steps))
@@ -520,7 +679,6 @@ Example:
 
 				subRoot, subErr := o.decompose(ctx, subSpec, subPrefix, stepNames, depth+1, cfg, onChunk, onEvent)
 				if subErr != nil {
-					// Fall back to treating this as a leaf
 					onEvent(OrchestratorEvent{Phase: "decompose", Status: "warning",
 						Message: fmt.Sprintf("Could not decompose %s, treating as leaf: %v", step.StepName, subErr)})
 					step.IsLeaf = true
@@ -542,7 +700,6 @@ Example:
 		o.validateAssembledManifest(br, manifest, onEvent)
 	}
 
-	// Build root node
 	root := &DecompositionNode{
 		StepName:   nsPrefix,
 		CellID:     ":" + nsPrefix + "/workflow",
@@ -557,7 +714,317 @@ Example:
 	return root, nil
 }
 
+// buildGraphRetryPrompt returns a retry prompt for when the initial graph response can't be parsed.
+func buildGraphRetryPrompt() string {
+	return `Your response could not be parsed. Return a COMPLETE graph as a single EDN map with three keys.
+
+` + "```edn\n" + `{:steps [{:name "step-a" :doc "Does A" :input-schema {:x :int} :output-schema {:x :int :y :string} :requires [] :simple? true}
+  {:name "step-b" :doc "Does B" :input-schema {:x :int :y :string} :output-schema {:result :string} :requires [:db] :simple? true}]
+ :edges {:step-a {:done :step-b}
+         :step-b {:done :end}}
+ :dispatches {:step-a [[:done (constantly true)]]
+              :step-b [[:done (constantly true)]]}}` + "\n```\n" + `
+The :edges and :dispatches maps MUST have an entry for EVERY step.
+Every step must be reachable from the first step following edges.
+At least one path must reach :end.`
+}
+
+// --- Graph validation pipeline ---
+
+// GraphIssue describes a specific problem found during graph validation.
+type GraphIssue struct {
+	Type    string // "unreachable", "stuck", "no_end", "missing_edge", "missing_dispatch", "schema_mismatch"
+	Message string // human-readable description
+}
+
+// validateGraphStructure runs deterministic checks on the graph and returns all issues found.
+// Checks: reachability (BFS from first step), end reachability, edge completeness, dispatch completeness.
+func validateGraphStructure(steps []*DecompositionNode, walk *GraphWalkResult) []GraphIssue {
+	var issues []GraphIssue
+	if len(steps) == 0 {
+		return issues
+	}
+
+	stepNames := make(map[string]bool)
+	for _, s := range steps {
+		stepNames[s.StepName] = true
+	}
+
+	// 1. Check every step has an edge entry
+	for _, s := range steps {
+		if _, ok := walk.Edges[s.StepName]; !ok {
+			issues = append(issues, GraphIssue{
+				Type:    "missing_edge",
+				Message: fmt.Sprintf("Step :%s has no edge entry — it needs {:done :next-step} or similar", s.StepName),
+			})
+		}
+	}
+
+	// 2. Check every step has a dispatch entry
+	for _, s := range steps {
+		if _, ok := walk.Dispatches[s.StepName]; !ok {
+			issues = append(issues, GraphIssue{
+				Type:    "missing_dispatch",
+				Message: fmt.Sprintf("Step :%s has no dispatch entry — it needs [[:done (constantly true)]] or similar", s.StepName),
+			})
+		}
+	}
+
+	// 3. Check every edge target is a valid step or :end
+	for stepName, edgesEDN := range walk.Edges {
+		var parsed interface{}
+		if err := edn.Unmarshal([]byte(edgesEDN), &parsed); err != nil {
+			issues = append(issues, GraphIssue{
+				Type:    "missing_edge",
+				Message: fmt.Sprintf("Step :%s has unparseable edges: %s", stepName, edgesEDN),
+			})
+			continue
+		}
+		for _, target := range extractTargetKeywords(parsed) {
+			if target != "end" && !stepNames[target] {
+				issues = append(issues, GraphIssue{
+					Type:    "missing_edge",
+					Message: fmt.Sprintf("Step :%s has edge to :%s which doesn't exist", stepName, target),
+				})
+			}
+		}
+	}
+
+	// 4. BFS from first step — check reachability and end-reachability
+	visited := make(map[string]bool)
+	reachesEnd := false
+	frontier := []string{steps[0].StepName}
+
+	for len(frontier) > 0 {
+		current := frontier[0]
+		frontier = frontier[1:]
+
+		if visited[current] || current == "end" {
+			if current == "end" {
+				reachesEnd = true
+			}
+			continue
+		}
+		visited[current] = true
+
+		edgesEDN, ok := walk.Edges[current]
+		if !ok {
+			issues = append(issues, GraphIssue{
+				Type:    "stuck",
+				Message: fmt.Sprintf("Walk stuck at :%s — no edges defined, can't continue", current),
+			})
+			continue
+		}
+
+		var parsed interface{}
+		if err := edn.Unmarshal([]byte(edgesEDN), &parsed); err != nil {
+			issues = append(issues, GraphIssue{
+				Type:    "stuck",
+				Message: fmt.Sprintf("Walk stuck at :%s — edges unparseable: %s", current, edgesEDN),
+			})
+			continue
+		}
+
+		targets := extractTargetKeywords(parsed)
+		if len(targets) == 0 {
+			issues = append(issues, GraphIssue{
+				Type:    "stuck",
+				Message: fmt.Sprintf("Walk stuck at :%s — edge has no targets: %s", current, edgesEDN),
+			})
+			continue
+		}
+
+		for _, t := range targets {
+			if t == "end" {
+				reachesEnd = true
+			} else if stepNames[t] && !visited[t] {
+				frontier = append(frontier, t)
+			}
+		}
+	}
+
+	// 5. Find unreachable steps
+	for _, s := range steps {
+		if !visited[s.StepName] {
+			issues = append(issues, GraphIssue{
+				Type:    "unreachable",
+				Message: fmt.Sprintf("Step :%s is unreachable — no path from :%s leads to it", s.StepName, steps[0].StepName),
+			})
+		}
+	}
+
+	// 6. Check that at least one path reaches :end
+	if !reachesEnd {
+		issues = append(issues, GraphIssue{
+			Type:    "no_end",
+			Message: "No path reaches :end — the graph has no terminal transition",
+		})
+	}
+
+	return issues
+}
+
+// buildGraphFixPrompt creates a targeted prompt telling the LLM exactly what's wrong
+// with the current graph and asking it to fix those specific issues.
+func buildGraphFixPrompt(steps []*DecompositionNode, walk *GraphWalkResult, issues []GraphIssue) string {
+	var b strings.Builder
+
+	b.WriteString("The workflow graph has structural problems. Fix ONLY the issues listed below.\n\n")
+
+	b.WriteString("Current graph:\n")
+	for _, s := range steps {
+		fmt.Fprintf(&b, "  :%s — %s\n    input: %s  output: %s\n",
+			s.StepName, s.Doc, defaultSchema(s.InputSchema), defaultSchema(s.OutputSchema))
+	}
+
+	b.WriteString("\nCurrent edges:\n")
+	for _, s := range steps {
+		if e, ok := walk.Edges[s.StepName]; ok {
+			fmt.Fprintf(&b, "  :%s → %s\n", s.StepName, e)
+		} else {
+			fmt.Fprintf(&b, "  :%s → (MISSING)\n", s.StepName)
+		}
+	}
+
+	b.WriteString("\nCurrent dispatches:\n")
+	for _, s := range steps {
+		if d, ok := walk.Dispatches[s.StepName]; ok {
+			fmt.Fprintf(&b, "  :%s → %s\n", s.StepName, d)
+		} else {
+			fmt.Fprintf(&b, "  :%s → (MISSING)\n", s.StepName)
+		}
+	}
+
+	b.WriteString("\nISSUES TO FIX:\n")
+	for i, issue := range issues {
+		fmt.Fprintf(&b, "  %d. [%s] %s\n", i+1, issue.Type, issue.Message)
+	}
+
+	b.WriteString(`
+Return the COMPLETE corrected :edges and :dispatches maps (not just the changed parts).
+Every step MUST have an entry in both maps.
+The graph must be walkable from the first step to :end, visiting every step.
+
+` + "```edn\n" + `{:edges {:step-name {:outcome :target} ...}
+ :dispatches {:step-name [[:outcome (fn [data] ...)]] ...}}` + "\n```")
+
+	return b.String()
+}
+
+// parseGraphFixResponse parses the LLM's corrected edges and dispatches.
+func parseGraphFixResponse(response string, stepNames map[string]bool) (*GraphWalkResult, error) {
+	block := ExtractFirstCodeBlock(response)
+	if block == "" {
+		block = response
+	}
+
+	var fix struct {
+		Edges      map[edn.Keyword]interface{} `edn:"edges"`
+		Dispatches map[edn.Keyword]interface{} `edn:"dispatches"`
+	}
+	if err := edn.Unmarshal([]byte(block), &fix); err != nil {
+		return nil, fmt.Errorf("EDN parse error: %w", err)
+	}
+
+	walk := &GraphWalkResult{
+		Edges:      make(map[string]string),
+		Dispatches: make(map[string]string),
+	}
+
+	for kw, val := range fix.Edges {
+		walk.Edges[string(kw)] = ednToString(val)
+	}
+
+	// Extract dispatches from raw text (fn forms don't survive EDN round-trip)
+	rawDispatches := parseDispatchesFromRaw(block, stepNames)
+	for name, disp := range rawDispatches {
+		walk.Dispatches[name] = disp
+	}
+	// Fill in any dispatches that were in the EDN but not caught by raw parsing
+	for kw, val := range fix.Dispatches {
+		name := string(kw)
+		if _, ok := walk.Dispatches[name]; !ok {
+			walk.Dispatches[name] = ednToString(val)
+		}
+	}
+
+	return walk, nil
+}
+
+// validateGraph runs the full validation pipeline: structure, schemas.
+// Iterates with the LLM on failures until the graph passes all checks or max attempts reached.
+func (o *Orchestrator) validateGraph(ctx context.Context, spec string,
+	steps []*DecompositionNode, walk *GraphWalkResult,
+	agent *GraphAgent, onChunk func(string, string),
+	onEvent func(OrchestratorEvent)) (*GraphWalkResult, error) {
+
+	const maxStructureAttempts = 3
+	const maxSchemaRounds = 5
+
+	stepNameSet := make(map[string]bool)
+	for _, s := range steps {
+		stepNameSet[s.StepName] = true
+	}
+
+	// Phase 1: Validate graph structure (reachability, edges, dispatches)
+	for attempt := 1; attempt <= maxStructureAttempts; attempt++ {
+		issues := validateGraphStructure(steps, walk)
+		if len(issues) == 0 {
+			onEvent(OrchestratorEvent{Phase: "graph_validation", Status: "structure_passed",
+				Message: fmt.Sprintf("Graph structure valid: all %d steps reachable with edges and dispatches", len(steps))})
+			break
+		}
+
+		onEvent(OrchestratorEvent{Phase: "graph_validation", Status: "structure_issues",
+			Message: fmt.Sprintf("Attempt %d: %d structural issues found", attempt, len(issues))})
+		for _, issue := range issues {
+			onEvent(OrchestratorEvent{Phase: "graph_validation", Status: issue.Type,
+				Message: issue.Message})
+		}
+
+		if attempt == maxStructureAttempts {
+			var msgs []string
+			for _, issue := range issues {
+				msgs = append(msgs, issue.Message)
+			}
+			return walk, fmt.Errorf("graph structure validation failed after %d attempts: %s",
+				maxStructureAttempts, strings.Join(msgs, "; "))
+		}
+
+		// Ask LLM to fix the specific issues
+		prompt := buildGraphFixPrompt(steps, walk, issues)
+		response, err := agent.ChatStream(ctx, prompt,
+			func(chunk string) { onChunk("graph-fix", chunk) })
+		if err != nil {
+			return walk, fmt.Errorf("graph fix LLM call (attempt %d): %w", attempt, err)
+		}
+
+		fixedWalk, parseErr := parseGraphFixResponse(response, stepNameSet)
+		if parseErr != nil {
+			onEvent(OrchestratorEvent{Phase: "graph_validation", Status: "warning",
+				Message: fmt.Sprintf("Could not parse graph fix response: %v", parseErr)})
+			continue
+		}
+
+		// Merge fixed edges/dispatches into walk
+		for name, edges := range fixedWalk.Edges {
+			walk.Edges[name] = edges
+		}
+		for name, disp := range fixedWalk.Dispatches {
+			walk.Dispatches[name] = disp
+		}
+	}
+
+	// Phase 2: Validate schema compatibility across all edges (edge-by-edge)
+	if err := o.validateEdgeSchemas(ctx, spec, steps, walk, agent, onChunk, onEvent); err != nil {
+		return walk, err
+	}
+
+	return walk, nil
+}
+
 // walkGraph performs a BFS from :start, asking the LLM about edges/dispatches one cell at a time.
+// This is a fallback used when the LLM returns steps-only (old format) instead of a full graph.
 func (o *Orchestrator) walkGraph(ctx context.Context, steps []*DecompositionNode,
 	agent *GraphAgent,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) (*GraphWalkResult, error) {
@@ -785,7 +1252,7 @@ func (o *Orchestrator) validateAssembledManifest(br *bridge.Bridge, manifest str
 func buildDecomposePrompt(spec, nsPrefix string, parentSteps []string, maxSteps int) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, `Break this specification into at most %d high-level steps.
+	fmt.Fprintf(&b, `Design a complete workflow graph with at most %d steps.
 
 <spec>
 %s
@@ -797,25 +1264,47 @@ func buildDecomposePrompt(spec, nsPrefix string, parentSteps []string, maxSteps 
 		fmt.Fprintf(&b, "This is a sub-decomposition. Parent workflow steps: %s\n\n", strings.Join(parentSteps, ", "))
 	}
 
-	b.WriteString(`For each step return an EDN map with:
-- :name — short keyword name (string, e.g. "validate-input")
-- :doc — what this step does (1-2 sentences, string)
-- :input-schema — lite Malli schema with field-level detail (see example)
-- :output-schema — lite Malli schema with field-level detail
-- :requires — vector of resource keywords (e.g. [:db :cache])
-- :simple? — true if implementable as one cell (~80 lines of Clojure), false if complex
+	b.WriteString(`Return a COMPLETE graph as a single EDN map with three keys: :steps, :edges, and :dispatches.
+
+:steps — vector of step maps, each with:
+  - :name — short keyword name (string, e.g. "validate-input")
+  - :doc — what this step does (1-2 sentences, string)
+  - :input-schema — lite Malli schema with field-level detail
+  - :output-schema — lite Malli schema with field-level detail
+  - :requires — vector of resource keywords (e.g. [:db :cache])
+  - :simple? — true if implementable as one cell (~80 lines of Clojure), false if complex
+
+:edges — map from step name keyword to edge map. Each edge map has outcome keywords
+  pointing to the next step keyword or :end. The first step is the entry point.
+  Every step MUST have an edge entry. The graph must be walkable from the first step
+  to :end, visiting every step.
+
+:dispatches — map from step name keyword to dispatch vector. Each dispatch vector contains
+  [outcome-keyword predicate-fn] pairs. Every outcome in the edges map MUST have a
+  corresponding dispatch entry.
 
 IMPORTANT — schemas use lite Malli syntax: {:field-name :type} for maps.
   :string, :int, :double, :boolean, :keyword for primitives
   [:vector <type>] for collections, {:field :type} for maps/structs
   [:map-of :keyword :type] for dynamic maps, [:maybe :type] for optional
 
-Return the steps as an EDN vector in a code block. Example:
+IMPORTANT — data flows through the graph. Each step's output schema must contain all
+  fields that downstream steps need (pass-through). If step A outputs {:x :int} and
+  step C (reached via step B) needs :x, then step B's output must also include :x.
+
+Return the graph in a single EDN code block:
 
 `)
 	b.WriteString("```edn\n")
-	b.WriteString(`[{:name "calculate-totals" :doc "Calculate order totals with tax" :input-schema {:items [:vector {:product-id :string :quantity :int :unit-price :double}] :tax-rate :double} :output-schema {:subtotal :double :tax-amount :double :total :double} :requires [:catalog] :simple? true}
- {:name "process-payment" :doc "Charge the customer" :input-schema {:total :double :payment-method :keyword} :output-schema {:transaction-id :string :status :keyword} :requires [:payment-gateway] :simple? true}]`)
+	b.WriteString(`{:steps [{:name "validate-input" :doc "Validate the order data" :input-schema {:items [:vector {:product-id :string :quantity :int :price :double}]} :output-schema {:items [:vector {:product-id :string :quantity :int :price :double}] :valid? :boolean} :requires [] :simple? true}
+  {:name "calculate-totals" :doc "Calculate order totals with tax" :input-schema {:items [:vector {:product-id :string :quantity :int :price :double}] :valid? :boolean} :output-schema {:subtotal :double :tax :double :total :double} :requires [:catalog] :simple? true}
+  {:name "process-payment" :doc "Charge the customer" :input-schema {:subtotal :double :tax :double :total :double} :output-schema {:transaction-id :string :status :keyword} :requires [:payment-gateway] :simple? true}]
+ :edges {:validate-input {:done :calculate-totals}
+         :calculate-totals {:done :process-payment}
+         :process-payment {:done :end}}
+ :dispatches {:validate-input [[:done (constantly true)]]
+              :calculate-totals [[:done (constantly true)]]
+              :process-payment [[:done (constantly true)]]}}`)
 	b.WriteString("\n```\n")
 
 	fmt.Fprintf(&b, "\nCell IDs will be namespaced as :%s/<step-name>.", nsPrefix)
