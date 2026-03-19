@@ -790,8 +790,8 @@ func (o *Orchestrator) decompose(ctx context.Context, spec, nsPrefix string,
 func buildGraphRetryPrompt() string {
 	return `Your response could not be parsed. Return a COMPLETE graph as a single EDN map with three keys.
 
-` + "```edn\n" + `{:steps [{:name "step-a" :doc "Does A" :input-schema {:x :int} :output-schema {:x :int :y :string} :requires [] :simple? true}
-  {:name "step-b" :doc "Does B" :input-schema {:x :int :y :string} :output-schema {:result :string} :requires [:db] :simple? true}]
+` + "```edn\n" + `{:steps [{:name "step-a" :doc "Detailed implementation requirements for step A including business rules, formulas, edge cases." :input-schema {:x :int} :output-schema {:x :int :y :string} :requires [] :simple? true}
+  {:name "step-b" :doc "Detailed implementation requirements for step B including how to use the :db resource, error handling, and boundary conditions." :input-schema {:x :int :y :string} :output-schema {:result :string} :requires [:db] :simple? true}]
  :edges {:step-a {:done :step-b}
          :step-b {:done :end}}
  :dispatches {:step-a [[:done (constantly true)]]
@@ -1340,7 +1340,15 @@ func buildDecomposePrompt(spec, nsPrefix string, parentSteps []string, maxSteps 
 
 :steps — vector of step maps, each with:
   - :name — short keyword name (string, e.g. "validate-input")
-  - :doc — what this step does (1-2 sentences, string)
+  - :doc — implementation requirements for this cell (string). This is the ONLY context
+    the implementing agent receives besides the schema. Include:
+    * What the cell does and why
+    * Specific business rules, formulas, or algorithms it must implement
+    * Edge cases, boundary conditions, and error handling
+    * How to use resources (e.g. lookup patterns, atom operations)
+    * Reference specific values from the spec (rates, thresholds, exemptions)
+    The doc should be detailed enough that a developer could implement the cell
+    correctly without reading the full spec.
   - :input-schema — lite Malli schema with field-level detail
   - :output-schema — lite Malli schema with field-level detail
   - :requires — vector of resource keywords (e.g. [:db :cache])
@@ -1355,10 +1363,17 @@ func buildDecomposePrompt(spec, nsPrefix string, parentSteps []string, maxSteps 
   [outcome-keyword predicate-fn] pairs. Every outcome in the edges map MUST have a
   corresponding dispatch entry.
 
-IMPORTANT — schemas use lite Malli syntax: {:field-name :type} for maps.
+IMPORTANT — schemas use lite Malli map syntax: {:field-name :type} for maps.
   :string, :int, :double, :boolean, :keyword for primitives
-  [:vector <type>] for collections, {:field :type} for maps/structs
-  [:map-of :keyword :type] for dynamic maps, [:maybe :type] for optional
+  [:vector <type>] for collections
+  {:field :type :field2 :type2} for structs (lite map syntax — NOT [:map ...] vector syntax)
+  [:map-of :string :double] for dynamic maps
+  [:enum :a :b :c] for enumerations
+
+  For optional/nullable fields, the KEY is the field name and the VALUE is [:maybe :type]:
+    CORRECT: {:error [:maybe :string]}        — field :error, type is optional string
+    WRONG:   {[:maybe :error] :string}         — DO NOT put [:maybe] around the key
+    WRONG:   {:error :maybe-string}            — :maybe is a wrapper, not a prefix
 
 IMPORTANT — data flows through the graph. Each step's output schema must contain all
   fields that downstream steps need (pass-through). If step A outputs {:x :int} and
@@ -1368,9 +1383,9 @@ Return the graph in a single EDN code block:
 
 `)
 	b.WriteString("```edn\n")
-	b.WriteString(`{:steps [{:name "validate-input" :doc "Validate the order data" :input-schema {:items [:vector {:product-id :string :quantity :int :price :double}]} :output-schema {:items [:vector {:product-id :string :quantity :int :price :double}] :valid? :boolean} :requires [] :simple? true}
-  {:name "calculate-totals" :doc "Calculate order totals with tax" :input-schema {:items [:vector {:product-id :string :quantity :int :price :double}] :valid? :boolean} :output-schema {:subtotal :double :tax :double :total :double} :requires [:catalog] :simple? true}
-  {:name "process-payment" :doc "Charge the customer" :input-schema {:subtotal :double :tax :double :total :double} :output-schema {:transaction-id :string :status :keyword} :requires [:payment-gateway] :simple? true}]
+	b.WriteString(`{:steps [{:name "validate-input" :doc "Validates order input structure. Check that :items is a non-empty vector of {product-id quantity} maps. Verify each product-id exists in the :catalog resource (a map of product-id to product details). Verify all quantities are positive integers. Set :valid? true on success, or :valid? false with :error message describing the first validation failure." :input-schema {:items [:vector {:product-id :string :quantity :int :price :double}]} :output-schema {:items [:vector {:product-id :string :quantity :int :price :double}] :valid? :boolean :error [:maybe :string]} :requires [:catalog] :simple? true}
+  {:name "calculate-totals" :doc "Calculate order totals with tax. For each item, compute line-total = round2(quantity * price). Subtotal = sum of line totals. Tax = round2(subtotal * tax-rate) where tax-rate comes from :tax-rates resource keyed by state. Total = subtotal + tax. Use round2 (BigDecimal HALF_UP to 2 decimal places) for all monetary calculations." :input-schema {:items [:vector {:product-id :string :quantity :int :price :double}] :valid? :boolean :error [:maybe :string]} :output-schema {:subtotal :double :tax :double :total :double :valid? :boolean :error [:maybe :string]} :requires [:catalog :tax-rates] :simple? true}
+  {:name "process-payment" :doc "Execute payment via the :payment-gateway resource. Call (charge gateway {:amount total :card card-number}). On success, return :status :success with :transaction-id from the gateway response. On failure (gateway throws or returns error), return :status :declined with :error containing the failure message." :input-schema {:subtotal :double :tax :double :total :double} :output-schema {:transaction-id :string :status :keyword :error [:maybe :string]} :requires [:payment-gateway] :simple? true}]
  :edges {:validate-input {:done :calculate-totals}
          :calculate-totals {:done :process-payment}
          :process-payment {:done :end}}

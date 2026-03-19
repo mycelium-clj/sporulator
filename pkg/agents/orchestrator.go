@@ -53,7 +53,7 @@ type ProjectConfig struct {
 	Spec             string // SPEC.md contents
 	ManifestID       string // e.g. ":order/placement"
 	MaxStepsPerLevel int    // max steps per decomposition level (default 5)
-	MaxDepth         int    // max recursion depth (default 3); 0 = flat (one-level decomposition)
+	MaxDepth         int    // max recursion depth; 0 = flat (one-level), negative = use default (3)
 	AutoApproveTests bool   // when true, skip test approval gate (current behavior)
 	AutoApproveGraph bool   // when true, skip graph approval gate
 }
@@ -263,7 +263,7 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 		if dcfg.MaxStepsPerLevel == 0 {
 			dcfg.MaxStepsPerLevel = DefaultDecompositionConfig().MaxStepsPerLevel
 		}
-		if dcfg.MaxDepth == 0 {
+		if dcfg.MaxDepth < 0 {
 			dcfg.MaxDepth = DefaultDecompositionConfig().MaxDepth
 		}
 
@@ -369,7 +369,7 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 	// Phase 5: Integration testing
 	onEvent(OrchestratorEvent{Phase: "integration", Status: "started", Message: "Running integration tests..."})
 
-	err = o.integrationTest(ctx, cfg, br, manifest, onChunk, onEvent)
+	err = o.integrationTest(ctx, cfg, br, manifest, tree, onChunk, onEvent)
 	if err != nil {
 		onEvent(OrchestratorEvent{Phase: "integration", Status: "error", Message: err.Error()})
 	}
@@ -542,7 +542,7 @@ func (o *Orchestrator) RunResumable(ctx context.Context, cfg ProjectConfig,
 
 	// Integration testing
 	onEvent(OrchestratorEvent{Phase: "integration", Status: "started", Message: "Running integration tests..."})
-	err = o.integrationTest(ctx, cfg, br, manifest, onChunk, onEvent)
+	err = o.integrationTest(ctx, cfg, br, manifest, tree, onChunk, onEvent)
 	if err != nil {
 		onEvent(OrchestratorEvent{Phase: "integration", Status: "error", Message: err.Error()})
 	}
@@ -573,7 +573,7 @@ func (o *Orchestrator) designManifest(ctx context.Context, cfg ProjectConfig, br
 	if dcfg.MaxStepsPerLevel == 0 {
 		dcfg.MaxStepsPerLevel = DefaultDecompositionConfig().MaxStepsPerLevel
 	}
-	if dcfg.MaxDepth == 0 {
+	if dcfg.MaxDepth < 0 {
 		dcfg.MaxDepth = DefaultDecompositionConfig().MaxDepth
 	}
 
@@ -599,6 +599,7 @@ func (o *Orchestrator) designManifest(ctx context.Context, cfg ProjectConfig, br
 }
 
 // implementLeavesWithReview implements all leaf cells with an optional test-review gate.
+// Phase 0: register cell schemas and validate with Malli
 // Phase A: generate test contracts in parallel
 // Phase B: review gate (loops until all approved/skipped) — skipped if onReview is nil or AutoApproveTests
 // Phase C: implement approved contracts in parallel
@@ -608,6 +609,56 @@ func (o *Orchestrator) implementLeavesWithReview(ctx context.Context, cfg Projec
 	onReview OnReviewFunc) []error {
 
 	rootManifest := tree.Manifest
+
+	// Phase 0: Register cell schemas and validate with Malli
+	// This catches invalid schemas before test generation, saving time.
+	onEvent(OrchestratorEvent{Phase: "schema_register", Status: "started",
+		Message: fmt.Sprintf("Registering schemas for %d cells", len(leaves))})
+
+	for _, leaf := range leaves {
+		cellNs := cfg.BaseNamespace + ".cells." + cellIDToNsSuffix(leaf.CellID)
+		inputSchema := defaultSchema(leaf.InputSchema)
+		outputSchema := defaultSchema(leaf.OutputSchema)
+		schema := fmt.Sprintf("{:input %s :output %s}", inputSchema, outputSchema)
+
+		// Write a stub cell file that registers the schema with a passthrough handler
+		stubCode := assembleStubCellSource(cellNs, leaf.CellID, leaf.Doc, schema, leaf.Requires)
+		srcFile := clojureNsToFile(cfg.ProjectPath, cfg.SourceDir, cellNs)
+		writeClojureFile(srcFile, stubCode)
+
+		// Load in REPL to validate the schema
+		session, _ := br.CloneSession()
+		evalResult, evalErr := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
+
+		if evalErr != nil || (evalResult != nil && evalResult.IsError()) {
+			errMsg := ""
+			if evalResult != nil {
+				errMsg = evalResult.Ex + " " + evalResult.Err
+			}
+			onEvent(OrchestratorEvent{Phase: "schema_register", CellID: leaf.CellID, Status: "invalid",
+				Message: fmt.Sprintf("Schema invalid for %s: %s", leaf.CellID, truncMsg(errMsg, 200))})
+
+			// Try to fix the schema: ask the LLM to produce valid Malli
+			fixedSchema := o.fixCellSchema(ctx, leaf, schema, errMsg, onChunk, onEvent)
+			if fixedSchema != "" {
+				leaf.InputSchema = extractSubSchema(fixedSchema, "input")
+				leaf.OutputSchema = extractSubSchema(fixedSchema, "output")
+				schema = fixedSchema
+
+				stubCode = assembleStubCellSource(cellNs, leaf.CellID, leaf.Doc, schema, leaf.Requires)
+				writeClojureFile(srcFile, stubCode)
+				evalResult2, _ := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
+				if evalResult2 != nil && !evalResult2.IsError() {
+					onEvent(OrchestratorEvent{Phase: "schema_register", CellID: leaf.CellID, Status: "fixed",
+						Message: fmt.Sprintf("Schema fixed and registered for %s", leaf.CellID)})
+				}
+			}
+		} else {
+			onEvent(OrchestratorEvent{Phase: "schema_register", CellID: leaf.CellID, Status: "registered",
+				Message: fmt.Sprintf("Schema valid for %s", leaf.CellID)})
+		}
+		br.CloseSession(session)
+	}
 
 	// Phase A: generate test contracts in parallel
 	contracts := make([]*TestContract, len(leaves))
@@ -881,34 +932,37 @@ func (o *Orchestrator) generateTestContract(ctx context.Context, cfg ProjectConf
 
 **Step 1: Write the test assertions first.**
 
-Here is the full specification:
-<spec>
-%s
-</spec>
-
-Here is the workflow manifest for context:
-`+"```edn\n%s\n```"+`
-
 Cell details:
 - **Cell ID:** %s
-- **Doc:** %s
+- **Implementation Requirements:** %s
 - **Schema:** %s
 - **Requires:** %s
 
 %s
 
+IMPORTANT: The implementation requirements above are the SINGLE SOURCE OF TRUTH for this cell.
+When multiple rules/conditions can apply to the same input, they ALL apply in the documented
+order. Test scenarios MUST account for this — if a test triggers rule A AND rule B, the expected
+values must reflect BOTH rules applied sequentially, not just one in isolation.
+
+Here is the workflow manifest for context (shows how this cell fits in the graph):
+`+"```edn\n%s\n```"+`
+
 The test namespace already has these set up for you:
 - handler bound via: (def handler (:handler (cell/get-cell! %s)))
 - approx= helper: (defn approx= [x y tolerance] (< (Math/abs (- (double x) (double y))) tolerance))
+- validate-output helper: (defn validate-output [result]) — validates result against declared output schema
 - clojure.test is required with [deftest is testing]
+- malli.core is available as m
 
 Write ONLY deftest forms. Do NOT include:
 - (ns ...) declaration
 - require forms
 - handler binding
-- helper function definitions (approx= is already available)
+- helper function definitions (approx= and validate-output are already available)
 
 Call the handler as: (handler resources data)
+Call (validate-output result) in EVERY test to verify schema compliance.
 
 Example:
 `+"```clojure"+`
@@ -916,12 +970,13 @@ Example:
   (let [resources {}
         data {:amount 100.0}
         result (handler resources data)]
+    (validate-output result)
     (is (approx= (:total result) 110.0 0.01))))
 `+"```"+`
 
 Return ONLY deftest forms in a single code block.`,
-		cellID, cfg.Spec, manifest, cellID, brief.Doc, brief.Schema,
-		strings.Join(brief.Requires, ", "), mathPrecisionRules, cellID)
+		cellID, cellID, brief.Doc, brief.Schema,
+		strings.Join(brief.Requires, ", "), mathPrecisionRules, manifest, cellID)
 
 	testResponse, err := agent.session.SendStream(ctx, agent.client, testPrompt,
 		func(chunk string) { onChunk(cellID+"/test", chunk) })
@@ -988,24 +1043,37 @@ Return ONLY deftest forms in a single code block.`,
 }
 
 // selfReviewTests sends the self-review prompt to the LLM in the same session
-// and applies any corrections it finds.
+// and applies any corrections it finds. Corrections are merged into the existing
+// tests by replacing only the deftest forms that were corrected, preserving all
+// tests the review marked as CORRECT.
 func (o *Orchestrator) selfReviewTests(ctx context.Context, c *TestContract,
 	onChunk func(string, string)) string {
 
-	reviewPrompt := fmt.Sprintf(`You just wrote tests for cell %s. Review them critically.
+	reviewPrompt := fmt.Sprintf(`You just wrote tests for cell %s. Review them critically
+against the implementation requirements below.
 
-For EACH test case:
-1. Derive each expected numeric value step-by-step from the spec's rules.
-   Show your arithmetic. If the spec doesn't provide worked examples, work through your own.
-2. Quote the spec section that justifies each test scenario.
-3. Check: do inputs match the declared schema? Do expected outputs?
+## Implementation Requirements (the source of truth for this cell):
+%s
+
+## Schema:
+%s
+
+## Review checklist — for EACH test case:
+1. Does the test scenario match what the requirements describe? Are all relevant
+   rules/conditions being tested (including how they compose/stack with each other)?
+2. Derive each expected numeric value step-by-step. Show your arithmetic.
+   If multiple rules apply to the same data, apply them ALL in the documented order.
+3. Do the test inputs match the declared input schema? Do expected outputs match
+   the output schema?
 
 For each test:
 - CORRECT: [name] — [reasoning]
-- WRONG: [name] — [error] — [corrected value]
+- WRONG: [name] — [error] — [corrected value with derivation]
 
-If any are WRONG, return corrected deftest forms in a code block.
-If all CORRECT, say "ALL TESTS VERIFIED" (no code block).`, c.CellID)
+If any are WRONG, return ONLY the corrected deftest forms in a code block.
+Do NOT include tests that are already correct — only the ones you are fixing.
+If all CORRECT, say "ALL TESTS VERIFIED" (no code block).`,
+		c.CellID, c.Brief.Doc, c.Brief.Schema)
 
 	reviewResp, err := c.Agent.session.SendStream(ctx, c.Agent.client, reviewPrompt,
 		func(chunk string) { onChunk(c.CellID+"/self-review", chunk) })
@@ -1016,7 +1084,8 @@ If all CORRECT, say "ALL TESTS VERIFIED" (no code block).`, c.CellID)
 	// Check if corrections were provided
 	corrected := extractSelfReviewCorrections(reviewResp)
 	if corrected != "" {
-		c.TestBody = corrected
+		// Merge corrections into existing tests instead of replacing all
+		c.TestBody = mergeTestCorrections(c.TestBody, corrected)
 		c.TestCode = assembleTestSource(c.TestNs, c.CellNs, c.CellID, c.TestBody)
 		writeClojureFile(c.TestFile, c.TestCode)
 	}
@@ -1037,6 +1106,115 @@ func extractSelfReviewCorrections(response string) string {
 	// Only return if it looks like deftest forms
 	if strings.Contains(code, "deftest") {
 		return code
+	}
+	return ""
+}
+
+// mergeTestCorrections merges corrected deftest forms into the original test body.
+// For each corrected test, if a test with the same name exists in the original, it is
+// replaced. If no match is found, the corrected test is appended. Tests in the original
+// that were not corrected are preserved as-is.
+func mergeTestCorrections(original, corrections string) string {
+	originalTests := splitDeftests(original)
+	correctedTests := splitDeftests(corrections)
+
+	if len(correctedTests) == 0 {
+		return original
+	}
+
+	// Build map of corrected test name → code
+	correctedByName := make(map[string]string)
+	for _, ct := range correctedTests {
+		name := extractDeftestName(ct)
+		if name != "" {
+			correctedByName[name] = ct
+		}
+	}
+
+	// Replace matching tests, keep non-matching ones
+	var result []string
+	replaced := make(map[string]bool)
+	for _, ot := range originalTests {
+		name := extractDeftestName(ot)
+		if correction, ok := correctedByName[name]; ok {
+			result = append(result, correction)
+			replaced[name] = true
+		} else {
+			result = append(result, ot)
+		}
+	}
+
+	// Append any corrected tests that didn't match an original (new tests)
+	for _, ct := range correctedTests {
+		name := extractDeftestName(ct)
+		if !replaced[name] {
+			result = append(result, ct)
+		}
+	}
+
+	return strings.Join(result, "\n\n")
+}
+
+// splitDeftests splits a Clojure source string into individual deftest forms.
+// Each form is returned as a complete string including the (deftest ...) wrapper.
+func splitDeftests(source string) []string {
+	var tests []string
+	lines := strings.Split(source, "\n")
+	var current []string
+	depth := 0
+	inTest := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "(deftest ") {
+			inTest = true
+			current = []string{line}
+			depth = 0
+			for _, ch := range line {
+				if ch == '(' {
+					depth++
+				} else if ch == ')' {
+					depth--
+				}
+			}
+			if depth <= 0 && inTest {
+				tests = append(tests, strings.Join(current, "\n"))
+				inTest = false
+				current = nil
+			}
+			continue
+		}
+		if inTest {
+			current = append(current, line)
+			for _, ch := range line {
+				if ch == '(' {
+					depth++
+				} else if ch == ')' {
+					depth--
+				}
+			}
+			if depth <= 0 {
+				tests = append(tests, strings.Join(current, "\n"))
+				inTest = false
+				current = nil
+			}
+		}
+	}
+	// Handle unclosed form
+	if inTest && len(current) > 0 {
+		tests = append(tests, strings.Join(current, "\n"))
+	}
+
+	return tests
+}
+
+// extractDeftestName returns the test name from a deftest form.
+// e.g. "(deftest test-foo-bar" → "test-foo-bar"
+func extractDeftestName(form string) string {
+	re := regexp.MustCompile(`\(deftest\s+([\w\-\?\!]+)`)
+	m := re.FindStringSubmatch(form)
+	if len(m) >= 2 {
+		return m[1]
 	}
 	return ""
 }
@@ -1073,10 +1251,18 @@ func (o *Orchestrator) implementFromContract(ctx context.Context, cfg ProjectCon
 
 ## Cell Contract
 - **Cell ID:** %s
-- **Purpose:** %s
+- **Implementation Requirements (source of truth):** %s
 - **Schema:** %s
 - **Namespace:** %s
 %s
+
+IMPORTANT:
+- The implementation requirements above and the tests are your guide. If tests and
+  requirements appear to conflict, the requirements take precedence.
+- Your handler MUST return a map that satisfies the output schema exactly.
+  Every key declared in the output schema must be present with the correct type.
+- The tests call (validate-output result) which checks your output against the Malli schema.
+
 The cell namespace and defcell wrapper are generated for you.
 
 Write ONLY:
@@ -1709,28 +1895,88 @@ Call the handler as: (handler resources data)`, errMsg, code)
 
 // integrationTest asks the graph agent to write and run integration tests.
 func (o *Orchestrator) integrationTest(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
-	manifest string,
+	manifest string, tree *DecompositionNode,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
 
-	// First compile the workflow now that all cells are loaded
-	onEvent(OrchestratorEvent{Phase: "integration", Status: "compiling",
-		Message: "Compiling workflow manifest with loaded cells..."})
+	// Phase 1: Validate all cell schemas are valid Malli before attempting compilation
+	onEvent(OrchestratorEvent{Phase: "integration", Status: "validating_schemas",
+		Message: "Validating cell schemas..."})
 
-	compileResult, compileErr := br.CompileWorkflow(manifest, "")
-	if compileErr != nil {
-		onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
-			Message: fmt.Sprintf("Workflow compile connection error: %v", compileErr)})
-	} else if compileResult.IsError() {
-		onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
-			Message: fmt.Sprintf("Workflow compile error: %s %s", compileResult.Ex, compileResult.Err)})
-	} else {
-		onEvent(OrchestratorEvent{Phase: "integration", Status: "compiled",
-			Message: "Workflow compiled successfully"})
+	schemaResult, schemaErr := br.ValidateCellSchemas(manifest)
+	if schemaErr != nil {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "warning",
+			Message: fmt.Sprintf("Schema validation connection error: %v", schemaErr)})
+	} else if schemaResult != nil && !schemaResult.IsError() {
+		schemaOutput := unquoteResult(schemaResult.Value)
+		if schemaOutput != "[]" && schemaOutput != "" {
+			// There are schema validation errors — fix them before compiling
+			onEvent(OrchestratorEvent{Phase: "integration", Status: "schema_errors",
+				Message: fmt.Sprintf("Invalid Malli schemas found: %s", schemaOutput)})
+
+			if err := o.fixInvalidSchemas(ctx, cfg, br, tree, schemaOutput, onChunk, onEvent); err != nil {
+				onEvent(OrchestratorEvent{Phase: "integration", Status: "warning",
+					Message: fmt.Sprintf("Could not fix all invalid schemas: %v", err)})
+			}
+		} else {
+			onEvent(OrchestratorEvent{Phase: "integration", Status: "schemas_valid",
+				Message: "All cell schemas are valid Malli"})
+		}
 	}
 
+	// Phase 2: Compile the workflow — schema chain validation
+	maxCompileAttempts := 3
+	compiled := false
+	for attempt := 1; attempt <= maxCompileAttempts; attempt++ {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "compiling",
+			Message: fmt.Sprintf("Compiling workflow (attempt %d/%d)...", attempt, maxCompileAttempts)})
+
+		compileResult, compileErr := br.CompileWorkflow(manifest, "{:coerce? true}")
+		if compileErr != nil {
+			onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
+				Message: fmt.Sprintf("Workflow compile connection error: %v", compileErr)})
+			break
+		}
+
+		if !compileResult.IsError() {
+			onEvent(OrchestratorEvent{Phase: "integration", Status: "compiled",
+				Message: "Workflow compiled successfully"})
+			compiled = true
+			break
+		}
+
+		// Compilation failed — parse the error and try to fix the offending cell
+		errMsg := compileResult.Ex + " " + compileResult.Err
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "compile_error",
+			Message: fmt.Sprintf("Compile error (attempt %d): %s", attempt, truncMsg(errMsg, 300))})
+
+		if attempt >= maxCompileAttempts {
+			break
+		}
+
+		// Try to fix: use SchemaChainCheck for structured error, then fix the cell
+		chainResult, chainErr := br.SchemaChainCheck(manifest)
+		if chainErr != nil {
+			break
+		}
+		chainOutput := unquoteResult(chainResult.Value)
+
+		fixed := o.fixSchemaChainErrors(ctx, cfg, br, tree, chainOutput, errMsg, onChunk, onEvent)
+		if !fixed {
+			break
+		}
+	}
+
+	if !compiled {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
+			Message: "Workflow compilation failed after all attempts"})
+		return fmt.Errorf("workflow compilation failed")
+	}
+
+	// Phase 3: Run integration tests
 	agent := o.manager.GetGraphAgent(cfg.ManifestID)
 
 	prompt := fmt.Sprintf(`All cells have been implemented and loaded in the REPL.
+The workflow compiles successfully.
 
 Now write integration test code to test the full workflow end-to-end.
 
@@ -1739,19 +1985,18 @@ The manifest:
 
 Write Clojure code that:
 1. Requires [mycelium.core :as myc]
-2. Compiles the workflow: (def wf (myc/compile-workflow <manifest-edn>))
-3. Sets up test resources and input data based on the spec
+2. Compiles the workflow: (def wf (myc/compile-workflow %s {:coerce? true}))
+3. Sets up test resources and input data
 4. Runs the workflow: (myc/run-workflow wf resources input)
 5. Prints the results clearly with (println (pr-str result))
 
 IMPORTANT constraints:
-- Do NOT use clojure.test or deftest — this is a script evaluated in the REPL, not a test namespace
+- Do NOT use clojure.test or deftest — this is a script evaluated in the REPL
 - Do NOT define any function named run-tests
-- Do NOT use any undefined helper functions — define everything you use
 - Use simple (println ...) and (assert ...) for verification
 - Keep it simple: 2-3 test scenarios maximum
 
-Return the code in a single code block. I will evaluate it in the REPL.`, manifest)
+Return the code in a single code block.`, manifest, manifest)
 
 	response, err := agent.ChatStream(ctx, prompt,
 		func(chunk string) { onChunk("graph/integration", chunk) })
@@ -1760,8 +2005,6 @@ Return the code in a single code block. I will evaluate it in the REPL.`, manife
 	}
 
 	testCode := ExtractFirstCodeBlock(response)
-
-	// Eval integration tests
 	result, err := br.Eval(testCode)
 	if err != nil {
 		return fmt.Errorf("eval integration tests: %w", err)
@@ -1776,7 +2019,6 @@ Return the code in a single code block. I will evaluate it in the REPL.`, manife
 		onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
 			Message: fmt.Sprintf("Integration test error: %s\n%s", result.Ex, result.Err)})
 
-		// Feed error back to graph agent for fixing
 		fixPrompt := fmt.Sprintf("The integration test had this error:\n\n```\n%s\n%s\n```\n\nFix the test code and return the corrected version in a code block.",
 			result.Ex, result.Err)
 
@@ -1805,6 +2047,257 @@ Return the code in a single code block. I will evaluate it in the REPL.`, manife
 		Message: fmt.Sprintf("Integration test output:\n%s", output)})
 
 	return nil
+}
+
+// fixInvalidSchemas fixes cells that have Malli-invalid schemas by asking the cell
+// agent to regenerate with a corrected schema.
+func (o *Orchestrator) fixInvalidSchemas(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
+	tree *DecompositionNode, errorsStr string,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
+
+	// Parse errors like [{:cell-id ":order/foo" :phase ":input" :error "..." :schema "..."}]
+	// For each erroring cell, ask the cell agent to fix its schema
+	leaves := collectLeaves(tree)
+	for _, leaf := range leaves {
+		if !strings.Contains(errorsStr, leaf.CellID) {
+			continue
+		}
+
+		onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "fixing_schema",
+			Message: fmt.Sprintf("Fixing invalid schema for %s", leaf.CellID)})
+
+		agent := o.manager.NewCellAgent(leaf.CellID)
+		cellNs := cfg.BaseNamespace + ".cells." + cellIDToNsSuffix(leaf.CellID)
+		srcFile := clojureNsToFile(cfg.ProjectPath, cfg.SourceDir, cellNs)
+
+		fixPrompt := fmt.Sprintf(`The cell %s has an invalid Malli schema that fails validation.
+
+Error details: %s
+
+The declared schema is: %s
+
+Fix the cell's schema declaration so it is valid Malli syntax. Common issues:
+- Using bare keywords like :map instead of [:map ...]
+- Missing vector wrappers around map entries
+- Using unsupported Malli types
+
+Return the complete corrected cell namespace in a code block.`, leaf.CellID, errorsStr, leaf.InputSchema+" "+leaf.OutputSchema)
+
+		fixResp, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
+			func(chunk string) { onChunk(leaf.CellID+"/schema-fix", chunk) })
+		if err != nil {
+			continue
+		}
+
+		fixedCode := ExtractFirstCodeBlock(fixResp)
+		if fixedCode == "" {
+			continue
+		}
+
+		if err := writeClojureFile(srcFile, fixedCode); err != nil {
+			continue
+		}
+
+		// Reload the fixed cell
+		session, _ := br.CloneSession()
+		br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, cellNs, cellNs))
+		br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
+
+		onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "schema_fixed",
+			Message: fmt.Sprintf("Reloaded %s with fixed schema", leaf.CellID)})
+	}
+
+	return nil
+}
+
+// fixSchemaChainErrors attempts to fix schema chain mismatches by identifying
+// the upstream cell that's missing output keys and asking the cell agent to add them.
+func (o *Orchestrator) fixSchemaChainErrors(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
+	tree *DecompositionNode, chainOutput, errMsg string,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) bool {
+
+	// The chain error message format is:
+	// "Schema chain error: :order/calculate-tax at :calculate-tax requires keys #{:items-detail}
+	//  but only #{:x :y} available"
+	// Also check the structured output from SchemaChainCheck for :error key
+
+	// Find cells that need fixing from the error message
+	leaves := collectLeaves(tree)
+	fixedAny := false
+
+	for _, leaf := range leaves {
+		if !strings.Contains(errMsg, leaf.CellID) && !strings.Contains(chainOutput, leaf.CellID) {
+			continue
+		}
+
+		onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "fixing_chain",
+			Message: fmt.Sprintf("Fixing schema chain for %s", leaf.CellID)})
+
+		agent := o.manager.NewCellAgent(leaf.CellID)
+		cellNs := cfg.BaseNamespace + ".cells." + cellIDToNsSuffix(leaf.CellID)
+		srcFile := clojureNsToFile(cfg.ProjectPath, cfg.SourceDir, cellNs)
+
+		// Read current source
+		currentCode := ""
+		if data, err := os.ReadFile(srcFile); err == nil {
+			currentCode = string(data)
+		}
+
+		fixPrompt := fmt.Sprintf(`The workflow fails to compile because of a schema chain error involving cell %s.
+
+Compilation error:
+%s
+
+Structured chain check output:
+%s
+
+Your current implementation:
+`+"```clojure\n%s\n```"+`
+
+The cell's declared output schema MUST include all keys that downstream cells need.
+Check: does your handler return all the keys declared in the output schema?
+Make sure you pass through all input keys that downstream cells expect (the data map
+is accumulating — downstream cells may need keys from earlier cells that flow through yours).
+
+Fix the cell to ensure its output matches its declared schema. Return the complete
+corrected namespace in a code block.`, leaf.CellID, truncMsg(errMsg, 500), truncMsg(chainOutput, 500), currentCode)
+
+		fixResp, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
+			func(chunk string) { onChunk(leaf.CellID+"/chain-fix", chunk) })
+		if err != nil {
+			continue
+		}
+
+		fixedCode := ExtractFirstCodeBlock(fixResp)
+		if fixedCode == "" {
+			continue
+		}
+
+		if err := writeClojureFile(srcFile, fixedCode); err != nil {
+			continue
+		}
+
+		// Reload
+		session, _ := br.CloneSession()
+		br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, cellNs, cellNs))
+		evalResult, _ := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
+		if evalResult != nil && !evalResult.IsError() {
+			fixedAny = true
+			onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "chain_fixed",
+				Message: fmt.Sprintf("Reloaded %s with schema chain fix", leaf.CellID)})
+		}
+	}
+
+	return fixedAny
+}
+
+// truncMsg truncates a message to maxLen characters.
+func truncMsg(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// unquoteResult removes pr-str quoting from REPL output.
+func unquoteResult(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+		s = strings.ReplaceAll(s, `\"`, `"`)
+		s = strings.ReplaceAll(s, `\\`, `\`)
+	}
+	return s
+}
+
+// assembleStubCellSource builds a minimal cell namespace with the schema and a passthrough handler.
+// Used in Phase 0 to validate that the schema is valid Malli before investing in test generation.
+func assembleStubCellSource(cellNs, cellID, doc, schema string, requires []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "(ns %s\n", cellNs)
+	b.WriteString("  (:require [mycelium.cell :as cell]))\n\n")
+	b.WriteString("(cell/defcell ")
+	b.WriteString(cellID)
+	b.WriteString("\n  {:doc \"")
+	b.WriteString(strings.ReplaceAll(doc, `"`, `\"`))
+	b.WriteString("\"\n   :schema ")
+	b.WriteString(schema)
+	b.WriteString("}\n  (fn [resources data] data))\n")
+	return b.String()
+}
+
+// fixCellSchema asks the LLM to produce a corrected Malli schema for a cell.
+func (o *Orchestrator) fixCellSchema(ctx context.Context, leaf *DecompositionNode,
+	currentSchema, errMsg string,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) string {
+
+	agent := o.manager.NewCellAgent(leaf.CellID + "/schema-fix")
+
+	prompt := fmt.Sprintf(`The Malli schema for cell %s is invalid and fails to compile.
+
+Error: %s
+
+Current schema: %s
+
+Fix this schema so it is valid Malli using lite map syntax.
+
+Rules for lite map syntax:
+- Maps: {:field-name :type :other-field :type2}
+- Vectors: [:vector {:nested-field :type}]
+- Optional: {:error [:maybe :string]}  (NOT {[:maybe :error] :string})
+- Enums: [:enum :a :b :c]
+- Map-of: [:map-of :string :double]
+- Primitives: :string :int :double :boolean :keyword :any
+
+Return ONLY the corrected schema as: {:input <input-schema> :output <output-schema>}
+in a code block. No explanation needed.`, leaf.CellID, truncMsg(errMsg, 300), currentSchema)
+
+	resp, err := agent.session.SendStream(ctx, agent.client, prompt,
+		func(chunk string) { onChunk(leaf.CellID+"/schema-fix", chunk) })
+	if err != nil {
+		return ""
+	}
+
+	code := ExtractFirstCodeBlock(resp)
+	if code == "" || !strings.Contains(code, ":input") {
+		return ""
+	}
+	return strings.TrimSpace(code)
+}
+
+// extractSubSchema pulls the :input or :output part from a {:input ... :output ...} schema string.
+func extractSubSchema(fullSchema, key string) string {
+	// Simple extraction: find :input or :output and take the next balanced form
+	search := ":" + key + " "
+	idx := strings.Index(fullSchema, search)
+	if idx < 0 {
+		search = ":" + key + "\n"
+		idx = strings.Index(fullSchema, search)
+	}
+	if idx < 0 {
+		return "{}"
+	}
+	rest := fullSchema[idx+len(search):]
+	rest = strings.TrimSpace(rest)
+
+	// Find the end of the balanced form
+	depth := 0
+	end := 0
+	for i, ch := range rest {
+		if ch == '{' || ch == '[' || ch == '(' {
+			depth++
+		} else if ch == '}' || ch == ']' || ch == ')' {
+			depth--
+			if depth == 0 {
+				end = i + 1
+				break
+			}
+		}
+	}
+	if end > 0 {
+		return rest[:end]
+	}
+	return "{}"
 }
 
 // assembleCellSource builds the complete cell namespace deterministically.
@@ -1850,12 +2343,24 @@ func assembleTestSource(testNs, cellNs, cellID string, testBody string) string {
 	fmt.Fprintf(&b, "(ns %s\n", testNs)
 	fmt.Fprintf(&b, "  (:require [clojure.test :refer [deftest is testing]]\n")
 	fmt.Fprintf(&b, "            [mycelium.cell :as cell]\n")
+	fmt.Fprintf(&b, "            [malli.core :as m]\n")
 	fmt.Fprintf(&b, "            [%s]))\n", cellNs)
 	b.WriteString("\n")
-	fmt.Fprintf(&b, "(def handler (:handler (cell/get-cell! %s)))\n", cellID)
+	fmt.Fprintf(&b, "(def cell-spec (cell/get-cell! %s))\n", cellID)
+	b.WriteString("(def handler (:handler cell-spec))\n")
+	b.WriteString("(def cell-schema (:schema cell-spec))\n")
 	b.WriteString("\n")
 	b.WriteString("(defn approx= [x y tolerance]\n")
 	b.WriteString("  (< (Math/abs (- (double x) (double y))) tolerance))\n")
+	b.WriteString("\n")
+	b.WriteString("(defn validate-output\n")
+	b.WriteString("  \"Validates that result satisfies the cell's declared output schema.\"\n")
+	b.WriteString("  [result]\n")
+	b.WriteString("  (when-let [out-schema (:output cell-schema)]\n")
+	b.WriteString("    (let [schema (if (vector? out-schema) out-schema [:map])]\n")
+	b.WriteString("      (is (m/validate schema result)\n")
+	b.WriteString("          (str \"Output schema violation: \"\n")
+	b.WriteString("               (pr-str (m/explain schema result)))))))\n")
 	b.WriteString("\n")
 	b.WriteString(testBody)
 	b.WriteString("\n")

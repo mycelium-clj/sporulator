@@ -377,6 +377,58 @@ func (b *Bridge) ListRegisteredCells() (*EvalResult, error) {
 	return b.Eval(`(pr-str (cell/list-cells))`)
 }
 
+// ValidateCellSchemas checks that every cell referenced in the manifest has a valid
+// Malli schema. Returns a pr-str'd vector of error maps, or "[]" if all schemas are valid.
+func (b *Bridge) ValidateCellSchemas(manifestEDN string) (*EvalResult, error) {
+	code := fmt.Sprintf(`
+(require '[malli.core :as m] '[mycelium.cell :as cell])
+(let [manifest (read-string %s)
+      cells    (:cells manifest)
+      errors   (atom [])]
+  (doseq [[cell-name cell-def] cells]
+    (let [cell-id  (if (map? cell-def) (:id cell-def) cell-def)
+          cell-spec (try (cell/get-cell! cell-id) (catch Exception e nil))]
+      (when cell-spec
+        (let [schema (:schema cell-spec)]
+          (doseq [[phase s] [[:input (:input schema)] [:output (:output schema)]]]
+            (when s
+              (try
+                (m/schema s)
+                (catch Exception e
+                  (swap! errors conj
+                         {:cell-name (str cell-name)
+                          :cell-id   (str cell-id)
+                          :phase     (str phase)
+                          :error     (.getMessage e)
+                          :schema    (pr-str s)})))))))))
+  (pr-str @errors))`, quoteClojure(manifestEDN))
+	return b.Eval(code)
+}
+
+// SchemaChainCheck attempts to compile the workflow and returns structured error info
+// on schema chain failures. Returns the compilation result — check IsError().
+// On schema chain error, Err contains the detailed message with cell names, missing keys,
+// and available keys.
+func (b *Bridge) SchemaChainCheck(manifestEDN string) (*EvalResult, error) {
+	code := fmt.Sprintf(`
+(require '[mycelium.core :as myc])
+(try
+  (myc/compile-workflow %s {:coerce? true})
+  (pr-str {:ok true})
+  (catch Exception e
+    (pr-str {:ok false
+             :error (.getMessage e)
+             :data  (ex-data e)})))`, manifestEDN)
+	return b.Eval(code)
+}
+
+// quoteClojure wraps a string for embedding inside a Clojure (read-string ...) call.
+func quoteClojure(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
+}
+
 // unquoteClojure removes surrounding quotes and unescapes a Clojure pr-str'd string.
 func unquoteClojure(s string) string {
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {

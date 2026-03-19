@@ -85,8 +85,11 @@ func TestAssembleTestSource(t *testing.T) {
 	if !strings.Contains(result, "[example.cells.order]") {
 		t.Error("should require cell ns")
 	}
-	if !strings.Contains(result, "(def handler (:handler (cell/get-cell! :order/validate)))") {
+	if !strings.Contains(result, "(def handler (:handler cell-spec))") {
 		t.Error("should bind handler")
+	}
+	if !strings.Contains(result, "(def cell-spec (cell/get-cell! :order/validate))") {
+		t.Error("should bind cell-spec")
 	}
 	if !strings.Contains(result, "(defn approx=") {
 		t.Error("should include approx= helper")

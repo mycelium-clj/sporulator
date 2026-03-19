@@ -224,23 +224,22 @@ func buildCellPrompt(brief CellBrief) string {
 		fmt.Fprintf(&b, "**Cell ID:** `%s`\n", brief.ID)
 	}
 	if brief.Doc != "" {
-		fmt.Fprintf(&b, "**Purpose:** %s\n", brief.Doc)
+		fmt.Fprintf(&b, "\n**Implementation Requirements:**\n%s\n", brief.Doc)
 	}
 	if brief.Schema != "" {
-		fmt.Fprintf(&b, "\n**Contract:**\n")
-		fmt.Fprintf(&b, "- Schema: `%s`\n", brief.Schema)
+		fmt.Fprintf(&b, "\n**Contract (input/output schema):**\n```\n%s\n```\n", brief.Schema)
 	}
 	if len(brief.Requires) > 0 {
 		resources := make([]string, len(brief.Requires))
 		for i, r := range brief.Requires {
 			resources[i] = "`" + r + "`"
 		}
-		fmt.Fprintf(&b, "**Required resources:** %s\n", strings.Join(resources, ", "))
+		fmt.Fprintf(&b, "\n**Required resources:** %s\n", strings.Join(resources, ", "))
 	} else {
-		b.WriteString("**Required resources:** none\n")
+		b.WriteString("\n**Required resources:** none\n")
 	}
 	if brief.Context != "" {
-		fmt.Fprintf(&b, "\n**Additional context:**\n%s\n", brief.Context)
+		fmt.Fprintf(&b, "\n**Workflow position (predecessors/successors):**\n%s\n", brief.Context)
 	}
 
 	b.WriteString("\nReturn the complete `cell/defcell` form.")
