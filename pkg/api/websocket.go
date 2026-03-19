@@ -211,6 +211,8 @@ func (s *Server) handleWSMessage(c *wsClient, msg WSMessage) {
 		s.handleTestReview(c, msg)
 	case "graph_review":
 		s.handleGraphReview(c, msg)
+	case "impl_review":
+		s.handleImplReview(c, msg)
 	default:
 		c.sendError("unknown message type: " + msg.Type)
 	}
@@ -565,6 +567,7 @@ func (s *Server) handleOrchestrate(c *wsClient, msg WSMessage) {
 
 	cbs := agents.ReviewCallbacks{
 		OnTestReview:  s.makeReviewCallback(c, msg.ID),
+		OnImplReview:  s.makeImplReviewCallback(c, msg.ID),
 		OnGraphReview: s.makeGraphReviewCallback(c, msg.ID),
 	}
 
@@ -639,6 +642,7 @@ func (s *Server) handleOrchestrateResume(c *wsClient, msg WSMessage) {
 
 	cbs := agents.ReviewCallbacks{
 		OnTestReview:  s.makeReviewCallback(c, msg.ID),
+		OnImplReview:  s.makeImplReviewCallback(c, msg.ID),
 		OnGraphReview: s.makeGraphReviewCallback(c, msg.ID),
 	}
 
@@ -835,6 +839,86 @@ func (s *Server) handleGraphReview(c *wsClient, msg WSMessage) {
 
 	select {
 	case gate.ch <- &payload.Response:
+	default:
+	}
+}
+
+// --- Implementation review gate ---
+
+type implReviewGate struct {
+	ch chan []agents.ImplReviewResponse
+}
+
+func (s *Server) makeImplReviewCallback(c *wsClient, msgID string) agents.OnImplReviewFunc {
+	return func(reviews []agents.ImplReview) ([]agents.ImplReviewResponse, error) {
+		runID := msgID
+
+		gate := &implReviewGate{ch: make(chan []agents.ImplReviewResponse, 1)}
+		s.implReviewMu.Lock()
+		s.implReviewGates[runID] = gate
+		s.implReviewMu.Unlock()
+
+		defer func() {
+			s.implReviewMu.Lock()
+			delete(s.implReviewGates, runID)
+			s.implReviewMu.Unlock()
+		}()
+
+		c.sendMsg(WSMessage{
+			Type: "orchestrator_event",
+			ID:   msgID,
+			Payload: agents.OrchestratorEvent{
+				Phase:   "impl_review",
+				Status:  "awaiting_review",
+				Message: fmt.Sprintf("Review %d cell implementations", len(reviews)),
+			},
+		})
+		c.sendMsg(WSMessage{
+			Type: "impl_review_data",
+			ID:   msgID,
+			Payload: map[string]any{
+				"run_id":  runID,
+				"reviews": reviews,
+			},
+		})
+
+		select {
+		case resp := <-gate.ch:
+			return resp, nil
+		case <-c.ctx.Done():
+			return nil, c.ctx.Err()
+		}
+	}
+}
+
+type implReviewPayload struct {
+	RunID     string                       `json:"run_id"`
+	Responses []agents.ImplReviewResponse  `json:"responses"`
+}
+
+func (s *Server) handleImplReview(c *wsClient, msg WSMessage) {
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		c.sendError("invalid payload")
+		return
+	}
+	var payload implReviewPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		c.sendError("invalid impl_review payload")
+		return
+	}
+
+	s.implReviewMu.Lock()
+	gate, ok := s.implReviewGates[payload.RunID]
+	s.implReviewMu.Unlock()
+
+	if !ok {
+		c.sendError("no pending impl review for run_id: " + payload.RunID)
+		return
+	}
+
+	select {
+	case gate.ch <- payload.Responses:
 	default:
 	}
 }

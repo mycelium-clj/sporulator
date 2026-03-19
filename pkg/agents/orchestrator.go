@@ -42,6 +42,7 @@ type Orchestrator struct {
 	runID          string // set at the start of each Run()
 	cfg            ProjectConfig       // set at the start of each Run()
 	onGraphReview  OnGraphReviewFunc   // set at the start of each Run(); nil = auto-approve
+	onImplReview   OnImplReviewFunc    // set at the start of each Run(); nil = auto-approve
 }
 
 // ProjectConfig describes the target Clojure project.
@@ -128,9 +129,29 @@ func NewOrchestrator(mgr *Manager, st *store.Store) *Orchestrator {
 	return &Orchestrator{manager: mgr, store: st}
 }
 
+// ImplReview presents a completed cell implementation for user approval.
+type ImplReview struct {
+	CellID   string `json:"cell_id"`
+	ImplCode string `json:"impl_code"` // full cell namespace source
+	TestCode string `json:"test_code"` // locked test code
+	Brief    CellBrief `json:"brief"`  // doc + schema + context
+}
+
+// ImplReviewResponse is the user's decision on a cell implementation.
+type ImplReviewResponse struct {
+	CellID   string `json:"cell_id"`
+	Decision string `json:"decision"` // "approve", "revise"
+	Feedback string `json:"feedback"` // user notes for "revise"
+}
+
+// OnImplReviewFunc is the callback type for the implementation review gate.
+// Called with a batch of completed implementations; blocks until user responds.
+type OnImplReviewFunc func([]ImplReview) ([]ImplReviewResponse, error)
+
 // ReviewCallbacks holds optional review gate callbacks for Run/RunResumable.
 type ReviewCallbacks struct {
 	OnTestReview  OnReviewFunc       // test contract review; nil = auto-approve
+	OnImplReview  OnImplReviewFunc   // impl review; nil = auto-approve
 	OnGraphReview OnGraphReviewFunc  // graph review; nil = auto-approve
 }
 
@@ -154,6 +175,7 @@ func (o *Orchestrator) Run(ctx context.Context, cfg ProjectConfig,
 	if len(callbacks) > 0 {
 		reviewFn = callbacks[0].OnTestReview
 		o.onGraphReview = callbacks[0].OnGraphReview
+		o.onImplReview = callbacks[0].OnImplReview
 	}
 	o.cfg = cfg
 
@@ -891,6 +913,112 @@ Return ONLY deftest forms in a single code block.`, resp.Feedback)
 		}(i, c)
 	}
 	wg2.Wait()
+
+	// Phase D: Implementation review gate
+	// Let the user review and approve/revise completed implementations.
+	if o.onImplReview != nil {
+		var reviews []ImplReview
+		var reviewIndices []int // map review index → contracts index
+		for i, c := range contracts {
+			if errors[i] != nil || c == nil || c.Err != nil {
+				continue
+			}
+			srcFile := c.SrcFile
+			implCode := ""
+			if data, err := os.ReadFile(srcFile); err == nil {
+				implCode = string(data)
+			}
+			reviews = append(reviews, ImplReview{
+				CellID:   c.CellID,
+				ImplCode: implCode,
+				TestCode: c.TestCode,
+				Brief:    c.Brief,
+			})
+			reviewIndices = append(reviewIndices, i)
+		}
+
+		if len(reviews) > 0 {
+			onEvent(OrchestratorEvent{Phase: "impl_review", Status: "awaiting_review",
+				Message: fmt.Sprintf("Review implementations for %d cells", len(reviews))})
+
+			responses, reviewErr := o.onImplReview(reviews)
+			if reviewErr != nil {
+				onEvent(OrchestratorEvent{Phase: "impl_review", Status: "error",
+					Message: fmt.Sprintf("Implementation review error: %v", reviewErr)})
+			} else {
+				for _, resp := range responses {
+					if resp.Decision == "approve" {
+						onEvent(OrchestratorEvent{Phase: "impl_review", CellID: resp.CellID, Status: "approved",
+							Message: fmt.Sprintf("Implementation approved for %s", resp.CellID)})
+					} else if resp.Decision == "revise" {
+						onEvent(OrchestratorEvent{Phase: "impl_review", CellID: resp.CellID, Status: "revising",
+							Message: fmt.Sprintf("Revising implementation for %s", resp.CellID)})
+
+						// Find the contract and re-implement with user feedback
+						for j, review := range reviews {
+							if review.CellID != resp.CellID {
+								continue
+							}
+							idx := reviewIndices[j]
+							c := contracts[idx]
+							agent := o.manager.NewCellAgent(c.CellID)
+							session, _ := br.CloneSession()
+
+							revisePrompt := fmt.Sprintf(`The user reviewed your implementation and wants changes.
+
+User feedback: %s
+
+Current implementation:
+`+"```clojure\n%s\n```"+`
+
+Cell requirements: %s
+Schema: %s
+
+Fix the implementation based on the feedback. Return ONLY:
+1. (OPTIONAL) Helper functions
+2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
+
+Do NOT include (ns ...) or (cell/defcell ...).`,
+								resp.Feedback, review.ImplCode, c.Brief.Doc, c.Brief.Schema)
+
+							fixResp, err := agent.session.SendStream(ctx, agent.client, revisePrompt,
+								func(chunk string) { onChunk(c.CellID+"/impl-revise", chunk) })
+							if err != nil {
+								errors[idx] = fmt.Errorf("impl revision for %s: %w", c.CellID, err)
+								break
+							}
+
+							rawImpl := ExtractFirstCodeBlock(fixResp)
+							if rawImpl == "" {
+								break
+							}
+
+							fnBody := ExtractFnBody(rawImpl)
+							if fnBody == "" {
+								fnBody = rawImpl
+							}
+							helpers := ExtractHelpers(rawImpl)
+							extraReqs := ExtractExtraRequires(rawImpl)
+							implCode := assembleCellSource(c.CellNs, c.CellID, c.Brief.Doc, c.Brief.Schema,
+								c.Brief.Requires, extraReqs, helpers, fnBody)
+
+							writeClojureFile(c.SrcFile, implCode)
+
+							// Reload and re-test
+							br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, c.CellNs, c.CellNs))
+							br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, c.SrcFile))
+							br.CloseSession(session)
+
+							onEvent(OrchestratorEvent{Phase: "impl_review", CellID: c.CellID, Status: "revised",
+								Message: fmt.Sprintf("Implementation revised for %s", c.CellID)})
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return errors
 }
 

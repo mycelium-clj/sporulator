@@ -67,6 +67,7 @@ func main() {
 		fmt.Println("  start         - start a new orchestration run")
 		fmt.Println("  review        - send test review responses from /tmp/review_responses.json")
 		fmt.Println("  graph-review  - send graph review response from /tmp/graph_review.json")
+		fmt.Println("  impl-review   - send impl review responses from /tmp/impl_review_responses.json")
 		fmt.Println("\nstart flags:")
 		startCmd.PrintDefaults()
 		os.Exit(1)
@@ -80,6 +81,8 @@ func main() {
 		sendReview()
 	case "graph-review":
 		sendGraphReview()
+	case "impl-review":
+		sendImplReview()
 	default:
 		log.Fatalf("Unknown command: %s", os.Args[1])
 	}
@@ -157,10 +160,14 @@ func startOrchestration() {
 				// Only print interesting events
 				if event.Status == "started" || event.Status == "success" || event.Status == "error" ||
 					event.Status == "fixing" || event.Status == "retry" || event.Status == "failed" ||
-					event.Status == "awaiting_review" || event.Status == "approved" || event.Status == "revising" ||
+					event.Status == "awaiting_review" || event.Status == "approved" || event.Status == "revising" || event.Status == "revised" ||
 					event.Status == "info" || event.Status == "warning" ||
 					event.Status == "extracted" || event.Status == "mismatch" || event.Status == "tree_passed" ||
-					event.Phase == "test_review" || event.Phase == "graph_review" {
+					event.Status == "registered" || event.Status == "invalid" || event.Status == "fixed" ||
+					event.Status == "schemas_valid" || event.Status == "schema_errors" ||
+					event.Status == "compile_error" || event.Status == "compiled" || event.Status == "validating_schemas" ||
+					event.Phase == "test_review" || event.Phase == "graph_review" || event.Phase == "impl_review" ||
+					event.Phase == "schema_register" || event.Phase == "integration" {
 					fmt.Printf("[%s] [%s] %s %s: %s\n", ts(), event.Phase, event.CellID, event.Status, trunc(event.Message, 150))
 				}
 
@@ -171,6 +178,10 @@ func startOrchestration() {
 			case "graph_review_data":
 				// Save graph for review
 				handleGraphReviewData(resp.Payload)
+
+			case "impl_review_data":
+				// Save implementations for review
+				handleImplReviewData(resp.Payload)
 
 			case "orchestrator_complete":
 				fmt.Printf("\n[%s] === ORCHESTRATION COMPLETE ===\n", ts())
@@ -393,6 +404,94 @@ func sendGraphReview() {
 		log.Fatal("send:", err)
 	}
 	fmt.Printf("[%s] Graph review response sent\n", ts())
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, message, err := conn.ReadMessage()
+	if err == nil {
+		fmt.Printf("[%s] Response: %s\n", ts(), trunc(string(message), 200))
+	}
+}
+
+func handleImplReviewData(payload interface{}) {
+	data, _ := json.Marshal(payload)
+
+	var wrapper struct {
+		RunID   string `json:"run_id"`
+		Reviews []struct {
+			CellID   string `json:"cell_id"`
+			ImplCode string `json:"impl_code"`
+			TestCode string `json:"test_code"`
+			Brief    struct {
+				Doc    string `json:"doc"`
+				Schema string `json:"schema"`
+			} `json:"brief"`
+		} `json:"reviews"`
+	}
+	json.Unmarshal(data, &wrapper)
+
+	fmt.Printf("\n[%s] ========================================\n", ts())
+	fmt.Printf("[%s] IMPLEMENTATIONS READY FOR REVIEW\n", ts())
+	fmt.Printf("[%s] Run ID: %s\n", ts(), wrapper.RunID)
+	fmt.Printf("[%s] %d implementations to review\n", ts(), len(wrapper.Reviews))
+	fmt.Printf("[%s] ========================================\n\n", ts())
+
+	os.WriteFile("/tmp/orch_run_id.txt", []byte(wrapper.RunID), 0644)
+
+	for i, r := range wrapper.Reviews {
+		filename := fmt.Sprintf("/tmp/impl_%d_%s.clj", i, sanitize(r.CellID))
+		os.WriteFile(filename, []byte(r.ImplCode), 0644)
+		fmt.Printf("  [%d] %s\n", i, r.CellID)
+		fmt.Printf("      Saved to %s\n", filename)
+	}
+
+	// Save full data
+	implJSON, _ := json.MarshalIndent(wrapper, "", "  ")
+	os.WriteFile("/tmp/orch_impl_reviews.json", implJSON, 0644)
+
+	// Generate template response (all approve)
+	var responses []map[string]string
+	for _, r := range wrapper.Reviews {
+		responses = append(responses, map[string]string{
+			"cell_id":  r.CellID,
+			"decision": "approve",
+		})
+	}
+	template := map[string]interface{}{
+		"run_id":    wrapper.RunID,
+		"responses": responses,
+	}
+	templateJSON, _ := json.MarshalIndent(template, "", "  ")
+	os.WriteFile("/tmp/impl_review_responses.json", templateJSON, 0644)
+
+	fmt.Printf("\n  Review template saved to /tmp/impl_review_responses.json\n")
+	fmt.Printf("  Edit decisions (approve/revise) and run: orch_client impl-review\n\n")
+}
+
+func sendImplReview() {
+	data, err := os.ReadFile("/tmp/impl_review_responses.json")
+	if err != nil {
+		log.Fatal("Read impl review responses:", err)
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8420/ws", nil)
+	if err != nil {
+		log.Fatal("dial:", err)
+	}
+	defer conn.Close()
+
+	var payload interface{}
+	json.Unmarshal(data, &payload)
+
+	msg := WSMessage{
+		Type:    "impl_review",
+		ID:      "review",
+		Payload: payload,
+	}
+
+	if err := conn.WriteJSON(msg); err != nil {
+		log.Fatal("send:", err)
+	}
+	fmt.Printf("[%s] Implementation review responses sent\n", ts())
 
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, message, err := conn.ReadMessage()

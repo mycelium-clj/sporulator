@@ -36,6 +36,8 @@ type Server struct {
 	reviewGatesMu     sync.Mutex
 	graphReviewGates  map[string]*graphReviewGate  // runID → gate
 	graphReviewMu     sync.Mutex
+	implReviewGates   map[string]*implReviewGate   // runID → gate
+	implReviewMu      sync.Mutex
 }
 
 // Config configures the API server.
@@ -55,6 +57,7 @@ func NewServer(cfg Config) *Server {
 		mux:         http.NewServeMux(),
 		reviewGates:      make(map[string]*reviewGate),
 		graphReviewGates: make(map[string]*graphReviewGate),
+		implReviewGates:  make(map[string]*implReviewGate),
 	}
 	s.routes()
 	go s.hub.Run()
