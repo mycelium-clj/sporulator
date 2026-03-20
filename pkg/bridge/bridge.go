@@ -379,29 +379,45 @@ func (b *Bridge) ListRegisteredCells() (*EvalResult, error) {
 
 // ValidateCellSchemas checks that every cell referenced in the manifest has a valid
 // Malli schema. Returns a pr-str'd vector of error maps, or "[]" if all schemas are valid.
+// Handles per-transition output schemas (map of transition → schema) from composed cells.
 func (b *Bridge) ValidateCellSchemas(manifestEDN string) (*EvalResult, error) {
 	code := fmt.Sprintf(`
 (require '[malli.core :as m] '[mycelium.cell :as cell])
-(let [manifest (read-string %s)
-      cells    (:cells manifest)
-      errors   (atom [])]
-  (doseq [[cell-name cell-def] cells]
-    (let [cell-id  (if (map? cell-def) (:id cell-def) cell-def)
-          cell-spec (try (cell/get-cell! cell-id) (catch Exception e nil))]
-      (when cell-spec
-        (let [schema (:schema cell-spec)]
-          (doseq [[phase s] [[:input (:input schema)] [:output (:output schema)]]]
-            (when s
-              (try
-                (m/schema s)
-                (catch Exception e
+(letfn [(validate-schema [s]
+          (try (m/schema s) nil
+            (catch Exception e (.getMessage e))))]
+  (let [manifest (read-string %s)
+        cells    (:cells manifest)
+        errors   (atom [])]
+    (doseq [[cell-name cell-def] cells]
+      (let [cell-id  (if (map? cell-def) (:id cell-def) cell-def)
+            cell-spec (try (cell/get-cell! cell-id) (catch Exception e nil))]
+        (when cell-spec
+          (let [schema (:schema cell-spec)
+                input  (:input schema)
+                output (:output schema)]
+            ;; Validate input schema
+            (when input
+              (when-let [err (validate-schema input)]
+                (swap! errors conj
+                       {:cell-name (str cell-name) :cell-id (str cell-id)
+                        :phase ":input" :error err :schema (pr-str input)})))
+            ;; Validate output schema — may be per-transition map {transition → schema}
+            (when output
+              (if (and (map? output)
+                       (some vector? (vals output)))
+                ;; Per-transition output: validate each transition's schema separately
+                (doseq [[transition s] output]
+                  (when-let [err (validate-schema s)]
+                    (swap! errors conj
+                           {:cell-name (str cell-name) :cell-id (str cell-id)
+                            :phase (str ":output/" transition) :error err :schema (pr-str s)})))
+                ;; Single output schema
+                (when-let [err (validate-schema output)]
                   (swap! errors conj
-                         {:cell-name (str cell-name)
-                          :cell-id   (str cell-id)
-                          :phase     (str phase)
-                          :error     (.getMessage e)
-                          :schema    (pr-str s)})))))))))
-  (pr-str @errors))`, quoteClojure(manifestEDN))
+                         {:cell-name (str cell-name) :cell-id (str cell-id)
+                          :phase ":output" :error err :schema (pr-str output)}))))))))
+    (pr-str @errors)))`, quoteClojure(manifestEDN))
 	return b.Eval(code)
 }
 
