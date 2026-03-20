@@ -54,7 +54,84 @@ func Connect(cfg Config) (*Bridge, error) {
 		return nil, fmt.Errorf("bridge require mycelium.cell: %w", err)
 	}
 
+	// Load sporulator codegen helpers
+	b.loadCodegenHelpers()
+
 	return b, nil
+}
+
+// loadCodegenHelpers loads the sporulator.codegen namespace from the embedded resource.
+// Falls back silently if the file is not available (e.g., during tests).
+func (b *Bridge) loadCodegenHelpers() {
+	code := `
+(try
+  (load-file "resources/clj/sporulator/codegen.clj")
+  (require '[sporulator.codegen])
+  "ok"
+  (catch Exception e (str "codegen not loaded: " (.getMessage e))))
+`
+	b.Eval(code)
+}
+
+// AssembleCellSource generates a cell source file using the Clojure codegen helper.
+// Returns the source string or an error.
+func (b *Bridge) AssembleCellSource(cellNs, cellID, doc, schemaEDN string,
+	requires []string, extraReqs []string, helpers, fnBody string) (string, error) {
+
+	reqsVec := "[]"
+	if len(requires) > 0 {
+		parts := make([]string, len(requires))
+		for i, r := range requires {
+			parts[i] = `"` + r + `"`
+		}
+		reqsVec = "[" + strings.Join(parts, " ") + "]"
+	}
+	extraReqsVec := "[]"
+	if len(extraReqs) > 0 {
+		extraReqsVec = "[" + strings.Join(extraReqs, " ") + "]"
+	}
+
+	code := fmt.Sprintf(`
+(sporulator.codegen/assemble-cell-source
+  {:cell-ns %s
+   :cell-id %s
+   :doc %s
+   :schema-map (sporulator.codegen/parse-schema %s)
+   :requires %s
+   :extra-requires %s
+   :helpers %s
+   :fn-body %s})`,
+		quoteClojure(cellNs), cellID, quoteClojure(doc), quoteClojure(schemaEDN),
+		reqsVec, extraReqsVec, quoteClojure(helpers), quoteClojure(fnBody))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", fmt.Errorf("assemble cell source: %w", err)
+	}
+	if result.IsError() {
+		return "", fmt.Errorf("assemble cell source error: %s %s", result.Ex, result.Err)
+	}
+	return unquoteClojure(result.Value), nil
+}
+
+// AssembleStubCellSource generates a minimal stub cell source for schema validation.
+func (b *Bridge) AssembleStubCellSource(cellNs, cellID, doc, schemaEDN string) (string, error) {
+	code := fmt.Sprintf(`
+(sporulator.codegen/assemble-stub-cell-source
+  {:cell-ns %s
+   :cell-id %s
+   :doc %s
+   :schema-map (sporulator.codegen/parse-schema %s)})`,
+		quoteClojure(cellNs), cellID, quoteClojure(doc), quoteClojure(schemaEDN))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", fmt.Errorf("assemble stub source: %w", err)
+	}
+	if result.IsError() {
+		return "", fmt.Errorf("assemble stub source error: %s %s", result.Ex, result.Err)
+	}
+	return unquoteClojure(result.Value), nil
 }
 
 // Close shuts down the bridge session and connection.

@@ -2348,13 +2348,15 @@ func assembleStubCellSource(cellNs, cellID, doc, schema string, requires []strin
 	b.WriteString("  (:require [mycelium.cell :as cell]))\n\n")
 	b.WriteString("(cell/defcell ")
 	b.WriteString(cellID)
-	b.WriteString("\n  {:doc \"")
+	b.WriteString("\n  (merge {:doc \"")
 	b.WriteString(strings.ReplaceAll(doc, `"`, `\"`))
-	b.WriteString("\"\n   :schema ")
-	b.WriteString(schema)
-	b.WriteString("}\n  (fn [resources data] data))\n")
+	b.WriteString("\"}\n         ")
+	b.WriteString(schema) // {:input X :output Y}
+	b.WriteString(")\n  (fn [resources data] data))\n")
 	return b.String()
 }
+
+// splitSchemaStr is no longer used — schema splitting is done via Clojure merge at runtime.
 
 // fixCellSchema asks the LLM to produce a corrected Malli schema for a cell.
 func (o *Orchestrator) fixCellSchema(ctx context.Context, leaf *DecompositionNode,
@@ -2470,18 +2472,35 @@ func assembleCellSource(cellNs, cellID, doc, schema string,
 		b.WriteString("\n")
 	}
 
-	// defcell form
+	// defcell form — schema is "{:input X :output Y}", defcell expects :input/:output at top level.
+	// Use merge so the schema map's :input/:output keys are at the top level of opts.
 	b.WriteString("\n(cell/defcell ")
 	b.WriteString(cellID)
-	b.WriteString("\n  {:doc \"")
+	b.WriteString("\n  (merge {:doc \"")
 	b.WriteString(strings.ReplaceAll(doc, `"`, `\"`))
-	b.WriteString("\"\n   :schema ")
+	b.WriteString("\"")
+	if len(requires) > 0 {
+		b.WriteString("\n          :requires [")
+		for i, r := range requires {
+			if i > 0 {
+				b.WriteString(" ")
+			}
+			b.WriteString(":" + r)
+		}
+		b.WriteString("]")
+	}
+	b.WriteString("}\n         ")
 	b.WriteString(schema)
-	b.WriteString("}\n  ")
+	b.WriteString(")\n  ")
 	b.WriteString(fnBody)
 	b.WriteString(")\n")
 
 	return b.String()
+}
+
+// splitSchemaStr splits a "{:input ... :output ...}" string into separate input and output parts.
+func splitSchemaStr(schema string) (string, string) {
+	return extractSubSchema(schema, "input"), extractSubSchema(schema, "output")
 }
 
 // assembleTestSource builds the complete test namespace deterministically.
