@@ -10,20 +10,18 @@ import (
 type FixTier int
 
 const (
-	FixTierStandard FixTier = iota // attempts 1-2: code + brief + test output
-	FixTierExpanded                // attempt 3: adds graph context
-	FixTierNarrowed                // attempt 4: focuses on first failing test
-	FixTierFresh                   // attempt 5: fresh start, implement from scratch
+	FixTierStandard FixTier = iota // attempt 1: code + brief + test output + graph context
+	FixTierNarrowed                // attempt 2: focuses on first failing test
+	FixTierFresh                   // attempt 3: fresh start, implement from scratch
 )
 
 // fixTierForAttempt returns the escalation tier for a given attempt number.
+// With 3 max attempts, escalation is aggressive: standard → narrowed → fresh.
 func fixTierForAttempt(attempt int) FixTier {
 	switch {
-	case attempt <= 2:
+	case attempt <= 1:
 		return FixTierStandard
-	case attempt == 3:
-		return FixTierExpanded
-	case attempt == 4:
+	case attempt == 2:
 		return FixTierNarrowed
 	default:
 		return FixTierFresh
@@ -64,15 +62,12 @@ func buildGraduatedFixPrompt(p FixPromptParams) string {
 	tier := fixTierForAttempt(p.Attempt)
 
 	switch tier {
-	case FixTierExpanded:
-		// Add graph context and spec excerpt to standard prompt
-		return buildExpandedFixPrompt(p)
 	case FixTierNarrowed:
 		return buildNarrowedFixPrompt(p)
 	case FixTierFresh:
 		return buildFreshFixPrompt(p)
 	default:
-		// Standard tier: use base prompt
+		// Standard tier: includes graph context from the start
 		return buildFixPrompt(p)
 	}
 }

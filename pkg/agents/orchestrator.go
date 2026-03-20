@@ -1500,8 +1500,10 @@ Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
 		testCode = fixResult
 	}
 
-	// Run tests with fix cycle
-	maxAttempts := 5
+	// Run tests with fix cycle — 3 attempts before giving up.
+	// Failed cells are re-decomposed into sub-workflows, so it's more productive
+	// to decompose early than to keep attempting fixes on a complex cell.
+	maxAttempts := 3
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "running",
 			Message: fmt.Sprintf("Running tests (attempt %d/%d)", attempt, maxAttempts)})

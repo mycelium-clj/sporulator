@@ -132,6 +132,7 @@ type streamDelta struct {
 // ChatStream sends a streaming chat completions request.
 // onChunk is called with each content fragment as it arrives.
 // Returns the complete response after the stream ends.
+// Includes a 2-minute idle timeout — if no data arrives for 2 minutes, the stream is cancelled.
 func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(string)) (*ChatResponse, error) {
 	body := apiRequest{
 		Model:       c.model,
@@ -147,6 +148,13 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 	}
 	defer respBody.Close()
 
+	// Create a context with idle timeout — cancels if no chunk arrives for 2 minutes
+	idleTimeout := 2 * time.Minute
+	idleCtx, idleCancel := context.WithCancel(ctx)
+	defer idleCancel()
+	idleTimer := time.AfterFunc(idleTimeout, idleCancel)
+	defer idleTimer.Stop()
+
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
 	var promptTokens, completionTokens int
@@ -154,50 +162,80 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest, onChunk func(
 
 	scanner := bufio.NewScanner(respBody)
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024) // 1MB line buffer for long SSE events
-	for scanner.Scan() {
-		line := scanner.Text()
 
-		// SSE format: "data: {...}" or "data: [DONE]"
-		if !strings.HasPrefix(line, "data: ") {
-			continue
+	// Wrap scanner in a channel so we can select on idle timeout
+	lines := make(chan string)
+	scanErr := make(chan error, 1)
+	go func() {
+		defer close(lines)
+		for scanner.Scan() {
+			lines <- scanner.Text()
 		}
-		payload := strings.TrimPrefix(line, "data: ")
-		if payload == "[DONE]" {
-			break
+		if err := scanner.Err(); err != nil {
+			scanErr <- err
 		}
+	}()
 
-		var delta streamDelta
-		if err := json.Unmarshal([]byte(payload), &delta); err != nil {
-			continue // skip malformed chunks
-		}
+loop:
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				break loop
+			}
+			// Reset idle timer on each received line
+			idleTimer.Reset(idleTimeout)
 
-		if len(delta.Choices) > 0 {
-			d := delta.Choices[0].Delta
-			// Capture content (the final answer)
-			if d.Content != nil && *d.Content != "" {
-				fullContent.WriteString(*d.Content)
-				if onChunk != nil {
-					onChunk(*d.Content)
+			// SSE format: "data: {...}" or "data: [DONE]"
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			payload := strings.TrimPrefix(line, "data: ")
+			if payload == "[DONE]" {
+				break loop
+			}
+
+			var delta streamDelta
+			if err := json.Unmarshal([]byte(payload), &delta); err != nil {
+				continue // skip malformed chunks
+			}
+
+			if len(delta.Choices) > 0 {
+				d := delta.Choices[0].Delta
+				if d.Content != nil && *d.Content != "" {
+					fullContent.WriteString(*d.Content)
+					if onChunk != nil {
+						onChunk(*d.Content)
+					}
+				}
+				if d.ReasoningContent != nil && *d.ReasoningContent != "" {
+					fullReasoning.WriteString(*d.ReasoningContent)
+				}
+				if delta.Choices[0].FinishReason != nil {
+					finishReason = *delta.Choices[0].FinishReason
 				}
 			}
-			// Also capture reasoning_content (DeepSeek reasoner's chain-of-thought)
-			if d.ReasoningContent != nil && *d.ReasoningContent != "" {
-				fullReasoning.WriteString(*d.ReasoningContent)
-			}
-			// Capture finish reason
-			if delta.Choices[0].FinishReason != nil {
-				finishReason = *delta.Choices[0].FinishReason
-			}
-		}
 
-		if delta.Usage != nil {
-			promptTokens = delta.Usage.PromptTokens
-			completionTokens = delta.Usage.CompletionTokens
+			if delta.Usage != nil {
+				promptTokens = delta.Usage.PromptTokens
+				completionTokens = delta.Usage.CompletionTokens
+			}
+
+		case <-idleCtx.Done():
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("llm stream cancelled: %w", ctx.Err())
+			}
+			return nil, fmt.Errorf("llm stream idle timeout: no data received for %v", idleTimeout)
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("llm stream read: %w", err)
+	// Check for scanner errors
+	select {
+	case err := <-scanErr:
+		if err != nil {
+			return nil, fmt.Errorf("llm stream read: %w", err)
+		}
+	default:
 	}
 
 	// If content is empty but reasoning has data, use reasoning as fallback
