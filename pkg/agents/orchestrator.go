@@ -1432,20 +1432,16 @@ Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
 	}
 	rawImpl = requestContinuation(ctx, agent, rawImpl, onChunk, cellID+"/impl")
 
-	// Assemble implementation
-	var implCode string
-	if strings.Contains(rawImpl, "(ns ") {
-		implCode = rawImpl
-	} else {
-		fnBody := ExtractFnBody(rawImpl)
-		if fnBody == "" {
-			fnBody = rawImpl
-		}
-		helpers := ExtractHelpers(rawImpl)
-		extraReqs := ExtractExtraRequires(rawImpl)
-		implCode = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
-			brief.Requires, extraReqs, helpers, fnBody)
+	// Assemble implementation — always go through assembleCellSource to ensure
+	// correct defcell format. Never use LLM's (ns ...) directly.
+	fnBody := ExtractFnBody(rawImpl)
+	if fnBody == "" {
+		fnBody = rawImpl
 	}
+	helpers := ExtractHelpers(rawImpl)
+	extraReqs := ExtractExtraRequires(rawImpl)
+	implCode := assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+		brief.Requires, extraReqs, helpers, fnBody)
 
 	// Write source file
 	if err := writeClojureFile(srcFile, implCode); err != nil {
@@ -1580,18 +1576,15 @@ Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
 		}
 		extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/fix")
 
-		if strings.Contains(extracted, "(ns ") {
-			implCode = extracted
-		} else {
-			fnBody := ExtractFnBody(extracted)
-			if fnBody == "" {
-				fnBody = extracted
-			}
-			helpers := ExtractHelpers(extracted)
-			extraReqs := ExtractExtraRequires(extracted)
-			implCode = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
-				brief.Requires, extraReqs, helpers, fnBody)
+		// Always assemble through assembleCellSource for correct defcell format
+		fnBody = ExtractFnBody(extracted)
+		if fnBody == "" {
+			fnBody = extracted
 		}
+		helpers = ExtractHelpers(extracted)
+		extraReqs = ExtractExtraRequires(extracted)
+		implCode = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+			brief.Requires, extraReqs, helpers, fnBody)
 		if err := writeClojureFile(srcFile, implCode); err != nil {
 			return fmt.Errorf("write fixed source %s: %w", srcFile, err)
 		}
@@ -1929,20 +1922,15 @@ CRITICAL: The cell ID is %s.`, errMsg, code, cellID)
 	}
 	extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/fix")
 
-	// Assemble deterministically or use as-is if full namespace
-	var fixed string
-	if strings.Contains(extracted, "(ns ") {
-		fixed = extracted
-	} else {
-		fnBody := ExtractFnBody(extracted)
-		if fnBody == "" {
-			fnBody = extracted
-		}
-		helpers := ExtractHelpers(extracted)
-		extraReqs := ExtractExtraRequires(extracted)
-		fixed = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
-			brief.Requires, extraReqs, helpers, fnBody)
+	// Always assemble through assembleCellSource for correct defcell format
+	fnBody := ExtractFnBody(extracted)
+	if fnBody == "" {
+		fnBody = extracted
 	}
+	helpers := ExtractHelpers(extracted)
+	extraReqs := ExtractExtraRequires(extracted)
+	fixed := assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+		brief.Requires, extraReqs, helpers, fnBody)
 
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
@@ -2179,14 +2167,13 @@ Return the code in a single code block.`, manifest, manifest)
 	return nil
 }
 
-// fixInvalidSchemas fixes cells that have Malli-invalid schemas by asking the cell
-// agent to regenerate with a corrected schema.
+// fixInvalidSchemas fixes cells with invalid Malli schemas by re-assembling the source
+// with the correct schema from the decomposition tree. The schema is already known and
+// REPL-validated from Phase 0 — we just need to re-write the defcell with it.
 func (o *Orchestrator) fixInvalidSchemas(ctx context.Context, cfg ProjectConfig, br *bridge.Bridge,
 	tree *DecompositionNode, errorsStr string,
 	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
 
-	// Parse errors like [{:cell-id ":order/foo" :phase ":input" :error "..." :schema "..."}]
-	// For each erroring cell, ask the cell agent to fix its schema
 	leaves := collectLeaves(tree)
 	for _, leaf := range leaves {
 		if !strings.Contains(errorsStr, leaf.CellID) {
@@ -2194,47 +2181,39 @@ func (o *Orchestrator) fixInvalidSchemas(ctx context.Context, cfg ProjectConfig,
 		}
 
 		onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "fixing_schema",
-			Message: fmt.Sprintf("Fixing invalid schema for %s", leaf.CellID)})
+			Message: fmt.Sprintf("Re-assembling %s with correct schema", leaf.CellID)})
 
-		agent := o.manager.NewCellAgent(leaf.CellID)
 		cellNs := cfg.BaseNamespace + ".cells." + cellIDToNsSuffix(leaf.CellID)
 		srcFile := clojureNsToFile(cfg.ProjectPath, cfg.SourceDir, cellNs)
 
-		fixPrompt := fmt.Sprintf(`The cell %s has an invalid Malli schema that fails validation.
-
-Error details: %s
-
-The declared schema is: %s
-
-Fix the cell's schema declaration so it is valid Malli syntax. Common issues:
-- Using bare keywords like :map instead of [:map ...]
-- Missing vector wrappers around map entries
-- Using unsupported Malli types
-
-Return the complete corrected cell namespace in a code block.`, leaf.CellID, errorsStr, leaf.InputSchema+" "+leaf.OutputSchema)
-
-		fixResp, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
-			func(chunk string) { onChunk(leaf.CellID+"/schema-fix", chunk) })
-		if err != nil {
+		// Read current source and extract the fn body + helpers
+		currentCode := ""
+		if data, err := os.ReadFile(srcFile); err == nil {
+			currentCode = string(data)
+		}
+		fnBody := ExtractFnBody(currentCode)
+		if fnBody == "" {
 			continue
 		}
+		helpers := ExtractHelpers(currentCode)
+		extraReqs := ExtractExtraRequires(currentCode)
 
-		fixedCode := ExtractFirstCodeBlock(fixResp)
-		if fixedCode == "" {
-			continue
-		}
+		// Re-assemble with the correct schema from the decomposition tree
+		schema := fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema))
+		fixedCode := assembleCellSource(cellNs, leaf.CellID, leaf.Doc, schema,
+			leaf.Requires, extraReqs, helpers, fnBody)
 
 		if err := writeClojureFile(srcFile, fixedCode); err != nil {
 			continue
 		}
 
-		// Reload the fixed cell
+		// Reload
 		session, _ := br.CloneSession()
 		br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, cellNs, cellNs))
 		br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
 
 		onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "schema_fixed",
-			Message: fmt.Sprintf("Reloaded %s with fixed schema", leaf.CellID)})
+			Message: fmt.Sprintf("Re-assembled %s with correct schema", leaf.CellID)})
 	}
 
 	return nil
@@ -2289,8 +2268,11 @@ Check: does your handler return all the keys declared in the output schema?
 Make sure you pass through all input keys that downstream cells expect (the data map
 is accumulating — downstream cells may need keys from earlier cells that flow through yours).
 
-Fix the cell to ensure its output matches its declared schema. Return the complete
-corrected namespace in a code block.`, leaf.CellID, truncMsg(errMsg, 500), truncMsg(chainOutput, 500), currentCode)
+Fix the handler function. Return ONLY:
+1. (OPTIONAL) Helper functions
+2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
+
+Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`, leaf.CellID, truncMsg(errMsg, 500), truncMsg(chainOutput, 500), currentCode)
 
 		fixResp, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 			func(chunk string) { onChunk(leaf.CellID+"/chain-fix", chunk) })
@@ -2298,10 +2280,21 @@ corrected namespace in a code block.`, leaf.CellID, truncMsg(errMsg, 500), trunc
 			continue
 		}
 
-		fixedCode := ExtractFirstCodeBlock(fixResp)
-		if fixedCode == "" {
+		extracted := ExtractFirstCodeBlock(fixResp)
+		if extracted == "" {
 			continue
 		}
+
+		// Assemble through assembleCellSource for correct defcell format
+		fnBody := ExtractFnBody(extracted)
+		if fnBody == "" {
+			fnBody = extracted
+		}
+		chainHelpers := ExtractHelpers(extracted)
+		chainExtraReqs := ExtractExtraRequires(extracted)
+		fixedCode := assembleCellSource(cellNs, leaf.CellID, leaf.Doc,
+			fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema)),
+			leaf.Requires, chainExtraReqs, chainHelpers, fnBody)
 
 		if err := writeClojureFile(srcFile, fixedCode); err != nil {
 			continue
