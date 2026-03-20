@@ -377,6 +377,29 @@ func (b *Bridge) ListRegisteredCells() (*EvalResult, error) {
 	return b.Eval(`(pr-str (cell/list-cells))`)
 }
 
+// ValidateMalliSchema checks a single schema string is valid Malli via the REPL.
+// Uses mycelium.schema/normalize-schema to handle lite map syntax before validation.
+// Returns nil on success, or a descriptive error string.
+func (b *Bridge) ValidateMalliSchema(schemaEDN string) (string, error) {
+	code := fmt.Sprintf(`
+(require '[malli.core :as m] '[mycelium.schema :as schema])
+(try
+  (let [s (schema/normalize-schema (read-string %s))]
+    (m/schema s)
+    "ok")
+  (catch Exception e
+    (str "INVALID: " (.getMessage e))))`, quoteClojure(schemaEDN))
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", err
+	}
+	val := unquoteClojure(result.Value)
+	if val == "ok" {
+		return "", nil
+	}
+	return val, nil
+}
+
 // ValidateCellSchemas checks that every cell referenced in the manifest has a valid
 // Malli schema. Returns a pr-str'd vector of error maps, or "[]" if all schemas are valid.
 // Handles per-transition output schemas (map of transition → schema) from composed cells.

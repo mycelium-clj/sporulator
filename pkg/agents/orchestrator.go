@@ -2390,7 +2390,26 @@ in a code block. No explanation needed.`, leaf.CellID, truncMsg(errMsg, 300), cu
 	if code == "" || !strings.Contains(code, ":input") {
 		return ""
 	}
-	return strings.TrimSpace(code)
+	code = strings.TrimSpace(code)
+
+	// Validate the fixed schema via REPL before accepting
+	br := o.manager.GetBridge()
+	if br != nil {
+		inputSchema := extractSubSchema(code, "input")
+		outputSchema := extractSubSchema(code, "output")
+		if errMsg, err := br.ValidateMalliSchema(inputSchema); err == nil && errMsg != "" {
+			onEvent(OrchestratorEvent{Phase: "schema_register", CellID: leaf.CellID, Status: "warning",
+				Message: fmt.Sprintf("LLM schema fix still invalid (input): %s", errMsg)})
+			return ""
+		}
+		if errMsg, err := br.ValidateMalliSchema(outputSchema); err == nil && errMsg != "" {
+			onEvent(OrchestratorEvent{Phase: "schema_register", CellID: leaf.CellID, Status: "warning",
+				Message: fmt.Sprintf("LLM schema fix still invalid (output): %s", errMsg)})
+			return ""
+		}
+	}
+
+	return code
 }
 
 // extractSubSchema pulls the :input or :output part from a {:input ... :output ...} schema string.

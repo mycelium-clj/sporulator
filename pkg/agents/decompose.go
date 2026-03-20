@@ -639,6 +639,9 @@ func (o *Orchestrator) decompose(ctx context.Context, spec, nsPrefix string,
 		Message: fmt.Sprintf("Depth %d: %d steps, %d edges, %d dispatches",
 			depth, len(steps), len(walk.Edges), len(walk.Dispatches))})
 
+	// Validate all LLM-produced schemas via the REPL before proceeding
+	o.validateStepSchemas(steps, onEvent)
+
 	// Set depth on all steps
 	for _, step := range steps {
 		step.Depth = depth
@@ -1316,6 +1319,49 @@ func (o *Orchestrator) validateAssembledManifest(br *bridge.Bridge, manifest str
 	} else {
 		onEvent(OrchestratorEvent{Phase: "decompose", Status: "validated",
 			Message: fmt.Sprintf("Manifest validated: %s", result.Value)})
+	}
+}
+
+// validateStepSchemas validates all step input/output schemas via the REPL.
+// Invalid schemas are replaced with empty maps and a warning is emitted.
+func (o *Orchestrator) validateStepSchemas(steps []*DecompositionNode, onEvent func(OrchestratorEvent)) {
+	br := o.manager.GetBridge()
+	if br == nil {
+		return
+	}
+	for _, step := range steps {
+		if step.InputSchema != "" && step.InputSchema != "{}" {
+			if errMsg, err := br.ValidateMalliSchema(step.InputSchema); err == nil && errMsg != "" {
+				onEvent(OrchestratorEvent{Phase: "schema_validation", CellID: step.CellID,
+					Status: "invalid_schema",
+					Message: fmt.Sprintf("Invalid input schema for %s: %s — replacing with {}", step.StepName, errMsg)})
+				step.InputSchema = "{}"
+			}
+		}
+		if step.OutputSchema != "" && step.OutputSchema != "{}" {
+			if errMsg, err := br.ValidateMalliSchema(step.OutputSchema); err == nil && errMsg != "" {
+				onEvent(OrchestratorEvent{Phase: "schema_validation", CellID: step.CellID,
+					Status: "invalid_schema",
+					Message: fmt.Sprintf("Invalid output schema for %s: %s — replacing with {}", step.StepName, errMsg)})
+				step.OutputSchema = "{}"
+			}
+		}
+	}
+}
+
+// bridgeSchemaValidator returns a schemaValidator that checks schemas via the REPL.
+// Returns nil if no bridge is available.
+func (o *Orchestrator) bridgeSchemaValidator() schemaValidator {
+	br := o.manager.GetBridge()
+	if br == nil {
+		return nil
+	}
+	return func(schemaEDN string) string {
+		errMsg, err := br.ValidateMalliSchema(schemaEDN)
+		if err != nil {
+			return "" // connection error — don't block
+		}
+		return errMsg
 	}
 }
 
@@ -2009,7 +2055,7 @@ func (o *Orchestrator) validateEdgeSchemas(ctx context.Context, spec string,
 				continue
 			}
 
-			applied, skipped := applySchemaCorrections(steps, corrections, onEvent)
+			applied, skipped := applySchemaCorrections(steps, corrections, o.bridgeSchemaValidator(), onEvent)
 			if applied > 0 {
 				onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "corrected",
 					Message: fmt.Sprintf("Fixed :%s → :%s (%d applied, %d skipped)", m.SourceName, m.TargetName, applied, skipped)})
@@ -2040,8 +2086,12 @@ func (o *Orchestrator) validateEdgeSchemas(ctx context.Context, spec string,
 
 // applySchemaCorrections applies valid EDN corrections to step nodes in place.
 // Returns (applied, skipped) counts.
+// schemaValidator is a function that checks a schema string is valid Malli.
+// Returns "" on success, or an error message. Nil validator skips REPL validation.
+type schemaValidator func(schemaEDN string) string
+
 func applySchemaCorrections(steps []*DecompositionNode, corrections map[string]*schemaCorrection,
-	onEvent func(OrchestratorEvent)) (applied, skipped int) {
+	validate schemaValidator, onEvent func(OrchestratorEvent)) (applied, skipped int) {
 
 	stepByName := make(map[string]*DecompositionNode)
 	for _, s := range steps {
@@ -2054,27 +2104,38 @@ func applySchemaCorrections(steps []*DecompositionNode, corrections map[string]*
 			continue
 		}
 		if correction.InputSchema != "" {
-			if isValidEDN(correction.InputSchema) {
+			if err := validateSchemaStr(correction.InputSchema, validate); err != "" {
+				onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "warning",
+					Message: fmt.Sprintf("Invalid schema correction for %s input: %s", stepName, err)})
+				skipped++
+			} else {
 				step.InputSchema = correction.InputSchema
 				applied++
-			} else {
-				onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "warning",
-					Message: fmt.Sprintf("Invalid EDN in input-schema correction for %s", stepName)})
-				skipped++
 			}
 		}
 		if correction.OutputSchema != "" {
-			if isValidEDN(correction.OutputSchema) {
+			if err := validateSchemaStr(correction.OutputSchema, validate); err != "" {
+				onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "warning",
+					Message: fmt.Sprintf("Invalid schema correction for %s output: %s", stepName, err)})
+				skipped++
+			} else {
 				step.OutputSchema = correction.OutputSchema
 				applied++
-			} else {
-				onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "warning",
-					Message: fmt.Sprintf("Invalid EDN in output-schema correction for %s", stepName)})
-				skipped++
 			}
 		}
 	}
 	return
+}
+
+// validateSchemaStr checks a schema string: first EDN parse, then Malli via REPL if validator is available.
+func validateSchemaStr(schema string, validate schemaValidator) string {
+	if !isValidEDN(schema) {
+		return "invalid EDN"
+	}
+	if validate != nil {
+		return validate(schema)
+	}
+	return ""
 }
 
 // isValidEDN checks whether a string is parseable as EDN.
