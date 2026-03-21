@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,20 +27,6 @@ type OrchestratorEvent struct {
 	Message string `json:"Message"`
 }
 
-type TestContract struct {
-	CellID      string    `json:"cell_id"`
-	TestCode    string    `json:"test_code"`
-	ReviewNotes string    `json:"review_notes"`
-	CellBrief   CellBrief `json:"cell_brief"`
-	Revision    int       `json:"revision"`
-}
-
-type CellBrief struct {
-	ID     string `json:"id"`
-	Doc    string `json:"doc"`
-	Schema string `json:"schema"`
-}
-
 var (
 	manifestID       string
 	maxDepth         int
@@ -49,60 +36,42 @@ var (
 	specFile         string
 	projectPath      string
 	baseNs           string
+	wsAddr           string
 )
 
 func main() {
-	startCmd := flag.NewFlagSet("start", flag.ExitOnError)
-	startCmd.StringVar(&manifestID, "manifest", ":order/placement", "Manifest ID")
-	startCmd.IntVar(&maxDepth, "depth", 0, "Max decomposition depth")
-	startCmd.IntVar(&maxSteps, "steps", 8, "Max steps per level")
-	startCmd.BoolVar(&autoApprove, "auto-approve", false, "Auto-approve test contracts")
-	startCmd.BoolVar(&autoApproveGraph, "auto-approve-graph", false, "Auto-approve graph decomposition")
-	startCmd.StringVar(&specFile, "spec", "/Users/yogthos/src/mycelium-clj/order-lifecycle/SPEC.md", "Spec file path")
-	startCmd.StringVar(&projectPath, "project", "/Users/yogthos/src/mycelium-clj/order-lifecycle", "Project path")
-	startCmd.StringVar(&baseNs, "ns", "example.order-lifecycle", "Base namespace")
+	flag.StringVar(&manifestID, "manifest", ":order/placement", "Manifest ID")
+	flag.IntVar(&maxDepth, "depth", 0, "Max decomposition depth")
+	flag.IntVar(&maxSteps, "steps", 8, "Max steps per level")
+	flag.BoolVar(&autoApprove, "auto-approve", false, "Auto-approve test contracts")
+	flag.BoolVar(&autoApproveGraph, "auto-approve-graph", false, "Auto-approve graph decomposition")
+	flag.StringVar(&specFile, "spec", "", "Spec file path (required)")
+	flag.StringVar(&projectPath, "project", "", "Project path (required)")
+	flag.StringVar(&baseNs, "ns", "", "Base namespace (required)")
+	flag.StringVar(&wsAddr, "addr", "ws://localhost:8420/ws", "WebSocket address")
+	flag.Parse()
 
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: orch_client <command> [flags]")
-		fmt.Println("  start         - start a new orchestration run")
-		fmt.Println("  review        - send test review responses from /tmp/review_responses.json")
-		fmt.Println("  graph-review  - send graph review response from /tmp/graph_review.json")
-		fmt.Println("  impl-review   - send impl review responses from /tmp/impl_review_responses.json")
-		fmt.Println("\nstart flags:")
-		startCmd.PrintDefaults()
+	if specFile == "" || projectPath == "" || baseNs == "" {
+		fmt.Println("Usage: orch_client -spec <path> -project <path> -ns <namespace> [flags]")
+		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
-	case "start":
-		startCmd.Parse(os.Args[2:])
-		startOrchestration()
-	case "review":
-		sendReview()
-	case "graph-review":
-		sendGraphReview()
-	case "impl-review":
-		sendImplReview()
-	default:
-		log.Fatalf("Unknown command: %s", os.Args[1])
-	}
-}
-
-func startOrchestration() {
 	spec, err := os.ReadFile(specFile)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Read spec:", err)
 	}
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 
-	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8420/ws", nil)
+	conn, _, err := websocket.DefaultDialer.Dial(wsAddr, nil)
 	if err != nil {
-		log.Fatal("dial:", err)
+		log.Fatal("Connect:", err)
 	}
 	defer conn.Close()
 
+	// Send orchestrate message
 	msg := WSMessage{
 		Type: "orchestrate",
 		ID:   "orch-run",
@@ -120,86 +89,61 @@ func startOrchestration() {
 		},
 	}
 
-	fmt.Printf("[%s] Config: manifest=%s depth=%d steps=%d auto_approve=%v\n", ts(), manifestID, maxDepth, maxSteps, autoApprove)
+	fmt.Printf("╔══════════════════════════════════════════════════╗\n")
+	fmt.Printf("║  Sporulator — Interactive Orchestration Client   ║\n")
+	fmt.Printf("╚══════════════════════════════════════════════════╝\n\n")
+	fmt.Printf("  Project:  %s\n", projectPath)
+	fmt.Printf("  Manifest: %s\n", manifestID)
+	fmt.Printf("  Depth:    %d   Steps: %d\n\n", maxDepth, maxSteps)
 
 	if err := conn.WriteJSON(msg); err != nil {
-		log.Fatal("send:", err)
+		log.Fatal("Send:", err)
 	}
-	fmt.Printf("[%s] Orchestrate sent, waiting for events...\n", ts())
 
-	// Log file for full output
-	logFile, _ := os.Create("/tmp/orch_run.log")
-	defer logFile.Close()
-
+	reader := bufio.NewReader(os.Stdin)
 	done := make(chan struct{})
+
 	go func() {
 		defer close(done)
 		for {
-			_, message, err := conn.ReadMessage()
+			_, data, err := conn.ReadMessage()
 			if err != nil {
-				fmt.Printf("[%s] Connection closed: %v\n", ts(), err)
+				fmt.Printf("\n  Connection closed: %v\n", err)
 				return
 			}
 
-			// Log raw message
-			logFile.Write(message)
-			logFile.WriteString("\n")
-
 			var resp WSMessage
-			json.Unmarshal(message, &resp)
+			json.Unmarshal(data, &resp)
 
 			switch resp.Type {
 			case "stream_chunk":
 				// skip
 
 			case "orchestrator_event":
-				eventBytes, _ := json.Marshal(resp.Payload)
-				var event OrchestratorEvent
-				json.Unmarshal(eventBytes, &event)
-
-				// Only print interesting events
-				if event.Status == "started" || event.Status == "success" || event.Status == "error" ||
-					event.Status == "fixing" || event.Status == "retry" || event.Status == "failed" ||
-					event.Status == "awaiting_review" || event.Status == "approved" || event.Status == "revising" || event.Status == "revised" ||
-					event.Status == "info" || event.Status == "warning" ||
-					event.Status == "extracted" || event.Status == "mismatch" || event.Status == "tree_passed" ||
-					event.Status == "registered" || event.Status == "invalid" || event.Status == "fixed" ||
-					event.Status == "schemas_valid" || event.Status == "schema_errors" ||
-					event.Status == "compile_error" || event.Status == "compiled" || event.Status == "validating_schemas" ||
-					event.Phase == "test_review" || event.Phase == "graph_review" || event.Phase == "impl_review" ||
-					event.Phase == "schema_register" || event.Phase == "integration" {
-					fmt.Printf("[%s] [%s] %s %s: %s\n", ts(), event.Phase, event.CellID, event.Status, trunc(event.Message, 150))
-				}
-
-			case "test_review_contracts":
-				// Save contracts for review
-				handleContracts(resp.Payload)
+				handleEvent(resp.Payload)
 
 			case "graph_review_data":
-				// Save graph for review
-				handleGraphReviewData(resp.Payload)
+				handleGraphReview(conn, resp.Payload, reader)
+
+			case "test_review_contracts":
+				handleTestReview(conn, resp.Payload, reader)
 
 			case "impl_review_data":
-				// Save implementations for review
-				handleImplReviewData(resp.Payload)
+				handleImplReview(conn, resp.Payload, reader)
 
 			case "orchestrator_complete":
-				fmt.Printf("\n[%s] === ORCHESTRATION COMPLETE ===\n", ts())
+				fmt.Printf("\n  ✓ ORCHESTRATION COMPLETE\n\n")
 				return
 
 			case "orchestrator_error":
 				errStr, _ := json.Marshal(resp.Payload)
-				fmt.Printf("\n[%s] === ERROR: %s ===\n", ts(), string(errStr))
+				fmt.Printf("\n  ✗ ERROR: %s\n\n", string(errStr))
 				return
 
 			case "error":
 				errStr, _ := json.Marshal(resp.Payload)
-				fmt.Printf("[%s] ERROR: %s\n", ts(), string(errStr))
+				fmt.Printf("\n  ✗ ERROR: %s\n\n", string(errStr))
 				return
-
-			default:
-				// Print unknown message types
-				fmt.Printf("[%s] [%s] (see log)\n", ts(), resp.Type)
 			}
 		}
 	}()
@@ -207,214 +151,230 @@ func startOrchestration() {
 	select {
 	case <-done:
 	case <-interrupt:
-		fmt.Println("Interrupted")
+		fmt.Println("\n  Interrupted")
 		conn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	}
 }
 
-func handleContracts(payload interface{}) {
+// ─── Event Display ──────────────────────────────────────────
+
+func handleEvent(payload interface{}) {
 	data, _ := json.Marshal(payload)
+	var event OrchestratorEvent
+	json.Unmarshal(data, &event)
 
-	// Parse the contracts
-	var wrapper struct {
-		RunID     string         `json:"run_id"`
-		Contracts []TestContract `json:"contracts"`
-	}
-	json.Unmarshal(data, &wrapper)
-
-	fmt.Printf("\n[%s] ========================================\n", ts())
-	fmt.Printf("[%s] TEST CONTRACTS READY FOR REVIEW\n", ts())
-	fmt.Printf("[%s] Run ID: %s\n", ts(), wrapper.RunID)
-	fmt.Printf("[%s] %d contracts to review\n", ts(), len(wrapper.Contracts))
-	fmt.Printf("[%s] ========================================\n\n", ts())
-
-	// Save run_id
-	os.WriteFile("/tmp/orch_run_id.txt", []byte(wrapper.RunID), 0644)
-
-	// Save each contract
-	for i, c := range wrapper.Contracts {
-		filename := fmt.Sprintf("/tmp/contract_%d_%s.txt", i, sanitize(c.CellID))
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("CELL ID: %s\n", c.CellID))
-		sb.WriteString(fmt.Sprintf("REVISION: %d\n", c.Revision))
-		sb.WriteString(fmt.Sprintf("DOC: %s\n", c.CellBrief.Doc))
-		sb.WriteString(fmt.Sprintf("SCHEMA: %s\n", c.CellBrief.Schema))
-		sb.WriteString("\n--- REVIEW NOTES ---\n")
-		sb.WriteString(c.ReviewNotes)
-		sb.WriteString("\n\n--- TEST CODE ---\n")
-		sb.WriteString(c.TestCode)
-		os.WriteFile(filename, []byte(sb.String()), 0644)
-
-		fmt.Printf("  [%d] %s (rev %d) — %s\n", i, c.CellID, c.Revision, trunc(c.CellBrief.Doc, 80))
-		fmt.Printf("      Saved to %s\n", filename)
-	}
-
-	// Save full contracts as JSON for programmatic access
-	contractsJSON, _ := json.MarshalIndent(wrapper, "", "  ")
-	os.WriteFile("/tmp/orch_contracts.json", contractsJSON, 0644)
-
-	// Generate a template review response (all approve)
-	var responses []map[string]string
-	for _, c := range wrapper.Contracts {
-		responses = append(responses, map[string]string{
-			"cell_id":  c.CellID,
-			"decision": "approve",
-		})
-	}
-	template := map[string]interface{}{
-		"run_id":    wrapper.RunID,
-		"responses": responses,
-	}
-	templateJSON, _ := json.MarshalIndent(template, "", "  ")
-	os.WriteFile("/tmp/review_responses.json", templateJSON, 0644)
-
-	fmt.Printf("\n  Review template saved to /tmp/review_responses.json\n")
-	fmt.Printf("  Edit decisions (approve/revise/edit/skip) and run: orch_client review\n\n")
-}
-
-func sendReview() {
-	data, err := os.ReadFile("/tmp/review_responses.json")
-	if err != nil {
-		log.Fatal("Read review responses:", err)
-	}
-
-	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8420/ws", nil)
-	if err != nil {
-		log.Fatal("dial:", err)
-	}
-	defer conn.Close()
-
-	var payload interface{}
-	json.Unmarshal(data, &payload)
-
-	msg := WSMessage{
-		Type:    "test_review",
-		ID:      "review",
-		Payload: payload,
-	}
-
-	if err := conn.WriteJSON(msg); err != nil {
-		log.Fatal("send:", err)
-	}
-	fmt.Printf("[%s] Review responses sent\n", ts())
-
-	// Read a response to confirm
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, message, err := conn.ReadMessage()
-	if err == nil {
-		fmt.Printf("[%s] Response: %s\n", ts(), trunc(string(message), 200))
+	// Filter to interesting events
+	switch {
+	case event.Phase == "schema_register" && event.Status == "registered":
+		fmt.Printf("  ✓ Schema: %s\n", event.CellID)
+	case event.Phase == "schema_register" && event.Status == "invalid":
+		fmt.Printf("  ✗ Schema INVALID: %s — %s\n", event.CellID, trunc(event.Message, 80))
+	case event.Phase == "cell_test" && event.Status == "passed":
+		fmt.Printf("  ✓ Tests passed: %s\n", event.CellID)
+	case event.Phase == "cell_test" && event.Status == "failed":
+		fmt.Printf("  ✗ Tests FAILED: %s\n", event.CellID)
+	case event.Phase == "cell_implement" && event.Status == "fixing":
+		fmt.Printf("  … Fixing: %s\n", event.CellID)
+	case event.Phase == "cell_implement" && event.Status == "error":
+		fmt.Printf("  ✗ Compile error: %s\n", event.CellID)
+	case event.Phase == "redecompose":
+		fmt.Printf("  ↻ %s: %s\n", event.Status, trunc(event.Message, 80))
+	case event.Phase == "register":
+		fmt.Printf("  %s: %s — %s\n", icon(event.Status), event.CellID, event.Status)
+	case event.Phase == "integration":
+		fmt.Printf("  [integration] %s: %s\n", event.Status, trunc(event.Message, 100))
+	case event.Status == "started" && event.Phase == "manifest":
+		fmt.Printf("\n  ⏳ Decomposing specification...\n")
+	case event.Status == "started" && event.Phase == "decompose":
+		fmt.Printf("  ⏳ %s\n", event.Message)
+	case event.Phase == "schema_validation" && event.Status == "tree_passed":
+		fmt.Printf("  ✓ Schema tree validated\n")
+	case event.Phase == "impl_review" && event.Status == "approved":
+		fmt.Printf("  ✓ Impl approved: %s\n", event.CellID)
 	}
 }
 
-func handleGraphReviewData(payload interface{}) {
-	data, _ := json.Marshal(payload)
+func icon(status string) string {
+	switch status {
+	case "success", "passed", "approved", "registered":
+		return "✓"
+	case "error", "failed":
+		return "✗"
+	case "started":
+		return "⏳"
+	default:
+		return "·"
+	}
+}
 
+// ─── Graph Review Gate ──────────────────────────────────────
+
+func handleGraphReview(conn *websocket.Conn, payload interface{}, reader *bufio.Reader) {
+	data, _ := json.Marshal(payload)
 	var wrapper struct {
-		RunID string          `json:"run_id"`
-		Graph json.RawMessage `json:"graph"`
+		RunID string `json:"run_id"`
+		Graph struct {
+			Depth      int    `json:"depth"`
+			NsPrefix   string `json:"ns_prefix"`
+			Steps      []struct {
+				Name         string `json:"name"`
+				Doc          string `json:"doc"`
+				InputSchema  string `json:"input_schema"`
+				OutputSchema string `json:"output_schema"`
+				IsLeaf       bool   `json:"is_leaf"`
+			} `json:"steps"`
+			Edges      map[string]string `json:"edges"`
+			Dispatches map[string]string `json:"dispatches"`
+			Manifest   string            `json:"manifest"`
+		} `json:"graph"`
 	}
 	json.Unmarshal(data, &wrapper)
 
-	// Pretty-print the graph
-	var graph struct {
-		Depth      int    `json:"depth"`
-		NsPrefix   string `json:"ns_prefix"`
-		Steps      []struct {
-			Name         string `json:"name"`
-			Doc          string `json:"doc"`
-			InputSchema  string `json:"input_schema"`
-			OutputSchema string `json:"output_schema"`
-			IsLeaf       bool   `json:"is_leaf"`
-		} `json:"steps"`
-		Edges      map[string]string `json:"edges"`
-		Dispatches map[string]string `json:"dispatches"`
-		Manifest   string            `json:"manifest"`
-	}
-	json.Unmarshal(wrapper.Graph, &graph)
+	fmt.Printf("\n┌─────────────────────────────────────────────────────┐\n")
+	fmt.Printf("│  GRAPH REVIEW — %d steps (depth %d)                   \n", len(wrapper.Graph.Steps), wrapper.Graph.Depth)
+	fmt.Printf("└─────────────────────────────────────────────────────┘\n\n")
 
-	fmt.Printf("\n[%s] ========================================\n", ts())
-	fmt.Printf("[%s] GRAPH READY FOR REVIEW (depth %d, ns: %s)\n", ts(), graph.Depth, graph.NsPrefix)
-	fmt.Printf("[%s] ========================================\n\n", ts())
-
-	for i, s := range graph.Steps {
+	for i, s := range wrapper.Graph.Steps {
 		leaf := ""
-		if s.IsLeaf {
-			leaf = " [LEAF]"
+		if !s.IsLeaf {
+			leaf = " [COMPLEX]"
 		}
-		fmt.Printf("  [%d] %s%s\n", i, s.Name, leaf)
-		fmt.Printf("      %s\n", s.Doc)
-		fmt.Printf("      in:  %s\n", trunc(s.InputSchema, 100))
-		fmt.Printf("      out: %s\n", trunc(s.OutputSchema, 100))
+		fmt.Printf("  %d. %s%s\n", i+1, s.Name, leaf)
+		fmt.Printf("     %s\n\n", trunc(s.Doc, 100))
 	}
 
-	fmt.Printf("\n  Edges:\n")
-	for name, edges := range graph.Edges {
-		fmt.Printf("    %s: %s\n", name, edges)
+	fmt.Printf("  Edges:\n")
+	for _, s := range wrapper.Graph.Steps {
+		if e, ok := wrapper.Graph.Edges[s.Name]; ok {
+			fmt.Printf("    %s → %s\n", s.Name, e)
+		}
 	}
 
-	// Save run_id
-	os.WriteFile("/tmp/orch_run_id.txt", []byte(wrapper.RunID), 0644)
+	fmt.Printf("\n  [a]pprove  [r]evise  > ")
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(strings.ToLower(input))
 
-	// Save full graph as JSON
-	graphJSON, _ := json.MarshalIndent(wrapper, "", "  ")
-	os.WriteFile("/tmp/orch_graph.json", graphJSON, 0644)
+	decision := "approve"
+	feedback := ""
+	if strings.HasPrefix(input, "r") {
+		decision = "revise"
+		fmt.Printf("  Feedback: ")
+		feedback, _ = reader.ReadString('\n')
+		feedback = strings.TrimSpace(feedback)
+	}
 
-	// Save manifest for easy reading
-	os.WriteFile("/tmp/orch_graph_manifest.edn", []byte(graph.Manifest), 0644)
-
-	// Generate template response (approve)
-	template := map[string]interface{}{
-		"run_id": wrapper.RunID,
-		"response": map[string]string{
-			"decision": "approve",
+	resp := WSMessage{
+		Type: "graph_review",
+		ID:   "review",
+		Payload: map[string]interface{}{
+			"run_id": wrapper.RunID,
+			"response": map[string]string{
+				"decision": decision,
+				"feedback": feedback,
+			},
 		},
 	}
-	templateJSON, _ := json.MarshalIndent(template, "", "  ")
-	os.WriteFile("/tmp/graph_review.json", templateJSON, 0644)
-
-	fmt.Printf("\n  Graph saved to /tmp/orch_graph.json\n")
-	fmt.Printf("  Manifest saved to /tmp/orch_graph_manifest.edn\n")
-	fmt.Printf("  Review template saved to /tmp/graph_review.json\n")
-	fmt.Printf("  Edit decision (approve/revise) and run: orch_client graph-review\n\n")
+	conn.WriteJSON(resp)
+	fmt.Printf("  → %s\n\n", decision)
 }
 
-func sendGraphReview() {
-	data, err := os.ReadFile("/tmp/graph_review.json")
-	if err != nil {
-		log.Fatal("Read graph review:", err)
-	}
+// ─── Test Review Gate ───────────────────────────────────────
 
-	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8420/ws", nil)
-	if err != nil {
-		log.Fatal("dial:", err)
-	}
-	defer conn.Close()
-
-	var payload interface{}
-	json.Unmarshal(data, &payload)
-
-	msg := WSMessage{
-		Type:    "graph_review",
-		ID:      "review",
-		Payload: payload,
-	}
-
-	if err := conn.WriteJSON(msg); err != nil {
-		log.Fatal("send:", err)
-	}
-	fmt.Printf("[%s] Graph review response sent\n", ts())
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, message, err := conn.ReadMessage()
-	if err == nil {
-		fmt.Printf("[%s] Response: %s\n", ts(), trunc(string(message), 200))
-	}
-}
-
-func handleImplReviewData(payload interface{}) {
+func handleTestReview(conn *websocket.Conn, payload interface{}, reader *bufio.Reader) {
 	data, _ := json.Marshal(payload)
+	var wrapper struct {
+		RunID     string `json:"run_id"`
+		Contracts []struct {
+			CellID      string `json:"cell_id"`
+			TestCode    string `json:"test_code"`
+			ReviewNotes string `json:"review_notes"`
+			CellBrief   struct {
+				Doc    string `json:"doc"`
+				Schema string `json:"schema"`
+			} `json:"cell_brief"`
+			Revision int `json:"revision"`
+		} `json:"contracts"`
+	}
+	json.Unmarshal(data, &wrapper)
 
+	fmt.Printf("\n┌─────────────────────────────────────────────────────┐\n")
+	fmt.Printf("│  TEST REVIEW — %d contracts                          \n", len(wrapper.Contracts))
+	fmt.Printf("└─────────────────────────────────────────────────────┘\n\n")
+
+	for i, c := range wrapper.Contracts {
+		testCount := strings.Count(c.TestCode, "deftest")
+		fmt.Printf("  %d. %s — %d tests (rev %d)\n", i+1, c.CellID, testCount, c.Revision)
+	}
+
+	fmt.Printf("\n  [a]pprove all  [v]iew <n>  [r]evise <n>  [s]kip <n>  > ")
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(strings.ToLower(input))
+
+	var responses []map[string]string
+
+	if strings.HasPrefix(input, "v") {
+		// View a specific contract
+		// For now, just show it and re-prompt
+		idx := 0
+		fmt.Sscanf(input[1:], "%d", &idx)
+		if idx > 0 && idx <= len(wrapper.Contracts) {
+			c := wrapper.Contracts[idx-1]
+			fmt.Printf("\n  === %s ===\n", c.CellID)
+			fmt.Printf("  Doc: %s\n\n", trunc(c.CellBrief.Doc, 120))
+			fmt.Printf("  Test code:\n%s\n\n", c.TestCode)
+			fmt.Printf("  Review notes:\n%s\n\n", trunc(c.ReviewNotes, 500))
+		}
+		// Re-prompt
+		fmt.Printf("  [a]pprove all  [r]evise <n>  > ")
+		input, _ = reader.ReadString('\n')
+		input = strings.TrimSpace(strings.ToLower(input))
+	}
+
+	if strings.HasPrefix(input, "r") {
+		// Revise specific contracts
+		idx := 0
+		fmt.Sscanf(input[1:], "%d", &idx)
+		fmt.Printf("  Feedback for %s: ", wrapper.Contracts[idx-1].CellID)
+		feedback, _ := reader.ReadString('\n')
+		feedback = strings.TrimSpace(feedback)
+
+		for i, c := range wrapper.Contracts {
+			if i == idx-1 {
+				responses = append(responses, map[string]string{
+					"cell_id": c.CellID, "decision": "revise", "feedback": feedback,
+				})
+			} else {
+				responses = append(responses, map[string]string{
+					"cell_id": c.CellID, "decision": "approve",
+				})
+			}
+		}
+	} else {
+		// Approve all
+		for _, c := range wrapper.Contracts {
+			responses = append(responses, map[string]string{
+				"cell_id": c.CellID, "decision": "approve",
+			})
+		}
+	}
+
+	resp := WSMessage{
+		Type: "test_review",
+		ID:   "review",
+		Payload: map[string]interface{}{
+			"run_id":    wrapper.RunID,
+			"responses": responses,
+		},
+	}
+	conn.WriteJSON(resp)
+	fmt.Printf("  → sent %d responses\n\n", len(responses))
+}
+
+// ─── Implementation Review Gate ─────────────────────────────
+
+func handleImplReview(conn *websocket.Conn, payload interface{}, reader *bufio.Reader) {
+	data, _ := json.Marshal(payload)
 	var wrapper struct {
 		RunID   string `json:"run_id"`
 		Reviews []struct {
@@ -429,76 +389,71 @@ func handleImplReviewData(payload interface{}) {
 	}
 	json.Unmarshal(data, &wrapper)
 
-	fmt.Printf("\n[%s] ========================================\n", ts())
-	fmt.Printf("[%s] IMPLEMENTATIONS READY FOR REVIEW\n", ts())
-	fmt.Printf("[%s] Run ID: %s\n", ts(), wrapper.RunID)
-	fmt.Printf("[%s] %d implementations to review\n", ts(), len(wrapper.Reviews))
-	fmt.Printf("[%s] ========================================\n\n", ts())
-
-	os.WriteFile("/tmp/orch_run_id.txt", []byte(wrapper.RunID), 0644)
+	fmt.Printf("\n┌─────────────────────────────────────────────────────┐\n")
+	fmt.Printf("│  IMPL REVIEW — %d cells                              \n", len(wrapper.Reviews))
+	fmt.Printf("└─────────────────────────────────────────────────────┘\n\n")
 
 	for i, r := range wrapper.Reviews {
-		filename := fmt.Sprintf("/tmp/impl_%d_%s.clj", i, sanitize(r.CellID))
-		os.WriteFile(filename, []byte(r.ImplCode), 0644)
-		fmt.Printf("  [%d] %s\n", i, r.CellID)
-		fmt.Printf("      Saved to %s\n", filename)
+		lines := strings.Count(r.ImplCode, "\n") + 1
+		fmt.Printf("  %d. %s — %d lines\n", i+1, r.CellID, lines)
 	}
 
-	// Save full data
-	implJSON, _ := json.MarshalIndent(wrapper, "", "  ")
-	os.WriteFile("/tmp/orch_impl_reviews.json", implJSON, 0644)
+	fmt.Printf("\n  [a]pprove all  [v]iew <n>  [r]evise <n>  > ")
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(strings.ToLower(input))
 
-	// Generate template response (all approve)
+	if strings.HasPrefix(input, "v") {
+		idx := 0
+		fmt.Sscanf(input[1:], "%d", &idx)
+		if idx > 0 && idx <= len(wrapper.Reviews) {
+			r := wrapper.Reviews[idx-1]
+			fmt.Printf("\n  === %s ===\n%s\n", r.CellID, r.ImplCode)
+		}
+		fmt.Printf("  [a]pprove all  [r]evise <n>  > ")
+		input, _ = reader.ReadString('\n')
+		input = strings.TrimSpace(strings.ToLower(input))
+	}
+
 	var responses []map[string]string
-	for _, r := range wrapper.Reviews {
-		responses = append(responses, map[string]string{
-			"cell_id":  r.CellID,
-			"decision": "approve",
-		})
-	}
-	template := map[string]interface{}{
-		"run_id":    wrapper.RunID,
-		"responses": responses,
-	}
-	templateJSON, _ := json.MarshalIndent(template, "", "  ")
-	os.WriteFile("/tmp/impl_review_responses.json", templateJSON, 0644)
+	if strings.HasPrefix(input, "r") {
+		idx := 0
+		fmt.Sscanf(input[1:], "%d", &idx)
+		fmt.Printf("  Feedback for %s: ", wrapper.Reviews[idx-1].CellID)
+		feedback, _ := reader.ReadString('\n')
+		feedback = strings.TrimSpace(feedback)
 
-	fmt.Printf("\n  Review template saved to /tmp/impl_review_responses.json\n")
-	fmt.Printf("  Edit decisions (approve/revise) and run: orch_client impl-review\n\n")
+		for i, r := range wrapper.Reviews {
+			if i == idx-1 {
+				responses = append(responses, map[string]string{
+					"cell_id": r.CellID, "decision": "revise", "feedback": feedback,
+				})
+			} else {
+				responses = append(responses, map[string]string{
+					"cell_id": r.CellID, "decision": "approve",
+				})
+			}
+		}
+	} else {
+		for _, r := range wrapper.Reviews {
+			responses = append(responses, map[string]string{
+				"cell_id": r.CellID, "decision": "approve",
+			})
+		}
+	}
+
+	resp := WSMessage{
+		Type: "impl_review",
+		ID:   "review",
+		Payload: map[string]interface{}{
+			"run_id":    wrapper.RunID,
+			"responses": responses,
+		},
+	}
+	conn.WriteJSON(resp)
+	fmt.Printf("  → sent %d responses\n\n", len(responses))
 }
 
-func sendImplReview() {
-	data, err := os.ReadFile("/tmp/impl_review_responses.json")
-	if err != nil {
-		log.Fatal("Read impl review responses:", err)
-	}
-
-	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8420/ws", nil)
-	if err != nil {
-		log.Fatal("dial:", err)
-	}
-	defer conn.Close()
-
-	var payload interface{}
-	json.Unmarshal(data, &payload)
-
-	msg := WSMessage{
-		Type:    "impl_review",
-		ID:      "review",
-		Payload: payload,
-	}
-
-	if err := conn.WriteJSON(msg); err != nil {
-		log.Fatal("send:", err)
-	}
-	fmt.Printf("[%s] Implementation review responses sent\n", ts())
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, message, err := conn.ReadMessage()
-	if err == nil {
-		fmt.Printf("[%s] Response: %s\n", ts(), trunc(string(message), 200))
-	}
-}
+// ─── Helpers ────────────────────────────────────────────────
 
 func ts() string {
 	return time.Now().Format("15:04:05")
@@ -510,10 +465,4 @@ func trunc(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
-}
-
-func sanitize(s string) string {
-	s = strings.ReplaceAll(s, ":", "")
-	s = strings.ReplaceAll(s, "/", "_")
-	return s
 }
