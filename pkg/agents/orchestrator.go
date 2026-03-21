@@ -1490,7 +1490,7 @@ Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
 		onEvent(OrchestratorEvent{Phase: "cell_test", CellID: cellID, Status: "error",
 			Message: fmt.Sprintf("Test compilation error: %s", testEvalResult.Ex)})
 
-		fixResult, fixErr := o.fixTestCode(ctx, agent, cellID, testCode, testEvalResult, testFile, br, session, testNs, cellNs, onChunk)
+		fixResult, fixErr := o.fixTestCode(ctx, agent, cellID, testCode, testEvalResult, testFile, br, session, testNs, cellNs, brief, onChunk)
 		if fixErr != nil {
 			return fmt.Errorf("fix tests %s: %w", cellID, fixErr)
 		}
@@ -1900,19 +1900,24 @@ func (o *Orchestrator) fixCellCode(ctx context.Context, agent *CellAgent, cellID
 
 	fixPrompt := fmt.Sprintf(`The implementation had a compilation error:
 
+## Error
 %s
 
-Here is the code that failed:
-
+## Code that failed
 `+"```clojure\n%s\n```"+`
 
-Fix the issue. Return ONLY:
+## Cell contract
+- **Cell ID:** %s
+- **Implementation Requirements:** %s
+- **Schema:** %s
+
+Fix the compilation error. Return ONLY:
 1. (OPTIONAL) Helper functions
 2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
 
 If you need extra requires, add: ;; REQUIRE: [lib.name :as alias]
-Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.
-CRITICAL: The cell ID is %s.`, errMsg, code, cellID)
+Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
+		errMsg, code, cellID, brief.Doc, brief.Schema)
 
 	fixResponse, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 		func(chunk string) { onChunk(cellID+"/fix", chunk) })
@@ -1958,7 +1963,7 @@ CRITICAL: The cell ID is %s.`, errMsg, code, cellID)
 // which are assembled into the full test namespace in Go.
 func (o *Orchestrator) fixTestCode(ctx context.Context, agent *CellAgent, cellID, code string,
 	evalResult *bridge.EvalResult, filePath string, br *bridge.Bridge, session string,
-	testNs, cellNs string,
+	testNs, cellNs string, brief CellBrief,
 	onChunk func(string, string)) (string, error) {
 
 	errMsg := evalResult.Ex
@@ -1968,19 +1973,30 @@ func (o *Orchestrator) fixTestCode(ctx context.Context, agent *CellAgent, cellID
 
 	fixPrompt := fmt.Sprintf(`The test file had a compilation error:
 
+## Error
 %s
 
-Here is the test code that failed:
-
+## Test code that failed
 `+"```clojure\n%s\n```"+`
+
+## Cell being tested
+- **Cell ID:** %s
+- **Implementation Requirements:** %s
+- **Schema:** %s
+
+The test namespace has these already set up:
+- handler bound via: (def handler (:handler (cell/get-cell! %s)))
+- approx= helper for floating-point comparison
+- validate-output helper for schema checking
 
 Fix the test. Return ONLY deftest forms. Do NOT include:
 - (ns ...) declaration
 - require forms
 - handler binding
-- helper function definitions (approx= is already available)
+- helper function definitions
 
-Call the handler as: (handler resources data)`, errMsg, code)
+Call the handler as: (handler resources data)`,
+		errMsg, code, cellID, brief.Doc, brief.Schema, cellID)
 
 	fixResponse, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 		func(chunk string) { onChunk(cellID+"/test-fix", chunk) })
@@ -1994,13 +2010,8 @@ Call the handler as: (handler resources data)`, errMsg, code)
 	}
 	extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/test-fix")
 
-	// Assemble deterministically or use as-is if full namespace
-	var fixed string
-	if strings.Contains(extracted, "(ns ") {
-		fixed = extracted
-	} else {
-		fixed = assembleTestSource(testNs, cellNs, cellID, extracted)
-	}
+	// Always assemble through assembleTestSource for consistent format
+	fixed := assembleTestSource(testNs, cellNs, cellID, extracted)
 
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
@@ -2187,7 +2198,7 @@ Fix the test code. Common issues:
 - NullPointerException usually means a cell returned nil — check the input data
 
 Return the complete corrected test code in a single code block.`,
-			truncMsg(errMsg, 1000), testCode, manifest)
+			truncMsg(errMsg, 2000), testCode, manifest)
 
 		fixResponse, fixErr := agent.ChatStream(ctx, fixPrompt,
 			func(chunk string) { onChunk("graph/integration-fix", chunk) })
@@ -2307,7 +2318,7 @@ Fix the handler function. Return ONLY:
 1. (OPTIONAL) Helper functions
 2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
 
-Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`, leaf.CellID, truncMsg(errMsg, 500), truncMsg(chainOutput, 500), currentCode)
+Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`, leaf.CellID, truncMsg(errMsg, 2000), truncMsg(chainOutput, 2000), currentCode)
 
 		fixResp, err := agent.session.SendStream(ctx, agent.client, fixPrompt,
 			func(chunk string) { onChunk(leaf.CellID+"/chain-fix", chunk) })
