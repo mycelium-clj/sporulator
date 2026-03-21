@@ -2033,32 +2033,40 @@ func (o *Orchestrator) validateEdgeSchemas(ctx context.Context, spec string,
 		onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "mismatches_found",
 			Message: fmt.Sprintf("Round %d: %d mismatched edges to reconcile", round, len(mismatches))})
 
-		// Fix each mismatched edge individually
-		for i, m := range mismatches {
-			onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "fixing",
-				Message: fmt.Sprintf("Fixing edge %d/%d: :%s → :%s", i+1, len(mismatches), m.SourceName, m.TargetName)})
+		// Group mismatches by target cell — all incoming edges to the same cell
+		// must be fixed together so the target's input schema is consistent.
+		groups := groupMismatchesByTarget(mismatches)
 
-			prompt := buildEdgeFixPrompt(spec, steps, m)
+		for targetName, groupMismatches := range groups {
+			sourceNames := make([]string, len(groupMismatches))
+			for i, m := range groupMismatches {
+				sourceNames[i] = m.SourceName
+			}
+			onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "fixing",
+				Message: fmt.Sprintf("Fixing %d edges → :%s (sources: %s)",
+					len(groupMismatches), targetName, strings.Join(sourceNames, ", "))})
+
+			prompt := buildGroupedEdgeFixPrompt(spec, steps, targetName, groupMismatches)
 
 			response, err := agent.ChatStream(ctx, prompt,
 				func(chunk string) { onChunk("schema-fix", chunk) })
 			if err != nil {
 				onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "warning",
-					Message: fmt.Sprintf("LLM error fixing :%s → :%s: %v", m.SourceName, m.TargetName, err)})
+					Message: fmt.Sprintf("LLM error fixing edges → :%s: %v", targetName, err)})
 				continue
 			}
 
 			corrections := parseSchemaCorrections(response)
 			if len(corrections) == 0 {
 				onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "warning",
-					Message: fmt.Sprintf("No corrections returned for :%s → :%s", m.SourceName, m.TargetName)})
+					Message: fmt.Sprintf("No corrections returned for edges → :%s", targetName)})
 				continue
 			}
 
 			applied, skipped := applySchemaCorrections(steps, corrections, o.bridgeSchemaValidator(), onEvent)
 			if applied > 0 {
 				onEvent(OrchestratorEvent{Phase: "schema_validation", Status: "corrected",
-					Message: fmt.Sprintf("Fixed :%s → :%s (%d applied, %d skipped)", m.SourceName, m.TargetName, applied, skipped)})
+					Message: fmt.Sprintf("Fixed edges → :%s (%d applied, %d skipped)", targetName, applied, skipped)})
 			}
 		}
 	}
@@ -2273,6 +2281,83 @@ Rules:
 // This gives the LLM a simpler task than fixing all mismatches at once.
 // It also shows downstream successors so the LLM knows which fields need to be
 // passed through the target cell's output.
+// groupMismatchesByTarget groups schema mismatches by their target cell name.
+// This ensures all incoming edges to the same cell are fixed together.
+func groupMismatchesByTarget(mismatches []SchemaMismatch) map[string][]SchemaMismatch {
+	groups := make(map[string][]SchemaMismatch)
+	for _, m := range mismatches {
+		groups[m.TargetName] = append(groups[m.TargetName], m)
+	}
+	return groups
+}
+
+// buildGroupedEdgeFixPrompt creates a prompt that shows ALL incoming edges to a target cell.
+// This gives the LLM the full picture so it can make the target's input schema compatible
+// with all sources simultaneously.
+func buildGroupedEdgeFixPrompt(spec string, steps []*DecompositionNode, targetName string, mismatches []SchemaMismatch) string {
+	var b strings.Builder
+
+	stepByName := make(map[string]*DecompositionNode)
+	for _, s := range steps {
+		stepByName[s.StepName] = s
+	}
+	target := stepByName[targetName]
+
+	fmt.Fprintf(&b, "Fix schema incompatibilities for cell :%s which receives edges from %d cells.\n\n", targetName, len(mismatches))
+
+	fmt.Fprintf(&b, "TARGET cell :%s\n", targetName)
+	if target != nil {
+		fmt.Fprintf(&b, "  doc: %s\n", target.Doc)
+		fmt.Fprintf(&b, "  input:  %s\n", defaultSchema(target.InputSchema))
+		fmt.Fprintf(&b, "  output: %s\n", defaultSchema(target.OutputSchema))
+	}
+
+	b.WriteString("\nINCOMING EDGES (all must be compatible with target input):\n")
+	for _, m := range mismatches {
+		source := stepByName[m.SourceName]
+		fmt.Fprintf(&b, "\n  SOURCE :%s\n", m.SourceName)
+		if source != nil {
+			fmt.Fprintf(&b, "    doc: %s\n", source.Doc)
+			fmt.Fprintf(&b, "    output: %s\n", defaultSchema(source.OutputSchema))
+		}
+		if len(m.Missing) > 0 {
+			fmt.Fprintf(&b, "    MISSING from output: %s\n", strings.Join(m.Missing, ", "))
+		}
+		if len(m.TypeDiffs) > 0 {
+			fmt.Fprintf(&b, "    TYPE MISMATCHES: %s\n", strings.Join(m.TypeDiffs, "; "))
+		}
+	}
+
+	b.WriteString("\nALL CELLS (for pass-through context):\n")
+	for _, s := range steps {
+		fmt.Fprintf(&b, "  :%s  in: %s  out: %s\n",
+			s.StepName, truncSchema(defaultSchema(s.InputSchema), 60), truncSchema(defaultSchema(s.OutputSchema), 60))
+	}
+
+	fmt.Fprintf(&b, `
+FIX STRATEGY:
+1. The target :%s input schema must use ONLY fields that ALL source cells can provide.
+2. Fields that some sources have and others don't should be made optional with [:maybe :type].
+3. Each source cell's output must include all required (non-optional) fields from the target's input.
+4. When adding fields to any cell's output, also add them to its input if it's a pass-through.
+
+Output ONLY corrections in this format (one block per corrected cell):
+
+CORRECTED :<step-name> output-schema
+<corrected lite Malli EDN schema>
+
+CORRECTED :<step-name> input-schema
+<corrected lite Malli EDN schema>
+
+Rules:
+- Use lite Malli syntax: {:field-name :type} for maps.
+- Optional fields: {:field [:maybe :type]}
+- The corrected schemas must be consistent with each cell's documented purpose.
+`, targetName)
+
+	return b.String()
+}
+
 func buildEdgeFixPrompt(spec string, steps []*DecompositionNode, m SchemaMismatch) string {
 	var b strings.Builder
 
