@@ -21,10 +21,10 @@ type WSMessage struct {
 }
 
 type OrchestratorEvent struct {
-	Phase   string `json:"Phase"`
-	CellID  string `json:"CellID"`
-	Status  string `json:"Status"`
-	Message string `json:"Message"`
+	Phase   string `json:"phase"`
+	CellID  string `json:"cell_id"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
 }
 
 var (
