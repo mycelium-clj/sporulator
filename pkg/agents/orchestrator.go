@@ -993,14 +993,13 @@ Do NOT include (ns ...) or (cell/defcell ...).`,
 								break
 							}
 
-							fnBody := ExtractFnBody(rawImpl)
-							if fnBody == "" {
-								fnBody = rawImpl
+							implCode, assembleErr := br.AssembleCellFromLLMOutput(
+								c.CellNs, c.CellID, c.Brief.Doc, c.Brief.Schema,
+								c.Brief.Requires, rawImpl)
+							if assembleErr != nil {
+								errors[idx] = fmt.Errorf("impl revision assembly for %s: %w", c.CellID, assembleErr)
+								break
 							}
-							helpers := ExtractHelpers(rawImpl)
-							extraReqs := ExtractExtraRequires(rawImpl)
-							implCode := assembleCellSource(c.CellNs, c.CellID, c.Brief.Doc, c.Brief.Schema,
-								c.Brief.Requires, extraReqs, helpers, fnBody)
 
 							writeClojureFile(c.SrcFile, implCode)
 
@@ -1432,16 +1431,18 @@ Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
 	}
 	rawImpl = requestContinuation(ctx, agent, rawImpl, onChunk, cellID+"/impl")
 
-	// Assemble implementation — always go through assembleCellSource to ensure
-	// correct defcell format. Never use LLM's (ns ...) directly.
-	fnBody := ExtractFnBody(rawImpl)
-	if fnBody == "" {
-		fnBody = rawImpl
+	// Assemble implementation via REPL (extracts fn-body/helpers/requires in Clojure)
+	implCode, assembleErr := br.AssembleCellFromLLMOutput(cellNs, cellID, brief.Doc, brief.Schema,
+		brief.Requires, rawImpl)
+	if assembleErr != nil {
+		// Fallback to Go-side assembly
+		fnBody := ExtractFnBody(rawImpl)
+		if fnBody == "" {
+			fnBody = rawImpl
+		}
+		implCode = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+			brief.Requires, ExtractExtraRequires(rawImpl), ExtractHelpers(rawImpl), fnBody)
 	}
-	helpers := ExtractHelpers(rawImpl)
-	extraReqs := ExtractExtraRequires(rawImpl)
-	implCode := assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
-		brief.Requires, extraReqs, helpers, fnBody)
 
 	// Write source file
 	if err := writeClojureFile(srcFile, implCode); err != nil {
@@ -1576,15 +1577,18 @@ Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
 		}
 		extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/fix")
 
-		// Always assemble through assembleCellSource for correct defcell format
-		fnBody = ExtractFnBody(extracted)
-		if fnBody == "" {
-			fnBody = extracted
+		// Assemble via REPL
+		fixedImpl, assembleErr := br.AssembleCellFromLLMOutput(cellNs, cellID, brief.Doc, brief.Schema,
+			brief.Requires, extracted)
+		if assembleErr != nil {
+			fnBody := ExtractFnBody(extracted)
+			if fnBody == "" {
+				fnBody = extracted
+			}
+			fixedImpl = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+				brief.Requires, ExtractExtraRequires(extracted), ExtractHelpers(extracted), fnBody)
 		}
-		helpers = ExtractHelpers(extracted)
-		extraReqs = ExtractExtraRequires(extracted)
-		implCode = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
-			brief.Requires, extraReqs, helpers, fnBody)
+		implCode = fixedImpl
 		if err := writeClojureFile(srcFile, implCode); err != nil {
 			return fmt.Errorf("write fixed source %s: %w", srcFile, err)
 		}
@@ -1922,15 +1926,17 @@ CRITICAL: The cell ID is %s.`, errMsg, code, cellID)
 	}
 	extracted = requestContinuation(ctx, agent, extracted, onChunk, cellID+"/fix")
 
-	// Always assemble through assembleCellSource for correct defcell format
-	fnBody := ExtractFnBody(extracted)
-	if fnBody == "" {
-		fnBody = extracted
+	// Assemble via REPL
+	fixed, assembleErr := br.AssembleCellFromLLMOutput(cellNs, cellID, brief.Doc, brief.Schema,
+		brief.Requires, extracted)
+	if assembleErr != nil {
+		fnBody := ExtractFnBody(extracted)
+		if fnBody == "" {
+			fnBody = extracted
+		}
+		fixed = assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
+			brief.Requires, ExtractExtraRequires(extracted), ExtractHelpers(extracted), fnBody)
 	}
-	helpers := ExtractHelpers(extracted)
-	extraReqs := ExtractExtraRequires(extracted)
-	fixed := assembleCellSource(cellNs, cellID, brief.Doc, brief.Schema,
-		brief.Requires, extraReqs, helpers, fnBody)
 
 	if err := writeClojureFile(filePath, fixed); err != nil {
 		return "", err
@@ -2191,29 +2197,24 @@ func (o *Orchestrator) fixInvalidSchemas(ctx context.Context, cfg ProjectConfig,
 		if data, err := os.ReadFile(srcFile); err == nil {
 			currentCode = string(data)
 		}
-		fnBody := ExtractFnBody(currentCode)
-		if fnBody == "" {
+		// Re-assemble with the correct schema from the decomposition tree via REPL
+		schema := fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema))
+		fixedCode, assembleErr := br.AssembleCellFromLLMOutput(cellNs, leaf.CellID, leaf.Doc, schema,
+			leaf.Requires, currentCode)
+		if assembleErr != nil {
 			continue
 		}
-		helpers := ExtractHelpers(currentCode)
-		extraReqs := ExtractExtraRequires(currentCode)
-
-		// Re-assemble with the correct schema from the decomposition tree
-		schema := fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema))
-		fixedCode := assembleCellSource(cellNs, leaf.CellID, leaf.Doc, schema,
-			leaf.Requires, extraReqs, helpers, fnBody)
 
 		if err := writeClojureFile(srcFile, fixedCode); err != nil {
 			continue
 		}
 
-		// Reload
-		session, _ := br.CloneSession()
-		br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, cellNs, cellNs))
-		br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
-
-		onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "schema_fixed",
-			Message: fmt.Sprintf("Re-assembled %s with correct schema", leaf.CellID)})
+		// Reload and verify
+		ok, _, _ := br.LoadAndCheckCell(cellNs, leaf.CellID, srcFile)
+		if ok {
+			onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "schema_fixed",
+				Message: fmt.Sprintf("Re-assembled %s with correct schema", leaf.CellID)})
+		}
 	}
 
 	return nil
@@ -2285,26 +2286,21 @@ Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you.`,
 			continue
 		}
 
-		// Assemble through assembleCellSource for correct defcell format
-		fnBody := ExtractFnBody(extracted)
-		if fnBody == "" {
-			fnBody = extracted
+		// Assemble via REPL
+		schema := fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema))
+		fixedCode, assembleErr := br.AssembleCellFromLLMOutput(cellNs, leaf.CellID, leaf.Doc,
+			schema, leaf.Requires, extracted)
+		if assembleErr != nil {
+			continue
 		}
-		chainHelpers := ExtractHelpers(extracted)
-		chainExtraReqs := ExtractExtraRequires(extracted)
-		fixedCode := assembleCellSource(cellNs, leaf.CellID, leaf.Doc,
-			fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema)),
-			leaf.Requires, chainExtraReqs, chainHelpers, fnBody)
 
 		if err := writeClojureFile(srcFile, fixedCode); err != nil {
 			continue
 		}
 
-		// Reload
-		session, _ := br.CloneSession()
-		br.EvalInSession(session, fmt.Sprintf(`(when (find-ns '%s) (remove-ns '%s))`, cellNs, cellNs))
-		evalResult, _ := br.EvalInSession(session, fmt.Sprintf(`(load-file "%s")`, srcFile))
-		if evalResult != nil && !evalResult.IsError() {
+		// Reload and check registration
+		ok, _, _ := br.LoadAndCheckCell(cellNs, leaf.CellID, srcFile)
+		if ok {
 			fixedAny = true
 			onEvent(OrchestratorEvent{Phase: "integration", CellID: leaf.CellID, Status: "chain_fixed",
 				Message: fmt.Sprintf("Reloaded %s with schema chain fix", leaf.CellID)})

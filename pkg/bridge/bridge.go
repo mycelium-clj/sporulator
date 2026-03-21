@@ -134,6 +134,161 @@ func (b *Bridge) AssembleStubCellSource(cellNs, cellID, doc, schemaEDN string) (
 	return unquoteClojure(result.Value), nil
 }
 
+// AssembleTestSource generates a test namespace source using codegen.
+func (b *Bridge) AssembleTestSource(testNs, cellNs, cellID, testBody string) (string, error) {
+	code := fmt.Sprintf(`
+(sporulator.codegen/assemble-test-source
+  {:test-ns %s :cell-ns %s :cell-id %s :test-body %s})`,
+		quoteClojure(testNs), quoteClojure(cellNs), cellID, quoteClojure(testBody))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", fmt.Errorf("assemble test source: %w", err)
+	}
+	if result.IsError() {
+		return "", fmt.Errorf("assemble test source error: %s %s", result.Ex, result.Err)
+	}
+	return unquoteClojure(result.Value), nil
+}
+
+// AssembleManifest generates a manifest EDN string using codegen.
+// steps is serialized as a Clojure vector of maps via the bridge.
+func (b *Bridge) AssembleManifest(id, nsPrefix string, stepsJSON string, edges, dispatches map[string]string) (string, error) {
+	// Build edges and dispatches as Clojure map literals
+	var edgesStr strings.Builder
+	edgesStr.WriteString("{")
+	for k, v := range edges {
+		fmt.Fprintf(&edgesStr, "%s %s ", quoteClojure(k), quoteClojure(v))
+	}
+	edgesStr.WriteString("}")
+
+	var dispStr strings.Builder
+	dispStr.WriteString("{")
+	for k, v := range dispatches {
+		fmt.Fprintf(&dispStr, "%s %s ", quoteClojure(k), quoteClojure(v))
+	}
+	dispStr.WriteString("}")
+
+	code := fmt.Sprintf(`
+(let [steps-data (read-string %s)
+      edges-raw (read-string %s)
+      dispatches-raw (read-string %s)]
+  (sporulator.codegen/assemble-manifest
+    {:id %s :ns-prefix %s
+     :steps (mapv (fn [s]
+                    {:name (:name s)
+                     :doc (:doc s)
+                     :input-schema (mycelium.schema/normalize-schema (:input-schema s))
+                     :output-schema (mycelium.schema/normalize-schema (:output-schema s))
+                     :requires (:requires s)})
+                  steps-data)
+     :edges edges-raw
+     :dispatches dispatches-raw}))`,
+		quoteClojure(stepsJSON),
+		quoteClojure(edgesStr.String()),
+		quoteClojure(dispStr.String()),
+		id, quoteClojure(nsPrefix))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", fmt.Errorf("assemble manifest: %w", err)
+	}
+	if result.IsError() {
+		return "", fmt.Errorf("assemble manifest error: %s %s", result.Ex, result.Err)
+	}
+	return unquoteClojure(result.Value), nil
+}
+
+// AssembleCellFromLLMOutput takes raw LLM output (fn body + helpers + require comments),
+// extracts the parts using Clojure, assembles a complete cell source, and returns it.
+// The entire pipeline runs in the REPL — no Go-side code parsing.
+func (b *Bridge) AssembleCellFromLLMOutput(cellNs, cellID, doc, schemaEDN string,
+	requires []string, rawLLMCode string) (string, error) {
+
+	code := fmt.Sprintf(`
+(sporulator.codegen/llm-response->cell-source
+  {:cell-ns %s :cell-id %s :doc %s
+   :schema-edn %s :requires %s :raw-code %s})`,
+		quoteClojure(cellNs), cellID, quoteClojure(doc),
+		quoteClojure(schemaEDN), clojureVec(requires), quoteClojure(rawLLMCode))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", fmt.Errorf("assemble cell from LLM: %w", err)
+	}
+	if result.IsError() {
+		return "", fmt.Errorf("assemble cell error: %s %s", result.Ex, result.Err)
+	}
+	return unquoteClojure(result.Value), nil
+}
+
+// AssembleTestFromLLMOutput takes raw LLM test response and assembles a test namespace.
+func (b *Bridge) AssembleTestFromLLMOutput(testNs, cellNs, cellID, rawResponse string) (string, error) {
+	code := fmt.Sprintf(`
+(sporulator.codegen/llm-response->test-source
+  {:test-ns %s :cell-ns %s :cell-id %s :raw-response %s})`,
+		quoteClojure(testNs), quoteClojure(cellNs), cellID, quoteClojure(rawResponse))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", fmt.Errorf("assemble test from LLM: %w", err)
+	}
+	if result.IsError() {
+		return "", fmt.Errorf("assemble test error: %s %s", result.Ex, result.Err)
+	}
+	return unquoteClojure(result.Value), nil
+}
+
+// LoadAndCheckCell loads a cell source file and verifies it registered correctly.
+// Returns the pr-str'd result map: {:ok true :input-keys #{} :output-keys #{}} or {:error "..."}.
+func (b *Bridge) LoadAndCheckCell(cellNs, cellID, sourceFile string) (bool, string, error) {
+	code := fmt.Sprintf(`
+(pr-str (sporulator.codegen/load-and-check-cell %s %s %s))`,
+		quoteClojure(cellNs), quoteClojure(cellID), quoteClojure(sourceFile))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return false, "", err
+	}
+	val := unquoteClojure(result.Value)
+	ok := strings.Contains(val, ":ok true")
+	return ok, val, nil
+}
+
+// RunCellTests loads source + test files, runs tests, returns structured results.
+// Returns ok=true if all tests pass, plus the full output string.
+func (b *Bridge) RunCellTests(cellNs, testNs, sourceFile, testFile string) (bool, string, error) {
+	code := fmt.Sprintf(`
+(pr-str (sporulator.codegen/run-cell-tests %s %s %s %s))`,
+		quoteClojure(cellNs), quoteClojure(testNs),
+		quoteClojure(sourceFile), quoteClojure(testFile))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return false, "", err
+	}
+	val := unquoteClojure(result.Value)
+	passed := strings.Contains(val, ":passed? true")
+	// Extract :output from the result for display
+	output := val
+	if result.Out != "" {
+		output = result.Out
+	}
+	return passed, output, nil
+}
+
+// clojureVec converts a Go string slice to a Clojure vector string: ["a" "b" "c"]
+func clojureVec(items []string) string {
+	if len(items) == 0 {
+		return "[]"
+	}
+	parts := make([]string, len(items))
+	for i, s := range items {
+		parts[i] = `"` + s + `"`
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
 // Close shuts down the bridge session and connection.
 func (b *Bridge) Close() error {
 	b.client.CloseSession(b.session)

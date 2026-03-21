@@ -222,6 +222,89 @@
          vec)))
 
 ;; ============================================================
+;; High-level pipelines (Go calls these end-to-end)
+;; ============================================================
+
+(defn llm-response->cell-source
+  "Full pipeline: raw LLM code response → assembled cell source.
+   Extracts fn-body, helpers, and extra-requires from the LLM output,
+   then assembles a complete cell namespace with the correct defcell form.
+   Returns the source string ready to write to a file."
+  [{:keys [cell-ns cell-id doc schema-edn requires raw-code]}]
+  (let [code      (or (extract-code-block raw-code) raw-code)
+        fn-body   (or (extract-fn-body code) code)
+        helpers   (extract-helpers code)
+        extra-reqs (extract-extra-requires code)]
+    (assemble-cell-source
+      {:cell-ns cell-ns
+       :cell-id cell-id
+       :doc doc
+       :schema-map (parse-schema schema-edn)
+       :requires requires
+       :extra-requires extra-reqs
+       :helpers helpers
+       :fn-body fn-body})))
+
+(defn llm-response->test-source
+  "Full pipeline: raw LLM test response → assembled test source.
+   Extracts code block and wraps in test namespace boilerplate."
+  [{:keys [test-ns cell-ns cell-id raw-response]}]
+  (let [test-body (or (extract-code-block raw-response) raw-response)]
+    (assemble-test-source
+      {:test-ns test-ns
+       :cell-ns cell-ns
+       :cell-id cell-id
+       :test-body test-body})))
+
+(defn load-and-check-cell
+  "Loads a cell source file, evaluates it in the REPL, and verifies registration.
+   Returns {:ok true :schema {...}} on success, {:error \"...\"} on failure."
+  [cell-ns cell-id source-file]
+  (try
+    (when (find-ns (symbol cell-ns))
+      (remove-ns (symbol cell-ns)))
+    (load-file source-file)
+    (let [spec (cell/get-cell! (read-string cell-id))]
+      (cond
+        (nil? spec)
+        {:error (str "Cell " cell-id " not registered after loading " source-file)}
+
+        (nil? (:handler spec))
+        {:error (str "Cell " cell-id " has no handler")}
+
+        (nil? (:schema spec))
+        {:error (str "Cell " cell-id " has nil schema — defcell opts may be missing :input/:output")}
+
+        :else
+        {:ok true
+         :input-keys (set (keep (fn [e] (when (vector? e) (first e)))
+                                (rest (get-in spec [:schema :input]))))
+         :output-keys (set (keep (fn [e] (when (vector? e) (first e)))
+                                 (rest (get-in spec [:schema :output]))))}))
+    (catch Exception e
+      {:error (str "Failed to load " source-file ": " (.getMessage e))})))
+
+(defn run-cell-tests
+  "Loads a test file, runs the tests, returns structured results.
+   Returns {:passed? bool :tests N :failures N :errors N :output \"...\"}."
+  [cell-ns test-ns source-file test-file]
+  (try
+    ;; Reload cell and test namespaces
+    (when (find-ns (symbol cell-ns))
+      (remove-ns (symbol cell-ns)))
+    (when (find-ns (symbol test-ns))
+      (remove-ns (symbol test-ns)))
+    (load-file source-file)
+    (load-file test-file)
+    (let [output (with-out-str
+                   (clojure.test/run-tests (find-ns (symbol test-ns))))
+          results (parse-test-results output)]
+      (assoc results :output output))
+    (catch Exception e
+      {:passed? false :error (.getMessage e)
+       :output (str "Exception: " (.getMessage e))})))
+
+;; ============================================================
 ;; Cell inspection (from REPL registry)
 ;; ============================================================
 
