@@ -2107,30 +2107,51 @@ func (o *Orchestrator) integrationTest(ctx context.Context, cfg ProjectConfig, b
 		return fmt.Errorf("workflow compilation failed")
 	}
 
-	// Phase 3: Run integration tests with fix loop
+	// Phase 3: Run workflow with trace to verify end-to-end behavior.
+	// First ask the graph agent to generate test scenarios (resources + input),
+	// then run each scenario and use the trace to identify failures.
 	agent := o.manager.GetGraphAgent(cfg.ManifestID)
 
-	prompt := fmt.Sprintf(`All cells have been implemented and loaded in the REPL.
-The workflow compiles successfully.
+	// Ask graph agent to generate test scenarios as Clojure data (resources + input + expected output)
+	prompt := fmt.Sprintf(`All cells have been implemented. The workflow compiles successfully.
 
-Now write integration test code to test the full workflow end-to-end.
+Generate integration test code that runs the workflow end-to-end.
 
 The manifest:
 `+"```edn\n%s\n```"+`
 
 Write Clojure code that:
-1. Compiles the workflow: (def wf (mycelium.core/compile-workflow (read-string <manifest-edn>) {:coerce? true}))
-2. Sets up test resources (catalog, coupons, tax-rates, inventory atom) and input data
-3. Runs the workflow: (mycelium.core/run-workflow wf resources input)
-4. Prints the results clearly with (println (pr-str result))
+1. Sets up resources (catalog, coupons, tax-rates, inventory atom) matching the spec
+2. Defines 1-2 test scenarios with input data and expected output values
+3. Runs each scenario using sporulator.codegen/run-workflow-with-trace
+4. Compares actual results against expected values
+5. If a test fails, uses the trace to show which cell produced wrong data
 
-IMPORTANT constraints:
-- Require all namespaces you use: [mycelium.core :as myc], cell namespaces, etc.
-- Do NOT use clojure.test or deftest — this is a script evaluated in the REPL
-- Do NOT define any function named run-tests
-- Use simple (println ...) and (assert ...) for verification
-- Keep it simple: 1-2 test scenarios maximum
-- Wrap everything in a try/catch so errors are printed clearly
+The code should follow this pattern:
+`+"```clojure"+`
+(require '[sporulator.codegen :as cg])
+
+(let [manifest (read-string "<manifest-edn>")
+      resources {:catalog {...} :coupons {...} :tax-rates {...} :inventory (atom {...})}
+      input {:items [...] :state "CA" :card "4111..." ...}
+      result (cg/run-workflow-with-trace manifest resources input)]
+  (if (:ok result)
+    (do
+      (println "Result:" (pr-str (select-keys (:result result) [:status :discounted-subtotal :tax :shipping :total])))
+      ;; Verify expected values
+      (let [r (:result result)]
+        (assert (= :success (:status r)) (str "Expected :success, got " (:status r))))
+      (println "PASS"))
+    (do
+      (println "ERROR:" (:error result))
+      (println "Trace:" (cg/format-trace-for-llm (:trace result))))))
+`+"```"+`
+
+IMPORTANT:
+- Use sporulator.codegen/run-workflow-with-trace (already loaded in REPL)
+- Resources must match what cells expect (check cell docs for resource format)
+- Use the spec's test cases for expected values
+- Print PASS or FAIL clearly with details
 
 Return the code in a single code block.`, manifest)
 
@@ -2167,7 +2188,7 @@ Return the code in a single code block.`, manifest)
 			break
 		}
 
-		// Tests failed — feed error + test code back to LLM for fixing
+		// Tests failed — feed error + test code + trace back to LLM
 		errMsg := result.Ex
 		if result.Err != "" {
 			errMsg += "\n" + result.Err
@@ -2179,26 +2200,30 @@ Return the code in a single code block.`, manifest)
 			return fmt.Errorf("integration tests still failing after %d attempts: %s", maxTestAttempts, result.Ex)
 		}
 
-		// Build fix prompt with full context: the test code + error + manifest
+		// Build fix prompt with full context
 		fixPrompt := fmt.Sprintf(`The integration test failed with this error:
 
 ## Error
 `+"```\n%s\n```"+`
 
+## REPL output
+`+"```\n%s\n```"+`
+
 ## Test code that failed
 `+"```clojure\n%s\n```"+`
 
-## Manifest (for reference)
+## Manifest
 `+"```edn\n%s\n```"+`
 
 Fix the test code. Common issues:
-- Missing requires (ensure all cell namespaces are loaded)
-- Wrong data shape for workflow input
-- Wrong resource setup (catalog, coupons, tax-rates should match what cells expect)
-- NullPointerException usually means a cell returned nil — check the input data
+- Missing requires (ensure sporulator.codegen and cell namespaces are loaded)
+- Wrong data shape for workflow input (check cell input schemas)
+- Wrong resource setup (catalog, coupons, tax-rates should match cell docs)
+- NullPointerException means a cell handler returned nil — check the input data shape
+- Use run-workflow-with-trace to see the trace when debugging
 
 Return the complete corrected test code in a single code block.`,
-			truncMsg(errMsg, 2000), testCode, manifest)
+			truncMsg(errMsg, 2000), truncMsg(output, 1000), testCode, manifest)
 
 		fixResponse, fixErr := agent.ChatStream(ctx, fixPrompt,
 			func(chunk string) { onChunk("graph/integration-fix", chunk) })

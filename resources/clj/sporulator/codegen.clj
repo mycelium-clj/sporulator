@@ -7,6 +7,8 @@
    happens here — Go only passes opaque strings."
   (:require [mycelium.cell :as cell]
             [mycelium.schema :as schema]
+            [mycelium.workflow :as wf]
+            [maestro.core :as fsm]
             [malli.core :as m]
             [clojure.string :as str]))
 
@@ -303,6 +305,100 @@
     (catch Exception e
       {:passed? false :error (.getMessage e)
        :output (str "Exception: " (.getMessage e))})))
+
+;; ============================================================
+;; Integration testing with trace analysis
+;; ============================================================
+
+(defn run-workflow-with-trace
+  "Compiles and runs a workflow, returning the result with trace.
+   Returns {:ok true :result <data> :trace [...]} on success,
+   {:error \"...\" :phase :compile|:run} on failure."
+  [manifest-edn resources input]
+  (try
+    (let [manifest (if (string? manifest-edn)
+                     (read-string manifest-edn)
+                     manifest-edn)
+          compiled (wf/compile-workflow manifest {:coerce? true})
+          result   (fsm/run compiled resources {:data input})]
+      {:ok true
+       :result (dissoc result :mycelium/trace)
+       :trace  (:mycelium/trace result)})
+    (catch clojure.lang.ExceptionInfo e
+      {:error (.getMessage e)
+       :phase (if (str/includes? (.getMessage e) "Schema chain")
+                :compile :run)
+       :data  (ex-data e)})
+    (catch Exception e
+      {:error (.getMessage e) :phase :run})))
+
+(defn analyze-trace-failure
+  "Given a workflow trace and expected output values, identifies which cell
+   first produced wrong data. Compares each trace entry's :data against
+   what downstream cells need.
+
+   expected is a map of keys to expected values in the final result.
+   Returns nil if trace looks correct, or a map describing the failure:
+   {:cell-name :cell-id :issue \"...\" :actual <val> :expected <val> :data <snapshot>}"
+  [trace expected-output actual-output]
+  (when (and trace (seq expected-output))
+    ;; Find keys that are wrong in the final output
+    (let [wrong-keys (reduce-kv
+                       (fn [acc k expected-v]
+                         (let [actual-v (get actual-output k ::missing)]
+                           (if (or (= actual-v ::missing)
+                                   (not= (str expected-v) (str actual-v)))
+                             (conj acc {:key k :expected expected-v :actual actual-v})
+                             acc)))
+                       []
+                       expected-output)]
+      (when (seq wrong-keys)
+        ;; Walk trace backwards to find the first cell that should have produced these keys
+        (let [wrong-key-set (set (map :key wrong-keys))]
+          {:wrong-keys wrong-keys
+           :trace-steps
+           (mapv (fn [entry]
+                   {:cell (:cell entry)
+                    :cell-id (:cell-id entry)
+                    :transition (:transition entry)
+                    :relevant-keys
+                    (select-keys (:data entry) wrong-key-set)})
+                 trace)})))))
+
+(defn format-trace-for-llm
+  "Formats a workflow trace for inclusion in an LLM prompt.
+   Shows each cell's name, transition, and a subset of its output data."
+  [trace & {:keys [max-keys] :or {max-keys 10}}]
+  (when (seq trace)
+    (str/join "\n"
+      (map-indexed
+        (fn [i entry]
+          (let [data (:data entry)
+                keys-to-show (take max-keys (keys data))
+                data-summary (select-keys data keys-to-show)
+                more (- (count data) (count keys-to-show))]
+            (str "  " (inc i) ". " (:cell entry) " (" (:cell-id entry) ")"
+                 " → " (or (:transition entry) "unconditional")
+                 "\n     " (pr-str data-summary)
+                 (when (pos? more) (str " ... +" more " more keys")))))
+        trace))))
+
+(defn build-cell-fix-context
+  "Given a trace and a cell-id, extracts the context needed to fix that cell:
+   what data it received (from the previous trace entry) and what it produced."
+  [trace cell-id]
+  (let [entries (vec trace)
+        idx (first (keep-indexed
+                     (fn [i entry] (when (= (str (:cell-id entry)) (str cell-id)) i))
+                     entries))]
+    (when idx
+      {:cell-id cell-id
+       :cell-name (:cell entries idx)
+       :input-data (if (pos? idx)
+                     (:data (nth entries (dec idx)))
+                     {})
+       :output-data (:data (nth entries idx))
+       :transition (:transition (nth entries idx))})))
 
 ;; ============================================================
 ;; Cell inspection (from REPL registry)

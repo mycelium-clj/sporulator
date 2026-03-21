@@ -277,6 +277,41 @@ func (b *Bridge) RunCellTests(cellNs, testNs, sourceFile, testFile string) (bool
 	return passed, output, nil
 }
 
+// RunWorkflowWithTrace compiles and runs a workflow, returning the result with trace.
+// Returns the pr-str'd result map from codegen/run-workflow-with-trace.
+func (b *Bridge) RunWorkflowWithTrace(manifestEDN, resourcesEDN, inputEDN string) (string, error) {
+	code := fmt.Sprintf(`
+(pr-str (sporulator.codegen/run-workflow-with-trace
+  %s %s %s))`,
+		manifestEDN, resourcesEDN, inputEDN)
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", fmt.Errorf("run workflow with trace: %w", err)
+	}
+	if result.IsError() {
+		return "", fmt.Errorf("run workflow error: %s %s", result.Ex, result.Err)
+	}
+	val := result.Value
+	if result.Out != "" {
+		val = result.Out + "\n" + val
+	}
+	return unquoteClojure(val), nil
+}
+
+// FormatTraceForLLM formats a workflow trace for inclusion in an LLM prompt.
+func (b *Bridge) FormatTraceForLLM(traceEDN string) (string, error) {
+	code := fmt.Sprintf(`
+(sporulator.codegen/format-trace-for-llm (read-string %s))`,
+		quoteClojure(traceEDN))
+
+	result, err := b.Eval(code)
+	if err != nil {
+		return "", err
+	}
+	return unquoteClojure(result.Value), nil
+}
+
 // clojureVec converts a Go string slice to a Clojure vector string: ["a" "b" "c"]
 func clojureVec(items []string) string {
 	if len(items) == 0 {
