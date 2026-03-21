@@ -2237,10 +2237,191 @@ Return the complete corrected test code in a single code block.`,
 		}
 	}
 
+	// Phase 4: If integration tests produced output but contain assertion failures or
+	// wrong values, use the trace to identify which cell to fix.
+	// The output from the test run contains the trace + assertions.
+	// Look for FAIL indicators in the output.
+	if strings.Contains(output, "FAIL") || strings.Contains(output, "AssertionError") ||
+		strings.Contains(output, "expected:") {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "analyzing",
+			Message: "Integration tests have failures — analyzing trace to identify failing cells"})
+
+		err = o.fixCellsFromIntegrationFailure(ctx, cfg, br, tree, manifest, output, testCode, onChunk, onEvent)
+		if err != nil {
+			onEvent(OrchestratorEvent{Phase: "integration", Status: "warning",
+				Message: fmt.Sprintf("Cell fix from integration: %v", err)})
+		}
+	}
+
 	onEvent(OrchestratorEvent{Phase: "integration", Status: "complete",
 		Message: fmt.Sprintf("Integration test output:\n%s", output)})
 
 	return nil
+}
+
+// fixCellsFromIntegrationFailure uses the graph agent to analyze integration test output
+// (which includes trace data), identify which cell produced wrong output, then asks
+// the cell agent to fix it with the trace context.
+func (o *Orchestrator) fixCellsFromIntegrationFailure(ctx context.Context, cfg ProjectConfig,
+	br *bridge.Bridge, tree *DecompositionNode, manifest, testOutput, testCode string,
+	onChunk func(string, string), onEvent func(OrchestratorEvent)) error {
+
+	agent := o.manager.GetGraphAgent(cfg.ManifestID)
+
+	// Ask graph agent to analyze the trace and identify the failing cell
+	analysisPrompt := fmt.Sprintf(`The integration tests ran but produced wrong results.
+
+## Test output (includes trace data)
+`+"```\n%s\n```"+`
+
+## Test code
+`+"```clojure\n%s\n```"+`
+
+## Manifest
+`+"```edn\n%s\n```"+`
+
+Analyze the output. Look at the trace to find which cell produced wrong data.
+The trace shows each cell's output after it ran — compare the actual data flow
+against what the spec requires.
+
+Respond with:
+1. CELL: <cell-id> — the cell that needs fixing
+2. ISSUE: <description> — what's wrong with its output
+3. EXPECTED: <what the output should look like>
+4. ACTUAL: <what it actually produced>
+
+If the issue is in the test code itself (wrong setup, wrong expected values),
+say TEST_FIX and provide the corrected test code in a code block.`,
+		truncMsg(testOutput, 3000), testCode, manifest)
+
+	analysisResp, err := agent.ChatStream(ctx, analysisPrompt,
+		func(chunk string) { onChunk("graph/trace-analysis", chunk) })
+	if err != nil {
+		return fmt.Errorf("trace analysis: %w", err)
+	}
+
+	// Check if the graph agent says the test needs fixing
+	if strings.Contains(analysisResp, "TEST_FIX") {
+		fixedTestCode := ExtractFirstCodeBlock(analysisResp)
+		if fixedTestCode != "" {
+			onEvent(OrchestratorEvent{Phase: "integration", Status: "test_fix",
+				Message: "Graph agent identified issue in test code — re-running"})
+
+			result, evalErr := br.Eval(fixedTestCode)
+			if evalErr == nil && !result.IsError() {
+				output := result.Value
+				if result.Out != "" {
+					output = result.Out + "\n" + output
+				}
+				onEvent(OrchestratorEvent{Phase: "integration", Status: "passed",
+					Message: fmt.Sprintf("Integration tests passed after test fix:\n%s", truncMsg(output, 500))})
+			}
+		}
+		return nil
+	}
+
+	// Extract the failing cell ID from the analysis
+	failingCellID := extractCellIDFromAnalysis(analysisResp)
+	if failingCellID == "" {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "warning",
+			Message: "Could not identify failing cell from trace analysis"})
+		return nil
+	}
+
+	onEvent(OrchestratorEvent{Phase: "integration", CellID: failingCellID, Status: "cell_fix",
+		Message: fmt.Sprintf("Trace analysis identified %s as the failing cell", failingCellID)})
+
+	// Find the leaf node for this cell
+	leaves := collectLeaves(tree)
+	var leaf *DecompositionNode
+	for _, l := range leaves {
+		if l.CellID == failingCellID {
+			leaf = l
+			break
+		}
+	}
+	if leaf == nil {
+		return fmt.Errorf("cell %s not found in decomposition tree", failingCellID)
+	}
+
+	// Read the cell's current source
+	cellNs := cfg.BaseNamespace + ".cells." + cellIDToNsSuffix(failingCellID)
+	srcFile := clojureNsToFile(cfg.ProjectPath, cfg.SourceDir, cellNs)
+	currentCode := ""
+	if data, readErr := os.ReadFile(srcFile); readErr == nil {
+		currentCode = string(data)
+	}
+
+	schema := fmt.Sprintf("{:input %s :output %s}", defaultSchema(leaf.InputSchema), defaultSchema(leaf.OutputSchema))
+
+	// Ask cell agent to fix the implementation
+	cellAgent := o.manager.NewCellAgent(failingCellID)
+	fixPrompt := fmt.Sprintf(`The integration test identified your cell as producing wrong output.
+
+## Analysis from trace
+%s
+
+## Your current implementation
+`+"```clojure\n%s\n```"+`
+
+## Cell contract
+- **Cell ID:** %s
+- **Implementation Requirements:** %s
+- **Schema:** %s
+
+Fix the handler function based on the trace analysis. Return ONLY:
+1. (OPTIONAL) Helper functions
+2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form
+
+Do NOT include (ns ...) or (cell/defcell ...).`,
+		truncMsg(analysisResp, 2000), currentCode,
+		failingCellID, leaf.Doc, schema)
+
+	fixResp, fixErr := cellAgent.session.SendStream(ctx, cellAgent.client, fixPrompt,
+		func(chunk string) { onChunk(failingCellID+"/integration-fix", chunk) })
+	if fixErr != nil {
+		return fmt.Errorf("cell fix for %s: %w", failingCellID, fixErr)
+	}
+
+	extracted := ExtractFirstCodeBlock(fixResp)
+	if extracted == "" {
+		return nil
+	}
+
+	// Assemble via REPL and reload
+	fixedCode, assembleErr := br.AssembleCellFromLLMOutput(cellNs, failingCellID, leaf.Doc,
+		schema, leaf.Requires, extracted)
+	if assembleErr != nil {
+		return fmt.Errorf("assemble fix for %s: %w", failingCellID, assembleErr)
+	}
+
+	if writeErr := writeClojureFile(srcFile, fixedCode); writeErr != nil {
+		return writeErr
+	}
+
+	ok, _, _ := br.LoadAndCheckCell(cellNs, failingCellID, srcFile)
+	if ok {
+		onEvent(OrchestratorEvent{Phase: "integration", CellID: failingCellID, Status: "cell_fixed",
+			Message: fmt.Sprintf("Cell %s fixed and reloaded from trace analysis", failingCellID)})
+	}
+
+	return nil
+}
+
+// extractCellIDFromAnalysis extracts a cell ID from the graph agent's trace analysis.
+// Looks for "CELL: :ns/name" pattern.
+func extractCellIDFromAnalysis(analysis string) string {
+	for _, line := range strings.Split(analysis, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "CELL:") {
+			cellID := strings.TrimSpace(strings.TrimPrefix(trimmed, "CELL:"))
+			cellID = strings.TrimSpace(cellID)
+			if strings.HasPrefix(cellID, ":") {
+				return cellID
+			}
+		}
+	}
+	return ""
 }
 
 // fixInvalidSchemas fixes cells with invalid Malli schemas by re-assembling the source
