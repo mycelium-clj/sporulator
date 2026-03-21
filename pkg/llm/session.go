@@ -98,6 +98,15 @@ func (s *Session) Reset() {
 	s.messages = nil
 }
 
+// SetMessages replaces the conversation history (excluding system prompt).
+// Used to restore a session from persistent storage.
+func (s *Session) SetMessages(msgs []Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messages = make([]Message, len(msgs))
+	copy(s.messages, msgs)
+}
+
 // History returns a copy of the conversation messages (excluding system prompt).
 func (s *Session) History() []Message {
 	s.mu.Lock()

@@ -169,6 +169,25 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_cell_attempts_run_cell
 			ON cell_attempts(run_id, cell_id);
 
+		CREATE TABLE IF NOT EXISTS chat_sessions (
+			id         TEXT PRIMARY KEY,
+			agent_type TEXT NOT NULL DEFAULT 'graph',
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+
+		CREATE TABLE IF NOT EXISTS chat_messages (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			role       TEXT NOT NULL,
+			content    TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_chat_messages_session
+			ON chat_messages(session_id, created_at);
+
 		CREATE TABLE IF NOT EXISTS test_contracts (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
 			run_id       TEXT NOT NULL,

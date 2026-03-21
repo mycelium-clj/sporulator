@@ -79,6 +79,7 @@ func (m *Manager) GetBridge() *bridge.Bridge {
 }
 
 // GetGraphAgent returns (or creates) a persistent graph agent session.
+// On first access, loads any persisted chat history from the database.
 func (m *Manager) GetGraphAgent(sessionID string) *GraphAgent {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -87,8 +88,19 @@ func (m *Manager) GetGraphAgent(sessionID string) *GraphAgent {
 		return agent
 	}
 
+	session := llm.NewSession(sessionID, m.graphPrompt)
+
+	// Restore history from DB if available
+	if msgs, err := m.store.LoadChatMessages(sessionID); err == nil && len(msgs) > 0 {
+		llmMsgs := make([]llm.Message, len(msgs))
+		for i, m := range msgs {
+			llmMsgs[i] = llm.Message{Role: m.Role, Content: m.Content}
+		}
+		session.SetMessages(llmMsgs)
+	}
+
 	agent := &GraphAgent{
-		session:        llm.NewSession(sessionID, m.graphPrompt),
+		session:        session,
 		client:         m.graphClient,
 		store:          m.store,
 		bridgeProvider: m.GetBridge,

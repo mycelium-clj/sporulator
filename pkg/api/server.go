@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/mycelium-clj/sporulator/pkg/agents"
@@ -100,9 +103,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/repl/eval", s.handleReplEval)
 	s.mux.HandleFunc("POST /api/repl/instantiate", s.handleReplInstantiate)
 	s.mux.HandleFunc("GET /api/repl/status", s.handleReplStatus)
+	s.mux.HandleFunc("GET /api/repl/project-path", s.handleReplProjectPath)
 
 	// Source generation
 	s.mux.HandleFunc("POST /api/source/generate", s.handleSourceGenerate)
+
+	// Chat sessions
+	s.mux.HandleFunc("GET /api/sessions", s.handleListSessions)
+	s.mux.HandleFunc("GET /api/session", s.handleGetSession)
+	s.mux.HandleFunc("DELETE /api/session", s.handleDeleteSession)
+	s.mux.HandleFunc("POST /api/session/clear", s.handleClearSession)
+
+	// Manifest export to disk
+	s.mux.HandleFunc("POST /api/manifest/export", s.handleManifestExport)
 
 	// WebSocket
 	s.mux.HandleFunc("GET /ws", s.handleWebSocket)
@@ -414,6 +427,28 @@ func (s *Server) handleReplStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"connected": connected})
 }
 
+func (s *Server) handleReplProjectPath(w http.ResponseWriter, r *http.Request) {
+	b := s.getBridge()
+	if b == nil {
+		writeError(w, 503, "no REPL connected")
+		return
+	}
+
+	result, err := b.Eval(`(System/getProperty "user.dir")`)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("eval: %v", err))
+		return
+	}
+	if result.IsError() {
+		writeError(w, 500, fmt.Sprintf("eval error: %s", result.Ex))
+		return
+	}
+
+	// Value comes back as a pr-str'd string, e.g. "\"/path/to/project\""
+	path := strings.Trim(result.Value, "\"")
+	writeJSON(w, 200, map[string]string{"path": path})
+}
+
 // --- Source generation handler ---
 
 type sourceGenerateRequest struct {
@@ -446,4 +481,139 @@ func (s *Server) handleSourceGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, result)
+}
+
+// --- Manifest export handler ---
+
+type manifestExportRequest struct {
+	ProjectPath string `json:"project_path"`
+	ManifestID  string `json:"manifest_id"`
+	// Body allows exporting a manifest that hasn't been saved to the store yet.
+	// If provided, writes this EDN directly instead of loading from the store.
+	Body string `json:"body"`
+}
+
+func (s *Server) handleManifestExport(w http.ResponseWriter, r *http.Request) {
+	var req manifestExportRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, 400, fmt.Sprintf("invalid json: %v", err))
+		return
+	}
+	if req.ProjectPath == "" {
+		writeError(w, 400, "project_path is required")
+		return
+	}
+
+	body := req.Body
+	if body == "" {
+		// Load from store
+		if req.ManifestID == "" {
+			writeError(w, 400, "manifest_id or body is required")
+			return
+		}
+		manifest, err := s.store.GetLatestManifest(req.ManifestID)
+		if err != nil {
+			writeError(w, 500, fmt.Sprintf("load manifest: %v", err))
+			return
+		}
+		if manifest == nil {
+			writeError(w, 404, "manifest not found")
+			return
+		}
+		body = manifest.Body
+	}
+
+	// Write to {project_path}/resources/manifest.edn
+	dir := filepath.Join(req.ProjectPath, "resources")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		writeError(w, 500, fmt.Sprintf("create resources dir: %v", err))
+		return
+	}
+
+	outPath := filepath.Join(dir, "manifest.edn")
+	if err := os.WriteFile(outPath, []byte(body), 0644); err != nil {
+		writeError(w, 500, fmt.Sprintf("write manifest: %v", err))
+		return
+	}
+
+	log.Printf("Manifest exported to %s", outPath)
+	writeJSON(w, 200, map[string]string{"path": outPath})
+}
+
+// --- Chat session handlers ---
+
+func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	sessions, err := s.store.ListChatSessions()
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("list sessions: %v", err))
+		return
+	}
+	if sessions == nil {
+		sessions = []store.ChatSessionSummary{}
+	}
+	writeJSON(w, 200, sessions)
+}
+
+func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, 400, "id parameter is required")
+		return
+	}
+
+	session, err := s.store.GetChatSession(id)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("get session: %v", err))
+		return
+	}
+	if session == nil {
+		writeError(w, 404, "session not found")
+		return
+	}
+
+	messages, err := s.store.LoadChatMessages(id)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("load messages: %v", err))
+		return
+	}
+	if messages == nil {
+		messages = []store.ChatMessage{}
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"session":  session,
+		"messages": messages,
+	})
+}
+
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, 400, "id parameter is required")
+		return
+	}
+
+	if err := s.store.DeleteChatSession(id); err != nil {
+		writeError(w, 500, fmt.Sprintf("delete session: %v", err))
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleClearSession(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, 400, "id parameter is required")
+		return
+	}
+
+	// Reset in-memory agent (clears conversation history)
+	s.manager.ResetGraphAgent(id)
+
+	// Clear messages from database but keep the session
+	if err := s.store.ClearChatMessages(id); err != nil {
+		writeError(w, 500, fmt.Sprintf("clear session: %v", err))
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "cleared"})
 }

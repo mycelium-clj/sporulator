@@ -21,12 +21,29 @@ type GraphAgent struct {
 
 // Chat sends a message to the graph agent and returns the response.
 func (g *GraphAgent) Chat(ctx context.Context, message string) (string, error) {
-	return g.session.Send(ctx, g.client, message)
+	resp, err := g.session.Send(ctx, g.client, message)
+	if err != nil {
+		return "", err
+	}
+	g.persistTurn(message, resp)
+	return resp, nil
 }
 
 // ChatStream sends a message and streams the response token by token.
 func (g *GraphAgent) ChatStream(ctx context.Context, message string, onChunk func(string)) (string, error) {
-	return g.session.SendStream(ctx, g.client, message, onChunk)
+	resp, err := g.session.SendStream(ctx, g.client, message, onChunk)
+	if err != nil {
+		return "", err
+	}
+	g.persistTurn(message, resp)
+	return resp, nil
+}
+
+// persistTurn saves both the user message and assistant response to the database.
+func (g *GraphAgent) persistTurn(userMsg, assistantMsg string) {
+	sid := g.session.ID
+	_ = g.store.SaveChatMessage(sid, "graph", "user", userMsg)
+	_ = g.store.SaveChatMessage(sid, "graph", "assistant", assistantMsg)
 }
 
 // ChatWithManifest sends a message with the current manifest as context.

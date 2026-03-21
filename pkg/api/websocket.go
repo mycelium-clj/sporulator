@@ -221,6 +221,7 @@ func (s *Server) handleWSMessage(c *wsClient, msg WSMessage) {
 type graphChatPayload struct {
 	SessionID string `json:"session_id"`
 	Message   string `json:"message"`
+	Manifest  string `json:"manifest"` // optional: current manifest EDN for edit context
 }
 
 func (s *Server) handleGraphChat(c *wsClient, msg WSMessage) {
@@ -235,8 +236,14 @@ func (s *Server) handleGraphChat(c *wsClient, msg WSMessage) {
 		return
 	}
 
+	// If the client sent the current manifest, prepend it as context
+	message := payload.Message
+	if payload.Manifest != "" {
+		message = fmt.Sprintf("Current manifest:\n```edn\n%s\n```\n\n%s", payload.Manifest, payload.Message)
+	}
+
 	agent := s.manager.GetGraphAgent(payload.SessionID)
-	response, err := agent.ChatStream(c.ctx, payload.Message, func(chunk string) {
+	response, err := agent.ChatStream(c.ctx, message, func(chunk string) {
 		c.sendMsg(WSMessage{
 			Type: "stream_chunk",
 			ID:   payload.SessionID,
