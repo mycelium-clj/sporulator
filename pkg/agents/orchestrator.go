@@ -2096,7 +2096,7 @@ func (o *Orchestrator) integrationTest(ctx context.Context, cfg ProjectConfig, b
 		return fmt.Errorf("workflow compilation failed")
 	}
 
-	// Phase 3: Run integration tests
+	// Phase 3: Run integration tests with fix loop
 	agent := o.manager.GetGraphAgent(cfg.ManifestID)
 
 	prompt := fmt.Sprintf(`All cells have been implemented and loaded in the REPL.
@@ -2108,19 +2108,20 @@ The manifest:
 `+"```edn\n%s\n```"+`
 
 Write Clojure code that:
-1. Requires [mycelium.core :as myc]
-2. Compiles the workflow: (def wf (myc/compile-workflow %s {:coerce? true}))
-3. Sets up test resources and input data
-4. Runs the workflow: (myc/run-workflow wf resources input)
-5. Prints the results clearly with (println (pr-str result))
+1. Compiles the workflow: (def wf (mycelium.core/compile-workflow (read-string <manifest-edn>) {:coerce? true}))
+2. Sets up test resources (catalog, coupons, tax-rates, inventory atom) and input data
+3. Runs the workflow: (mycelium.core/run-workflow wf resources input)
+4. Prints the results clearly with (println (pr-str result))
 
 IMPORTANT constraints:
+- Require all namespaces you use: [mycelium.core :as myc], cell namespaces, etc.
 - Do NOT use clojure.test or deftest — this is a script evaluated in the REPL
 - Do NOT define any function named run-tests
 - Use simple (println ...) and (assert ...) for verification
-- Keep it simple: 2-3 test scenarios maximum
+- Keep it simple: 1-2 test scenarios maximum
+- Wrap everything in a try/catch so errors are printed clearly
 
-Return the code in a single code block.`, manifest, manifest)
+Return the code in a single code block.`, manifest)
 
 	response, err := agent.ChatStream(ctx, prompt,
 		func(chunk string) { onChunk("graph/integration", chunk) })
@@ -2129,22 +2130,64 @@ Return the code in a single code block.`, manifest, manifest)
 	}
 
 	testCode := ExtractFirstCodeBlock(response)
-	result, err := br.Eval(testCode)
-	if err != nil {
-		return fmt.Errorf("eval integration tests: %w", err)
-	}
 
-	output := result.Value
-	if result.Out != "" {
-		output = result.Out + "\n" + output
-	}
+	// Run integration tests with fix loop (up to 3 attempts)
+	maxTestAttempts := 3
+	var output string
+	for attempt := 1; attempt <= maxTestAttempts; attempt++ {
+		onEvent(OrchestratorEvent{Phase: "integration", Status: "running",
+			Message: fmt.Sprintf("Running integration tests (attempt %d/%d)", attempt, maxTestAttempts)})
 
-	if result.IsError() {
+		result, evalErr := br.Eval(testCode)
+		if evalErr != nil {
+			onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
+				Message: fmt.Sprintf("REPL connection error: %v", evalErr)})
+			return fmt.Errorf("eval integration tests: %w", evalErr)
+		}
+
+		output = result.Value
+		if result.Out != "" {
+			output = result.Out + "\n" + output
+		}
+
+		if !result.IsError() {
+			onEvent(OrchestratorEvent{Phase: "integration", Status: "passed",
+				Message: fmt.Sprintf("Integration tests passed:\n%s", truncMsg(output, 500))})
+			break
+		}
+
+		// Tests failed — feed error + test code back to LLM for fixing
+		errMsg := result.Ex
+		if result.Err != "" {
+			errMsg += "\n" + result.Err
+		}
 		onEvent(OrchestratorEvent{Phase: "integration", Status: "error",
-			Message: fmt.Sprintf("Integration test error: %s\n%s", result.Ex, result.Err)})
+			Message: fmt.Sprintf("Integration test error (attempt %d): %s", attempt, truncMsg(errMsg, 300))})
 
-		fixPrompt := fmt.Sprintf("The integration test had this error:\n\n```\n%s\n%s\n```\n\nFix the test code and return the corrected version in a code block.",
-			result.Ex, result.Err)
+		if attempt >= maxTestAttempts {
+			return fmt.Errorf("integration tests still failing after %d attempts: %s", maxTestAttempts, result.Ex)
+		}
+
+		// Build fix prompt with full context: the test code + error + manifest
+		fixPrompt := fmt.Sprintf(`The integration test failed with this error:
+
+## Error
+`+"```\n%s\n```"+`
+
+## Test code that failed
+`+"```clojure\n%s\n```"+`
+
+## Manifest (for reference)
+`+"```edn\n%s\n```"+`
+
+Fix the test code. Common issues:
+- Missing requires (ensure all cell namespaces are loaded)
+- Wrong data shape for workflow input
+- Wrong resource setup (catalog, coupons, tax-rates should match what cells expect)
+- NullPointerException usually means a cell returned nil — check the input data
+
+Return the complete corrected test code in a single code block.`,
+			truncMsg(errMsg, 1000), testCode, manifest)
 
 		fixResponse, fixErr := agent.ChatStream(ctx, fixPrompt,
 			func(chunk string) { onChunk("graph/integration-fix", chunk) })
@@ -2153,17 +2196,8 @@ Return the code in a single code block.`, manifest, manifest)
 		}
 
 		fixedCode := ExtractFirstCodeBlock(fixResponse)
-		fixResult, fixEvalErr := br.Eval(fixedCode)
-		if fixEvalErr != nil {
-			return fixEvalErr
-		}
-
-		if fixResult.IsError() {
-			return fmt.Errorf("integration tests still failing: %s", fixResult.Ex)
-		}
-		output = fixResult.Value
-		if fixResult.Out != "" {
-			output = fixResult.Out + "\n" + output
+		if fixedCode != "" {
+			testCode = fixedCode
 		}
 	}
 
