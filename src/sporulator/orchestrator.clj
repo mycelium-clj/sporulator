@@ -346,12 +346,17 @@
 
     (emit on-event "manifest" "started" :run-id run-id)
 
-    ;; Build briefs from leaves
-    (let [briefs (mapv (fn [{:keys [cell-id doc input-schema output-schema requires]}]
-                         {:id       cell-id
-                          :doc      (or doc "")
-                          :schema   (str "{:input " (or input-schema "{}") " :output " (or output-schema "{}") "}")
-                          :requires (or requires [])})
+    ;; Build briefs from leaves (accept both kebab and underscore keys from JSON)
+    (let [briefs (mapv (fn [leaf]
+                         (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
+                               doc (or (:doc leaf) "")
+                               input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
+                               output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
+                               requires (or (:requires leaf) [])]
+                           {:id       cell-id
+                            :doc      doc
+                            :schema   (str "{:input " input-schema " :output " output-schema "}")
+                            :requires requires}))
                        leaves)]
 
       ;; Phase 1: Generate test contracts
