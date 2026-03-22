@@ -281,6 +281,7 @@
                           :base-ns      base-ns
                           :store        store
                           :project-path project-path
+                          :auto-approve? true
                           :on-event     (fn [event]
                                           (send-ws! ch {:type "orchestrator_event"
                                                         :id sid
@@ -289,23 +290,6 @@
                                           (send-ws! ch {:type "stream_chunk"
                                                         :id sid
                                                         :payload {:chunk chunk}}))
-                          :on-test-review
-                          (fn [contracts]
-                            ;; Send contracts to UI for review
-                            (send-ws! ch {:type "test_review_contracts"
-                                          :id sid
-                                          :payload {:run_id run-id
-                                                    :contracts (mapv (fn [c]
-                                                                       {:cell_id      (:cell-id c)
-                                                                        :test_code    (:test-code c)
-                                                                        :test_body    (:test-body c)
-                                                                        :review_notes (:review-notes c)
-                                                                        :revision     (:revision c 0)
-                                                                        :cell_brief   (select-keys (:brief c)
-                                                                                        [:id :doc :schema :requires])})
-                                                                     contracts)}})
-                            ;; Block until user responds
-                            (or (orchestrator/await-review gate 300000) []))
                           :max-attempts 3})]
             (swap! review-gates dissoc run-id)
             (send-ws! ch {:type (if (= :ok (:status result))
