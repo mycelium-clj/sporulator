@@ -1,7 +1,8 @@
 (ns sporulator.orchestrator
   "TDD orchestrator: generate tests → review → implement → verify.
    Coordinates graph and cell agents through the full workflow."
-  (:require [clojure.string :as str]
+  (:require [clojure.data.json :as json]
+            [clojure.string :as str]
             [sporulator.cell-agent :as cell-agent]
             [sporulator.codegen :as codegen]
             [sporulator.eval :as ev]
@@ -146,6 +147,46 @@
 
 ;; ── Implementation from contract ───────────────────────────────
 
+;; ── Lint fix loop ──────────────────────────────────────────────
+
+(defn lint-fix-loop
+  "Runs clj-kondo on code. If lint errors found, asks LLM to fix syntax
+   only (no logic changes). Retries up to max-attempts.
+   Returns {:status :ok :code fixed-code} or {:status :error :error msg}."
+  [client session code cell-id
+   & {:keys [max-attempts on-chunk on-event]
+      :or   {max-attempts 3}}]
+  (loop [current-code code
+         attempt      0]
+    (let [lint (ev/lint-code current-code)]
+      (if-not (seq (:errors lint))
+        {:status :ok :code current-code}
+        ;; Lint errors found
+        (do
+          (when on-event
+            (on-event {:phase "cell_implement" :status "lint_fix"
+                       :cell-id cell-id :attempt (inc attempt)
+                       :message (str (count (:errors lint)) " lint errors")}))
+          (if (>= attempt max-attempts)
+            {:status :error
+             :error  (str "Lint errors persist after " max-attempts " attempts: "
+                          (str/join "; " (map :message (:errors lint))))}
+            ;; Ask LLM to fix syntax only
+            (let [fix-prompt (str "Fix ONLY the syntax errors in this code. "
+                                  "Do NOT change any logic.\n\n"
+                                  "**Errors:**\n"
+                                  (str/join "\n" (map #(str "- Line " (:line %) ": " (:message %))
+                                                      (:errors lint)))
+                                  "\n\n**Code:**\n```clojure\n" current-code "\n```")
+                  fixed (if session
+                          (llm/session-send-stream session client fix-prompt
+                            (or on-chunk (fn [_])))
+                          current-code)
+                  extracted (or (extract/extract-first-code-block fixed) fixed)]
+              (recur extracted (inc attempt)))))))))
+
+;; ── Implementation ─────────────────────────────────────────────
+
 (defn- build-impl-prompt
   "Builds the prompt to implement a cell against its test contract."
   [{:keys [brief test-body]}]
@@ -274,10 +315,13 @@
      :on-chunk      — streaming callback
      :on-test-review — review callback: (fn [contracts] -> responses)
      :auto-approve? — skip review gates (default false)
-     :max-attempts  — max fix attempts per cell (default 3)"
+     :max-attempts  — max fix attempts per cell (default 3)
+     :manifest-id   — manifest ID for run tracking"
   [client {:keys [leaves base-ns store on-event on-chunk
-                  on-test-review auto-approve? max-attempts]
-           :or   {auto-approve? false max-attempts 3}
+                  on-test-review auto-approve? max-attempts manifest-id
+                  spec-hash]
+           :or   {auto-approve? false max-attempts 3
+                  manifest-id "" spec-hash ""}
            :as   opts}]
   (let [run-id  (str "run-" (System/nanoTime))
         on-event (or on-event (fn [_]))
@@ -287,8 +331,8 @@
     (when store
       (store/create-run! store
         {:id          run-id
-         :spec-hash   ""
-         :manifest-id ""
+         :spec-hash   spec-hash
+         :manifest-id manifest-id
          :status      "running"}))
 
     (emit on-event "manifest" "started" :run-id run-id)
@@ -319,6 +363,11 @@
             ;; Split into good and failed
             good-contracts (filterv :test-code contracts)
             failed         (filterv :error contracts)]
+
+        ;; Report failed contract generation
+        (doseq [f failed]
+          (emit on-event "cell_test" "error"
+                :cell-id (:cell-id f) :message (:error f)))
 
         ;; Phase 2: Review gate
         (let [approved (if auto-approve?
@@ -383,11 +432,15 @@
                 passed  (filterv #(= :ok (:status %)) impl-results)
                 failed-impl (filterv #(not= :ok (:status %)) impl-results)]
 
-            ;; Update run status
+            ;; Update run status and tree
             (let [final-status (if (and (empty? failed) (empty? failed-impl))
-                                 "completed" "partial")]
+                                 "completed" "partial")
+                  tree-json    (json/write-str
+                                 {:passed (mapv :cell-id passed)
+                                  :failed (into (mapv :cell-id failed)
+                                                (mapv :cell-id failed-impl))})]
               (when store
-                (store/update-run-status! store run-id final-status))
+                (store/update-run-tree! store run-id final-status tree-json))
               (emit on-event "complete" "done"
                     :passed (count passed)
                     :failed (+ (count failed) (count failed-impl)))
@@ -398,3 +451,64 @@
                :failed       (into (mapv :cell-id failed)
                                    (mapv :cell-id failed-impl))
                :results      impl-results})))))))
+
+;; ── Resume ─────────────────────────────────────────────────────
+
+(defn resume!
+  "Resumes a previous orchestration run. Checks store for a previous run
+   matching manifest-id. Reloads passed cells, re-implements failed ones.
+   Falls back to a fresh orchestrate! if no previous run found.
+
+   Options: same as orchestrate! plus :manifest-id (required)"
+  [client {:keys [manifest-id store on-event on-chunk] :as opts}]
+  (let [on-event (or on-event (fn [_]))]
+    (if-not store
+      (orchestrate! client opts)
+      ;; Check for previous run
+      (let [prev-run (store/get-latest-run-for-manifest store manifest-id)]
+        (if-not prev-run
+          (do (emit on-event "resume" "fresh"
+                    :message "No previous run found, starting fresh")
+              (orchestrate! client opts))
+
+          ;; Previous run found — check what passed/failed
+          (let [summary  (store/get-run-summary store (:id prev-run))
+                tree     (try (json/read-str (or (:tree-json prev-run) "{}")
+                                :key-fn keyword)
+                              (catch Exception _ {}))
+                passed   (or (:passed tree) [])
+                failed   (or (:failed tree) [])]
+
+            (emit on-event "resume" "found"
+                  :run-id (:id prev-run)
+                  :passed (count passed)
+                  :failed (count failed))
+
+            ;; Reload passed cells from store
+            (doseq [cell-id passed]
+              (when-let [cell (store/get-latest-cell store cell-id)]
+                (let [r (ev/eval-code (:handler cell))]
+                  (if (= :ok (:status r))
+                    (emit on-event "resume" "reloaded" :cell-id cell-id)
+                    (do
+                      (emit on-event "resume" "reload_failed" :cell-id cell-id
+                            :message (:error r)))))))
+
+            ;; If nothing failed, we're done
+            (if (empty? failed)
+              (do (emit on-event "resume" "all_passed"
+                        :message "All cells from previous run passed")
+                  {:status :ok :run-id (:id prev-run)
+                   :passed passed :failed []})
+
+              ;; Re-implement failed cells
+              (do (emit on-event "resume" "implementing"
+                        :message (str "Re-implementing " (count failed) " failed cells"))
+                  (orchestrate! client
+                    (assoc opts
+                      :leaves (mapv (fn [cell-id]
+                                      {:cell-id cell-id
+                                       :doc ""
+                                       :input-schema "{}"
+                                       :output-schema "{}"})
+                                    failed)))))))))))

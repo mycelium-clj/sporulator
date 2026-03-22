@@ -188,3 +188,113 @@
       (is (pos? (count @events)))
       ;; Should have a run in store
       (is (some? (:run-id result))))))
+
+;; =============================================================
+;; lint-fix-loop
+;; =============================================================
+
+(deftest lint-fix-loop-test
+  (testing "returns clean code unchanged"
+    (let [code "(defn foo [x] (+ x 1))"
+          r (orch/lint-fix-loop nil nil code ":test/lint-ok"
+              :max-attempts 3 :on-event (fn [_]))]
+      (is (= :ok (:status r)))
+      (is (= code (:code r)))))
+
+  (testing "fixes lint errors with LLM"
+    (let [call-count (atom 0)
+          session    (llm/create-session "lint-test" "")
+          r (with-redefs [llm/session-send-stream
+                          (mock-llm-send-stream
+                            (fn [_msg]
+                              (swap! call-count inc)
+                              ;; Return fixed code
+                              "```clojure\n(defn foo [x] (+ x 1))\n```"))]
+              (orch/lint-fix-loop
+                nil session
+                "(defn foo [x] (undefined-fn x))"
+                ":test/lint-fix"
+                :max-attempts 3 :on-event (fn [_])))]
+      (is (= :ok (:status r)))
+      (is (pos? @call-count)))))
+
+;; =============================================================
+;; impl-review gate
+;; =============================================================
+
+(deftest impl-review-gate-test
+  (testing "sends implementations for review and processes responses"
+    (store/create-run! *store*
+      {:id "impl-rev-1" :spec-hash "" :manifest-id "" :status "running"})
+    (let [events (atom [])
+          contract (with-redefs
+                     [llm/session-send-stream
+                      (mock-llm-send-stream
+                        (fn [_] "(deftest t (is true))"))]
+                     (orch/generate-test-contract nil
+                       {:brief    tax-cell-brief
+                        :base-ns  "test.implrev"
+                        :store    *store*
+                        :run-id   "impl-rev-1"
+                        :on-event (fn [_])
+                        :on-chunk (fn [_])}))
+          ;; Implement it
+          result (with-redefs
+                   [llm/session-send-stream
+                    (mock-llm-send-stream
+                      (fn [_]
+                        "```clojure\n(ns test.implrev.cells.compute-tax\n  (:require [mycelium.cell :as cell]))\n\n(cell/defcell :order/compute-tax\n  {:doc \"Computes tax\"\n   :input {:subtotal :double}\n   :output {:tax :double}}\n  (fn [_ data] {:tax (* (:subtotal data) 0.1)}))\n```"))]
+                   (orch/implement-from-contract nil
+                     {:contract contract
+                      :store    *store*
+                      :run-id   "impl-rev-1"
+                      :on-event (fn [e] (swap! events conj e))
+                      :on-chunk (fn [_])
+                      :max-attempts 3
+                      :on-impl-review
+                      (fn [impls]
+                        ;; Auto-approve all
+                        (mapv (fn [i] {:cell-id (:cell-id i) :decision "approve"})
+                              impls))}))]
+      (is (= :ok (:status result))))))
+
+;; =============================================================
+;; resume! (orchestrator resume)
+;; =============================================================
+
+(deftest resume-orchestrator-test
+  (testing "resumes from a previous run"
+    ;; First, run a full orchestration
+    (let [first-result
+          (with-redefs
+            [llm/session-send-stream
+             (mock-llm-send-stream
+               (fn [msg]
+                 (cond
+                   (and msg (str/includes? msg "Implement"))
+                   "```clojure\n(ns test.resume.cells.compute-tax\n  (:require [mycelium.cell :as cell]))\n\n(cell/defcell :order/compute-tax\n  {:doc \"Computes tax\"\n   :input {:subtotal :double}\n   :output {:tax :double}}\n  (fn [_ data] {:tax (* (:subtotal data) 0.1)}))\n```"
+                   (and msg (str/includes? msg "test"))
+                   "(deftest tax-test\n  (is (= {:tax 10.0} (handler {} {:subtotal 100.0}))))"
+                   :else "ALL TESTS VERIFIED")))]
+            (orch/orchestrate! nil
+              {:leaves [{:cell-id ":order/compute-tax" :step-name "compute-tax"
+                         :doc "Computes tax" :input-schema "{:subtotal :double}"
+                         :output-schema "{:tax :double}" :requires []}]
+               :base-ns "test.resume" :store *store*
+               :manifest-id ":test-resume-app"
+               :on-event (fn [_]) :on-chunk (fn [_])
+               :auto-approve? true :max-attempts 3}))]
+      (is (= :ok (:status first-result)))
+      ;; Now resume — should detect previous run
+      (let [resume-result
+            (with-redefs
+              [llm/session-send-stream
+               (mock-llm-send-stream (fn [_] "ALL TESTS VERIFIED"))]
+              (orch/resume! nil
+                {:manifest-id ":test-resume-app"
+                 :store       *store*
+                 :on-event    (fn [_])
+                 :on-chunk    (fn [_])
+                 :auto-approve? true}))]
+        (is (some? resume-result))
+        (is (= :ok (:status resume-result)))))))

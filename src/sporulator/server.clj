@@ -193,7 +193,14 @@
                             (send-ws! ch {:type "test_review_contracts"
                                           :id sid
                                           :payload {:run_id run-id
-                                                    :contracts (mapv #(select-keys % [:cell-id :test-body :review-notes])
+                                                    :contracts (mapv (fn [c]
+                                                                       {:cell_id      (:cell-id c)
+                                                                        :test_code    (:test-code c)
+                                                                        :test_body    (:test-body c)
+                                                                        :review_notes (:review-notes c)
+                                                                        :revision     (:revision c 0)
+                                                                        :cell_brief   (select-keys (:brief c)
+                                                                                        [:id :doc :schema :requires])})
                                                                      contracts)}})
                             ;; Block until user responds
                             (or (orchestrator/await-review gate 300000) []))

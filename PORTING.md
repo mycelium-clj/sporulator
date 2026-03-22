@@ -209,9 +209,10 @@ Use `eval`/`load-string` directly. This replaces the entire Go `bridge` package.
 | Compile workflow | `CompileWorkflow()` | `mycelium.core/compile` | [ ] |
 | Run workflow | `RunWorkflow()` | `mycelium.core/run` | [ ] |
 | Run with trace | `RunWorkflowWithTrace()` | run + capture trace | [ ] |
-| Validate schema | `ValidateSchema()` | malli validation | [ ] |
+| Validate schema | `ValidateSchema()` | `validate-schema` | [x] |
 | Verify cell contract | `VerifyCellContract()` | `verify-cell-contract` | [x] |
-| Lint fix (clj-kondo) | `lintFixLoop()` | clj-kondo via shell | [ ] |
+| Lint code | `lintFixLoop()` (lint part) | `lint-code` | [x] |
+| Merge test corrections | `mergeTestCorrections()` | `merge-test-corrections` | [x] |
 
 ---
 
@@ -231,10 +232,10 @@ Full TDD workflow: decompose → test → implement → integrate.
 | Event emission | `OrchestratorEvent` | `emit` callback | [x] |
 | Run tracking (store) | `CreateRun/UpdateRunStatus` | via store functions | [x] |
 | Cell attempt tracking | `SaveCellAttempt` | via store functions | [x] |
-| Resume workflow | `RunResumable()` | — | [ ] |
-| Merge test corrections | `mergeTestCorrections()` | — | [ ] |
+| Resume workflow | `RunResumable()` | `resume!` | [x] |
+| Merge test corrections | `mergeTestCorrections()` | `eval/merge-test-corrections` | [x] |
+| Lint fix loop | `lintFixLoop()` | `lint-fix-loop` | [x] |
 | Integration test loop | integration testing | — | [ ] |
-| Lint fix loop | `lintFixLoop()` | — | [ ] |
 | Schema validation loop | `validateEdgeSchemas()` | — | [ ] |
 | Review gates (graph) | `OnGraphReview` callback | — | [ ] |
 | Review gates (impl) | `OnImplReview` callback | — | [ ] |

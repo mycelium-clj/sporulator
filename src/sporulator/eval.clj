@@ -2,7 +2,8 @@
   "In-process code evaluation for sporulator.
    Replaces the Go bridge — no nREPL needed since we're in the same JVM.
    Provides safe eval with timeout, output capture, and error handling."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.test :as test])
   (:import [java.io StringWriter]))
 
@@ -141,3 +142,103 @@
        :error  "mycelium.cell/get-cell! not found on classpath"})
     (catch Exception e
       {:status :error :error (.getMessage e)})))
+
+;; ── Schema validation ──────────────────────────────────────────
+
+(defn validate-schema
+  "Validates data against a Malli schema (lite syntax string).
+   Returns {:valid? true} or {:valid? false :explanation ...}
+   or {:valid? false :error msg} if schema can't be parsed."
+  [schema-str data]
+  (try
+    (let [parsed (edn/read-string schema-str)
+          ;; Convert lite syntax map to malli [:map ...] form
+          malli-schema (if (map? parsed)
+                         (into [:map] (map (fn [[k v]] [k v]) parsed))
+                         parsed)
+          validate-fn  (requiring-resolve 'malli.core/validate)
+          explain-fn   (requiring-resolve 'malli.core/explain)]
+      (if (validate-fn malli-schema data)
+        {:valid? true}
+        {:valid? false
+         :explanation (explain-fn malli-schema data)}))
+    (catch Exception e
+      {:valid? false :error (.getMessage e)})))
+
+;; ── Lint ────────────────────────────────────────────────────────
+
+(defn lint-code
+  "Runs clj-kondo on a code string. Returns a map with :errors and :warnings
+   vectors, or nil values if the code is clean. Returns {:error msg} if
+   clj-kondo is not available."
+  [code]
+  (try
+    (let [proc (-> (ProcessBuilder. ["clj-kondo" "--lint" "-" "--lang" "clj"])
+                   (.redirectErrorStream true)
+                   (.start))]
+      (with-open [out (.getOutputStream proc)]
+        (.write out (.getBytes code "UTF-8")))
+      (let [output (slurp (.getInputStream proc))
+            exit   (.waitFor proc)
+            lines  (str/split-lines output)
+            parsed (keep (fn [line]
+                           (when-let [[_ _file row col level msg]
+                                      (re-find #"^(.+):(\d+):(\d+): (error|warning): (.+)$" line)]
+                             {:line    (parse-long row)
+                              :col     (parse-long col)
+                              :level   level
+                              :message msg}))
+                         lines)
+            errors   (filterv #(= "error" (:level %)) parsed)
+            warnings (filterv #(= "warning" (:level %)) parsed)]
+        {:errors   (when (seq errors) errors)
+         :warnings (when (seq warnings) warnings)}))
+    (catch java.io.IOException _
+      {:error "clj-kondo not found on PATH"})
+    (catch Exception e
+      {:error (.getMessage e)})))
+
+;; ── Test correction merging ────────────────────────────────────
+
+(defn- split-deftests
+  "Splits a string into individual (deftest ...) form strings.
+   Returns a vector of {:name string :body string}."
+  [code]
+  (when (and code (not (str/blank? code)))
+    (let [;; Match (deftest <name> ...) forms
+          pattern #"(?s)\(deftest\s+(\S+)\s"
+          matches (re-seq pattern code)
+          names   (mapv second matches)]
+      (if (empty? names)
+        [{:name nil :body (str/trim code)}]
+        ;; Split by deftest boundaries
+        (let [parts (str/split code #"(?=\(deftest\s)")
+              parts (filterv #(not (str/blank? %)) parts)]
+          (mapv (fn [part]
+                  (let [name (second (re-find #"\(deftest\s+(\S+)" part))]
+                    {:name name :body (str/trim part)}))
+                parts))))))
+
+(defn merge-test-corrections
+  "Merges corrected deftest forms into original test body.
+   Corrections replace matching tests by name; new tests are appended."
+  [original corrections]
+  (if (or (nil? corrections) (str/blank? corrections))
+    original
+    (let [orig-tests (split-deftests original)
+          corr-tests (split-deftests corrections)
+          corr-map   (into {} (keep (fn [{:keys [name body]}]
+                                      (when name [name body]))
+                                    corr-tests))
+          ;; Replace matching, keep non-matching
+          merged     (mapv (fn [{:keys [name body]}]
+                             (if (and name (contains? corr-map name))
+                               (get corr-map name)
+                               body))
+                           orig-tests)
+          ;; Find new tests (in corrections but not in original)
+          orig-names (set (keep :name orig-tests))
+          new-tests  (filterv (fn [{:keys [name]}]
+                                (and name (not (contains? orig-names name))))
+                              corr-tests)]
+      (str/join "\n\n" (into merged (mapv :body new-tests))))))

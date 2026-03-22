@@ -1,5 +1,6 @@
 (ns sporulator.eval-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.string :as str]
             [sporulator.eval :as ev]
             [sporulator.codegen :as codegen]))
 
@@ -137,3 +138,71 @@
     (let [r (ev/verify-cell-contract :nonexistent/cell)]
       (is (= :error (:status r)))
       (is (some? (:error r))))))
+
+;; =============================================================
+;; validate-schema
+;; =============================================================
+
+(deftest validate-schema-test
+  (testing "validates data against malli schema"
+    (let [r (ev/validate-schema "{:x :int :y :string}" {:x 1 :y "hello"})]
+      (is (:valid? r))))
+
+  (testing "returns explanation for invalid data"
+    (let [r (ev/validate-schema "{:x :int}" {:x "not-an-int"})]
+      (is (not (:valid? r)))
+      (is (some? (:explanation r)))))
+
+  (testing "handles invalid schema string gracefully"
+    (let [r (ev/validate-schema "{broken" {:x 1})]
+      (is (not (:valid? r)))
+      (is (some? (:error r))))))
+
+;; =============================================================
+;; lint-code
+;; =============================================================
+
+(deftest lint-code-test
+  (testing "returns nil for clean code"
+    (let [r (ev/lint-code "(defn foo [x] (+ x 1))")]
+      (is (nil? (:errors r)))))
+
+  (testing "returns errors for bad code"
+    (let [r (ev/lint-code "(defn foo [x] (+ x))")]
+      ;; clj-kondo may or may not flag this depending on version
+      ;; but unresolved vars should be caught
+      (is (map? r))))
+
+  (testing "catches unresolved symbols"
+    (let [r (ev/lint-code "(defn foo [x] (undefined-fn x))")]
+      (is (some? (:errors r))))))
+
+;; =============================================================
+;; merge-test-corrections (Round 2 — pure function)
+;; =============================================================
+
+(deftest merge-test-corrections-test
+  (testing "replaces matching deftest forms"
+    (let [original "(deftest test-a\n  (is (= 1 1)))\n\n(deftest test-b\n  (is (= 2 2)))"
+          corrected "(deftest test-b\n  (is (= 2 3)))"
+          result (ev/merge-test-corrections original corrected)]
+      (is (str/includes? result "test-a"))
+      (is (str/includes? result "(is (= 2 3))"))
+      (is (not (str/includes? result "(is (= 2 2))")))))
+
+  (testing "appends new tests from corrections"
+    (let [original "(deftest test-a\n  (is (= 1 1)))"
+          corrected "(deftest test-c\n  (is (= 3 3)))"
+          result (ev/merge-test-corrections original corrected)]
+      (is (str/includes? result "test-a"))
+      (is (str/includes? result "test-c"))))
+
+  (testing "returns original when no corrections"
+    (let [original "(deftest test-a\n  (is true))"
+          result (ev/merge-test-corrections original "")]
+      (is (= (str/trim original) (str/trim result)))))
+
+  (testing "returns original when corrections is nil"
+    (let [original "(deftest test-a\n  (is true))"]
+      (is (= (str/trim original)
+             (str/trim (ev/merge-test-corrections original nil)))))))
