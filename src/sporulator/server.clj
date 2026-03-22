@@ -57,9 +57,30 @@
                 (URLDecoder/decode v "UTF-8"))))
           (str/split qs #"&"))))
 
+(defn- parse-query-params
+  "Parses all query parameters into a keyword map."
+  [request]
+  (when-let [qs (:query-string request)]
+    (into {}
+      (keep (fn [pair]
+              (let [[k v] (str/split pair #"=" 2)]
+                (when (and k v)
+                  [(keyword k) (URLDecoder/decode v "UTF-8")])))
+            (str/split qs #"&")))))
+
 (defn- read-json-body [request]
-  (when-let [body (:body request)]
-    (json/read (java.io.InputStreamReader. body "UTF-8") :key-fn keyword)))
+  ;; code-mode sends POST args as query params, not JSON body.
+  ;; Try query params first, fall back to JSON body.
+  (let [qp (parse-query-params request)]
+    (if (seq qp)
+      qp
+      (when-let [body (:body request)]
+        (try
+          (let [parsed (json/read (java.io.InputStreamReader. body "UTF-8") :key-fn keyword)]
+            (if (and (map? parsed) (contains? parsed :body) (map? (:body parsed)))
+              (:body parsed)
+              parsed))
+          (catch Exception _ nil))))))
 
 ;; ── WebSocket hub ──────────────────────────────────────────────
 
