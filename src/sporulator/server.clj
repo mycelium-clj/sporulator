@@ -9,6 +9,7 @@
             [sporulator.orchestrator :as orchestrator]
             [sporulator.source-gen :as source-gen]
             [sporulator.store :as store]
+            [sporulator.tools :as tools]
             [org.httpkit.server :as http])
   (:import [java.net URLDecoder]))
 
@@ -405,6 +406,10 @@
             (graph-agent/reset-session! id)
             (json-response {} 200))
         (json-response {"error" "missing id"} 400))
+
+      ;; Tools manifest (UTCP for code-mode registration)
+      (and (= method :get) (= uri "/api/tools/manifest"))
+      (json-response (tools/tool-definitions))
 
       ;; Not found
       :else
