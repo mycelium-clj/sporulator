@@ -1,6 +1,8 @@
 (ns sporulator.graph-agent-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.string :as str]
             [sporulator.graph-agent :as ga]
+            [sporulator.llm :as llm]
             [sporulator.store :as store]))
 
 ;; =============================================================
@@ -141,3 +143,35 @@
 
   (testing "returns nil when response has no manifest"
     (is (nil? (ga/save-response-manifest! *store* "just some text")))))
+
+;; =============================================================
+;; decompose-requirements
+;; =============================================================
+
+(deftest decompose-requirements-test
+  (testing "decomposes requirements into numbered steps before manifest"
+    (let [call-count (atom 0)
+          result
+          (with-redefs [llm/session-send-stream
+                        (fn [session _client msg on-chunk & _]
+                          (swap! (:messages session) conj {:role "user" :content msg})
+                          (let [resp (if (zero? @call-count)
+                                       ;; First call: decomposition
+                                       "## Steps\n1. Parse order items from input\n2. Apply promotional discounts\n3. Compute tax per item\n4. Calculate shipping by warehouse"
+                                       ;; Second call: manifest from steps
+                                       "```edn\n{:id :order-flow\n :cells {:start {:id :order/parse}}\n :pipeline [:start]}\n```")]
+                            (swap! call-count inc)
+                            (when on-chunk (on-chunk resp))
+                            (swap! (:messages session) conj {:role "assistant" :content resp})
+                            resp))]
+            (ga/design-workflow nil "decomp-1"
+              "Build an order processing system"
+              (fn [_]) :store *store*))]
+      (is (= 2 @call-count) "Should make two LLM calls: decompose then manifest")
+      (is (some? (:steps result)))
+      (is (some? (:manifest-response result)))))
+
+  (testing "build-decompose-prompt includes requirements"
+    (let [prompt (ga/build-decompose-prompt "Build a todo app with CRUD")]
+      (is (str/includes? prompt "Build a todo app"))
+      (is (str/includes? prompt "step")))))

@@ -113,6 +113,58 @@
                      :created-by "graph-agent"})]
       {:version version :manifest-id manifest-id})))
 
+;; ── Decomposition ──────────────────────────────────────────────
+
+(defn build-decompose-prompt
+  "Builds a prompt that asks the LLM to break requirements into clear steps
+   before designing the manifest."
+  [requirements]
+  (str "Before designing a workflow manifest, break down the following requirements "
+       "into clear, sequential processing steps. For each step:\n"
+       "1. Give it a short name\n"
+       "2. Describe what it does in one sentence\n"
+       "3. List its input and output data\n\n"
+       "Focus on the data transformation pipeline — what goes in, what comes out "
+       "at each stage. Do NOT write the manifest yet, just the step breakdown.\n\n"
+       "**Requirements:**\n" requirements))
+
+(defn- build-manifest-from-steps-prompt
+  "Builds a prompt that asks the LLM to create a manifest from the decomposed steps."
+  [steps-response]
+  (str "Now create the Mycelium workflow manifest based on the steps you identified above. "
+       "Include proper schemas for each cell based on the input/output data you described.\n\n"
+       "Remember:\n"
+       "- Wrap the manifest in a fenced ```edn code block\n"
+       "- Output the COMPLETE manifest\n"
+       "- Every cell needs :id, :doc, and :schema with :input and :output\n"
+       "- Use :pipeline for linear flows, :edges for branching\n"))
+
+(defn design-workflow
+  "Two-step workflow design: first decomposes requirements into steps,
+   then creates the manifest from those steps.
+
+   Returns {:steps decomposition-response :manifest-response manifest-response}."
+  [client session-id requirements on-chunk & {:keys [store on-feedback]}]
+  (let [session (get-or-create-session session-id store)]
+    ;; Step 1: Decompose requirements into steps
+    (let [decompose-msg (build-decompose-prompt requirements)]
+      (persist-turn! store session-id "user" decompose-msg)
+      (let [steps-response (llm/session-send-stream session client decompose-msg on-chunk)]
+        (persist-turn! store session-id "assistant" steps-response)
+
+        ;; Step 2: Build manifest from the decomposed steps
+        (let [manifest-msg (build-manifest-from-steps-prompt steps-response)]
+          (persist-turn! store session-id "user" manifest-msg)
+          (let [manifest-response (llm/session-send-stream session client manifest-msg on-chunk)]
+            (persist-turn! store session-id "assistant" manifest-response)
+            (when store
+              (save-response-manifest! store manifest-response))
+            (when on-feedback
+              (on-feedback {:event-type "design_complete"
+                            :steps      steps-response}))
+            {:steps             steps-response
+             :manifest-response manifest-response}))))))
+
 ;; ── Chat ───────────────────────────────────────────────────────
 
 (defn chat-stream
