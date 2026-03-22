@@ -1,173 +1,181 @@
 # Sporulator
 
-Backend service for the Mycelium visual workflow builder. Provides a two-tier LLM agent architecture, SQLite cell storage, nREPL bridge, and HTTP/WebSocket API.
+TDD-driven code generation tool for [Mycelium](https://github.com/mycelium-clj/mycelium) workflows. Sporulator designs workflow graphs, generates cell implementations, and verifies them with automated tests — all orchestrated through LLM agents with human review gates.
+
+## How It Works
+
+Sporulator follows a structured TDD workflow:
+
+1. **Design** — The graph agent designs a workflow manifest (cells, edges, schemas) via LLM conversation
+2. **Test** — Test contracts are generated for each cell, self-reviewed, and presented for human approval
+3. **Implement** — Cell agents implement each cell against locked tests, with an eval feedback loop that auto-fixes errors
+4. **Verify** — Implementations are evaluated in-process, tests are run, and results are tracked
+
+The entire process runs in the same JVM as the generated code — no nREPL bridge needed. Code is evaluated directly via `load-string`, giving immediate feedback on compilation errors, test failures, and schema violations.
 
 ## Architecture
 
 ```
-Frontend (React) ←→ HTTP/WS API ←→ Agent Manager ←→ LLM Providers
-                                 ←→ SQLite Store
-                                 ←→ nREPL Bridge ←→ Clojure REPL
+sporulator/
+├── store.clj          # SQLite persistence (cells, manifests, runs, sessions)
+├── llm.clj            # OpenAI-compatible LLM client with SSE streaming
+├── eval.clj           # In-process code eval with timeout, test runner, lint
+├── extract.clj        # Code extraction from LLM responses
+├── codegen.clj        # Source code assembly (cells, tests, manifests)
+├── prompts.clj        # System prompts and graduated fix prompt construction
+├── decompose.clj      # Workflow decomposition and graph context
+├── graph_agent.clj    # Manifest design via LLM with validation feedback
+├── cell_agent.clj     # Cell implementation via LLM with eval feedback
+├── orchestrator.clj   # Full TDD orchestration loop with review gates
+├── source_gen.clj     # Generate .clj source files from stored cells
+├── server.clj         # HTTP + WebSocket server for sporulator-ui
+└── tools.clj          # UTCP tool definitions for Claude Code integration
 ```
 
-**Graph Agent** — Long-lived session that designs workflow manifests. Understands the full Mycelium manifest structure (cells, edges, dispatches, joins, pipelines).
+## Usage
 
-**Cell Agent** — Short-lived session that implements individual cells. Generates `defcell` forms with handlers, schemas, and docs.
+### As a Library
 
-## Quick Start
+Add to your `deps.edn`:
 
-### Prerequisites
-
-- Go 1.25+
-- An OpenAI-compatible LLM API key (DeepSeek, OpenAI, OpenRouter, etc.)
-- (Optional) A running Clojure nREPL with Mycelium on the classpath
-
-### Build
-
-```bash
-go build -o sporulator ./cmd/sporulator
+```clojure
+io.github.mycelium-clj/sporulator {:local/root "../sporulator"}
 ```
 
-### Run
+Start the server from your REPL:
+
+```clojure
+(require '[sporulator.store :as store]
+         '[sporulator.server :as server])
+
+(def db (store/open ".sporulator/sporulator.db"))
+
+(def srv (server/start!
+           {:port         8420
+            :store        db
+            :project-path (System/getProperty "user.dir")
+            :graph-llm    {:api-key "your-key"}   ;; or set GRAPH_API_KEY env var
+            :cell-llm     {:api-key "your-key"}})) ;; or set CELL_API_KEY env var
+
+;; Stop when done
+(server/stop! srv)
+```
+
+### With order-lifecycle (dev workflow)
+
+The `order-lifecycle` project includes sporulator integration in `user.clj`:
 
 ```bash
-# Minimal — just the API with LLM agents
-./sporulator \
-  --graph-key YOUR_API_KEY \
-  --cell-key YOUR_API_KEY
+cd order-lifecycle
+clj -M:dev:nrepl
+```
 
-# Full — with nREPL connection for live cell instantiation
-./sporulator \
-  --graph-key YOUR_API_KEY \
-  --cell-key YOUR_API_KEY \
-  --nrepl-port 7888
+Then from the REPL:
+
+```clojure
+(sporulator-go!)   ;; start sporulator server on port 8420
+(sporulator-halt!) ;; stop it
 ```
 
 ### Environment Variables
 
-Instead of flags, you can set environment variables:
-
 | Variable | Default | Description |
-|---|---|---|
-| `GRAPH_BASE_URL` | `https://api.deepseek.com` | Graph agent API base URL |
-| `GRAPH_API_KEY` | (none) | Graph agent API key |
-| `GRAPH_MODEL` | `deepseek-chat` | Graph agent model name |
-| `CELL_BASE_URL` | `https://api.deepseek.com` | Cell agent API base URL |
-| `CELL_API_KEY` | (none) | Cell agent API key |
-| `CELL_MODEL` | `deepseek-chat` | Cell agent model name |
+|----------|---------|-------------|
+| `GRAPH_API_KEY` | — | API key for the graph agent LLM (required for graph design) |
+| `GRAPH_BASE_URL` | `https://api.deepseek.com` | Base URL for graph agent API |
+| `GRAPH_MODEL` | `deepseek-chat` | Model name for graph agent |
+| `CELL_API_KEY` | — | API key for the cell agent LLM (required for implementation) |
+| `CELL_BASE_URL` | `https://api.deepseek.com` | Base URL for cell agent API |
+| `CELL_MODEL` | `deepseek-chat` | Model name for cell agent |
 
-### CLI Flags
+## REST API
 
-| Flag | Default | Description |
-|---|---|---|
-| `--addr` | `:8420` | HTTP listen address |
-| `--db` | `sporulator.db` | SQLite database path |
-| `--nrepl-host` | `127.0.0.1` | nREPL host |
-| `--nrepl-port` | `0` | nREPL port (connects if > 0) |
-| `--graph-url` | env or `https://api.deepseek.com` | Graph agent API URL |
-| `--graph-key` | env | Graph agent API key |
-| `--graph-model` | env or `deepseek-chat` | Graph agent model |
-| `--cell-url` | env or `https://api.deepseek.com` | Cell agent API URL |
-| `--cell-key` | env | Cell agent API key |
-| `--cell-model` | env or `deepseek-chat` | Cell agent model |
+The server exposes these endpoints at `http://localhost:8420`:
 
-## API Reference
+### Cells
+- `GET /api/cells` — list all cells with latest version
+- `GET /api/cell?id=:id` — get cell by ID
+- `POST /api/cell` — save a cell (creates new version)
+- `GET /api/cell/history?id=:id` — version history
+- `GET /api/cell/tests?id=:id` — test results
 
-### REST Endpoints
+### Manifests
+- `GET /api/manifests` — list all manifests
+- `GET /api/manifest?id=:id` — get manifest by ID
+- `POST /api/manifest` — save a manifest
+- `POST /api/manifest/export` — export manifest to disk
 
-#### Cells
+### REPL
+- `GET /api/repl/status` — connection status (always connected)
+- `POST /api/repl/eval` — evaluate Clojure code in-process
+- `POST /api/repl/instantiate` — load a cell from store into the JVM
 
-```
-GET  /api/cells              — List all cells (latest versions)
-GET  /api/cell?id=:ns/name   — Get latest version of a cell
-POST /api/cell?id=:ns/name   — Save a new cell version
-GET  /api/cell/history?id=:ns/name — Get all versions of a cell
-GET  /api/cell/tests?id=:ns/name   — Get test results for a cell
-```
+### Sessions
+- `GET /api/sessions` — list chat sessions
+- `GET /api/session?id=:id` — get session with message history
+- `DELETE /api/session?id=:id` — delete session
+- `POST /api/session/clear?id=:id` — clear messages
 
-**Save cell body:**
-```json
-{
-  "handler": "(cell/defcell :math/double ...)",
-  "schema": "{:input {:x :int} :output {:r :int}}",
-  "doc": "Doubles the input",
-  "created_by": "graph-agent"
-}
-```
+### Source Generation
+- `POST /api/source/generate` — generate .clj files from stored cells/manifests
 
-#### Manifests
+### Tools
+- `GET /api/tools/manifest` — UTCP tool manifest for Claude Code registration
 
-```
-GET  /api/manifests              — List all manifests
-GET  /api/manifest?id=:app-name  — Get latest manifest
-POST /api/manifest?id=:app-name  — Save a new manifest version
-```
+## WebSocket API
 
-**Save manifest body:**
-```json
-{
-  "body": "{:id :todo-app :cells [...] :edges [...]}",
-  "created_by": "graph-agent"
-}
-```
+Connect to `ws://localhost:8420/ws` for streaming operations:
 
-#### REPL (requires nREPL connection)
+### Client → Server
+| Message Type | Description |
+|-------------|-------------|
+| `graph_chat` | Design/modify workflow manifests via LLM |
+| `cell_implement` | Implement a cell with eval feedback loop |
+| `cell_iterate` | Send feedback to iterate on a cell |
+| `orchestrate` | Run full TDD orchestration |
+| `test_review` | Deliver test review responses |
+| `graph_review` | Deliver graph review responses |
+| `impl_review` | Deliver implementation review responses |
 
-```
-GET  /api/repl/status        — Check nREPL connection status
-POST /api/repl/eval          — Evaluate Clojure code
-POST /api/repl/instantiate   — Instantiate a cell from the store
-```
+### Server → Client
+| Message Type | Description |
+|-------------|-------------|
+| `stream_chunk` | LLM token fragment |
+| `stream_end` | Streaming complete with full content |
+| `stream_error` | LLM or processing error |
+| `feedback_event` | Eval/validation progress event |
+| `orchestrator_event` | Orchestration phase/status update |
+| `orchestrator_complete` | Orchestration finished successfully |
+| `orchestrator_error` | Orchestration failed |
+| `test_review_contracts` | Test contracts awaiting user review |
+| `graph_review_data` | Graph structure awaiting user review |
+| `impl_review_data` | Implementations awaiting user review |
 
-### WebSocket
+## Claude Code Integration
 
-Connect to `ws://host:port/ws` for streaming LLM interactions.
+Sporulator can register its API as native Claude Code tools via code-mode:
 
-**Message format:**
-```json
-{"type": "message_type", "id": "session-id", "payload": {...}}
-```
+1. Start the sporulator server
+2. Register tools:
+   ```
+   mcp__code-mode__register_manual with:
+   {"name": "sporulator",
+    "call_template_type": "http",
+    "http_method": "GET",
+    "url": "http://localhost:8420/api/tools/manifest",
+    "content_type": "application/json"}
+   ```
+3. Available tools: `sporulator.clj_eval`, `sporulator.clj_list_cells`,
+   `sporulator.clj_save_cell`, `sporulator.clj_list_manifests`, etc.
 
-**Client → Server:**
-
-| Type | Payload | Description |
-|---|---|---|
-| `graph_chat` | `{"session_id": "...", "message": "..."}` | Chat with the graph agent |
-| `cell_implement` | `{"brief": {"id": ":ns/name", "doc": "...", ...}}` | Implement a cell |
-| `cell_iterate` | `{"session_id": ":ns/name", "feedback": "..."}` | Iterate on a cell |
-
-**Server → Client:**
-
-| Type | Description |
-|---|---|
-| `stream_chunk` | LLM token chunk (`{"chunk": "..."}`) |
-| `stream_end` | Stream complete (`{"content": "full response"}`) |
-| `stream_error` | LLM error |
-| `cell_result` | Cell implementation result (`{"cell_id": "...", "code": "..."}`) |
-| `error` | General error |
-
-## Development
+## Testing
 
 ```bash
-# Run tests
-go test ./...
-
-# Run tests with nREPL integration (requires running nREPL)
-NREPL_PORT=7888 go test ./...
-
-# Build and run
-go run ./cmd/sporulator --graph-key $GRAPH_API_KEY --cell-key $CELL_API_KEY
+clj -M:test
 ```
 
-## Project Structure
+96 tests, 413 assertions covering store, eval, graph agent, cell agent, orchestrator, and source generation.
 
-```
-cmd/sporulator/     — CLI entrypoint
-pkg/
-  agents/           — Graph and cell LLM agents, code extraction
-  api/              — HTTP handlers, WebSocket hub
-  bridge/           — nREPL bridge for live Clojure interaction
-  llm/              — OpenAI-compatible chat client with streaming
-  repl/             — Low-level nREPL protocol client (bencode over TCP)
-  store/            — SQLite storage for cells, manifests, test results
-```
+## License
+
+Copyright Yogthos
