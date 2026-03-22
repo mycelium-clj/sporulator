@@ -45,6 +45,45 @@
     (io/make-parents f)
     (spit f content)))
 
+;; ── Single-file writers ─────────────────────────────────────────
+
+(defn- cell-name-from-id
+  "Extracts the cell name from a cell ID like ':order/compute-tax' → 'compute-tax'."
+  [cell-id]
+  (let [id (if (str/starts-with? (str cell-id) ":")
+             (subs (str cell-id) 1)
+             (str cell-id))]
+    (if-let [idx (str/index-of id "/")]
+      (subs id (inc idx))
+      id)))
+
+(defn write-cell!
+  "Writes a single cell's source file to disk.
+   Returns {:path relative-path}."
+  [project-path base-namespace cell-id cell-source]
+  (let [name    (cell-name-from-id cell-id)
+        ns-name (str base-namespace ".cells." name)
+        rel-path (ns-to-path ns-name)]
+    (write-file! project-path rel-path cell-source)
+    {:path rel-path :namespace ns-name}))
+
+(defn write-manifest!
+  "Writes a manifest as a namespace file and as raw EDN to resources/.
+   Returns {:path relative-path}."
+  [project-path base-namespace manifest-id manifest-body]
+  (let [clean-id (-> (str manifest-id)
+                     (str/replace ":" "")
+                     (str/replace "/" "-"))
+        ns-name  (str base-namespace ".workflows." clean-id)
+        content  (build-manifest-namespace ns-name base-namespace manifest-body #{})
+        rel-path (ns-to-path ns-name)]
+    (write-file! project-path rel-path content)
+    ;; Also write raw EDN to resources
+    (write-file! project-path "resources/manifest.edn" manifest-body)
+    {:path rel-path :namespace ns-name}))
+
+;; ── Batch generation ───────────────────────────────────────────
+
 (defn generate
   "Generates source files from cells and manifests in the store.
    Writes .clj files to output-dir.

@@ -4,6 +4,7 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [sporulator.cell-agent :as cell-agent]
+            [sporulator.source-gen :as source-gen]
             [sporulator.codegen :as codegen]
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
@@ -207,8 +208,11 @@
      :run-id       — orchestration run ID
      :on-event     — event callback
      :on-chunk     — streaming callback
-     :max-attempts — max fix attempts (default 3)"
-  [client {:keys [contract store run-id on-event on-chunk max-attempts]
+     :max-attempts — max fix attempts (default 3)
+     :project-path — project root directory for writing source files
+     :base-ns      — base namespace for source files"
+  [client {:keys [contract store run-id on-event on-chunk max-attempts
+                  project-path base-ns]
            :or   {max-attempts 3}}]
   (let [{:keys [cell-id brief test-code cell-ns]} contract
         session (or (:session contract)
@@ -279,6 +283,11 @@
                          :schema     (or (:schema brief) "")
                          :doc        (or (:doc brief) "")
                          :created-by "cell-agent-tdd"})))
+                  ;; Write source file to disk
+                  (when (and project-path base-ns)
+                    (source-gen/write-cell! project-path base-ns cell-id source)
+                    (emit on-event "cell_implement" "file_written"
+                          :cell-id cell-id))
                   {:status :ok :cell-id cell-id
                    :output (:output test-res)
                    :summary (:summary test-res)})
@@ -319,7 +328,7 @@
      :manifest-id   — manifest ID for run tracking"
   [client {:keys [leaves base-ns store on-event on-chunk
                   on-test-review auto-approve? max-attempts manifest-id
-                  spec-hash]
+                  spec-hash project-path]
            :or   {auto-approve? false max-attempts 3
                   manifest-id "" spec-hash ""}
            :as   opts}]
@@ -423,7 +432,9 @@
                              :run-id       run-id
                              :on-event     on-event
                              :on-chunk     on-chunk
-                             :max-attempts max-attempts})
+                             :max-attempts max-attempts
+                             :project-path project-path
+                             :base-ns      base-ns})
                           (catch Exception e
                             {:status  :error
                              :cell-id (:cell-id contract)

@@ -185,7 +185,7 @@
             (send-ws! ch {:type "stream_error" :id sid
                           :payload (.getMessage e)})))))))
 
-(defn- handle-orchestrate [{:keys [cell-client llm-client store]} ch msg]
+(defn- handle-orchestrate [{:keys [cell-client llm-client store project-path]} ch msg]
   (let [sid    (get-in msg [:payload :session_id])
         leaves (get-in msg [:payload :leaves])
         base-ns (get-in msg [:payload :base_ns] "app")
@@ -202,6 +202,7 @@
                          {:leaves       leaves
                           :base-ns      base-ns
                           :store        store
+                          :project-path project-path
                           :on-event     (fn [event]
                                           (send-ws! ch {:type "orchestrator_event"
                                                         :id sid

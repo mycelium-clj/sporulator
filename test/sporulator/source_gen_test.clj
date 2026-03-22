@@ -62,3 +62,39 @@
                     :base-namespace "myapp"})]
       (is (some? result))
       (is (empty? (:files result))))))
+
+;; =============================================================
+;; write-cell!
+;; =============================================================
+
+(deftest write-cell-test
+  (testing "writes a single cell source file to disk"
+    (let [source "(ns myapp.cells.compute-tax\n  (:require [mycelium.cell :as cell]))\n\n(cell/defcell :order/compute-tax\n  {:doc \"Tax\"}\n  (fn [_ d] {:tax 1}))\n"
+          result (sg/write-cell! *out-dir* "myapp" ":order/compute-tax" source)]
+      (is (some? (:path result)))
+      (is (.exists (io/file *out-dir* (:path result))))
+      (is (str/includes? (slurp (io/file *out-dir* (:path result))) "defcell"))))
+
+  (testing "creates parent directories"
+    (let [source "(ns deep.ns.cells.foo\n  (:require [mycelium.cell :as cell]))"
+          result (sg/write-cell! *out-dir* "deep.ns" ":test/foo" source)]
+      (is (.exists (io/file *out-dir* (:path result)))))))
+
+;; =============================================================
+;; write-manifest!
+;; =============================================================
+
+(deftest write-manifest-test
+  (testing "writes manifest as a namespace file"
+    (let [body "{:id :my-app :cells {:start {:id :my/cell}} :pipeline [:start]}"
+          result (sg/write-manifest! *out-dir* "myapp" ":my-app" body)]
+      (is (some? (:path result)))
+      (let [content (slurp (io/file *out-dir* (:path result)))]
+        (is (str/includes? content "(ns myapp.workflows.my-app"))
+        (is (str/includes? content "(def manifest"))
+        (is (str/includes? content body)))))
+
+  (testing "writes manifest EDN to resources"
+    (let [body "{:id :my-app :cells {} :pipeline []}"
+          result (sg/write-manifest! *out-dir* "myapp" ":my-app" body)]
+      (is (.exists (io/file *out-dir* "resources/manifest.edn"))))))

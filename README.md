@@ -10,6 +10,7 @@ Sporulator follows a structured TDD workflow:
 2. **Test** — Test contracts are generated for each cell, self-reviewed, and presented for human approval
 3. **Implement** — Cell agents implement each cell against locked tests, with an eval feedback loop that auto-fixes errors
 4. **Verify** — Implementations are evaluated in-process, tests are run, and results are tracked
+5. **Write** — Source files are written to disk as cells pass their tests
 
 The entire process runs in the same JVM as the generated code — no nREPL bridge needed. Code is evaluated directly via `load-string`, giving immediate feedback on compilation errors, test failures, and schema violations.
 
@@ -27,7 +28,7 @@ sporulator/
 ├── graph_agent.clj    # Manifest design via LLM with validation feedback
 ├── cell_agent.clj     # Cell implementation via LLM with eval feedback
 ├── orchestrator.clj   # Full TDD orchestration loop with review gates
-├── source_gen.clj     # Generate .clj source files from stored cells
+├── source_gen.clj     # Write .clj source files to project on disk
 ├── server.clj         # HTTP + WebSocket server for sporulator-ui
 └── tools.clj          # UTCP tool definitions for Claude Code integration
 ```
@@ -36,10 +37,12 @@ sporulator/
 
 ### As a Library
 
-Add to your `deps.edn`:
+Add sporulator to your project's `deps.edn`:
 
 ```clojure
 io.github.mycelium-clj/sporulator {:local/root "../sporulator"}
+;; or from git:
+;; io.github.mycelium-clj/sporulator {:git/url "..." :git/sha "..."}
 ```
 
 Start the server from your REPL:
@@ -61,21 +64,8 @@ Start the server from your REPL:
 (server/stop! srv)
 ```
 
-### With order-lifecycle (dev workflow)
-
-The `order-lifecycle` project includes sporulator integration in `user.clj`:
-
-```bash
-cd order-lifecycle
-clj -M:dev:nrepl
-```
-
-Then from the REPL:
-
-```clojure
-(sporulator-go!)   ;; start sporulator server on port 8420
-(sporulator-halt!) ;; stop it
-```
+When the orchestrator implements cells, source files are automatically written
+to `{project-path}/src/` using the configured base namespace.
 
 ### Environment Variables
 
@@ -174,7 +164,7 @@ Sporulator can register its API as native Claude Code tools via code-mode:
 clj -M:test
 ```
 
-96 tests, 413 assertions covering store, eval, graph agent, cell agent, orchestrator, and source generation.
+98 tests, 422 assertions covering store, eval, graph agent, cell agent, orchestrator, and source generation.
 
 ## License
 
