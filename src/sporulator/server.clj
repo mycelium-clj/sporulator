@@ -137,6 +137,40 @@
                           :id sid
                           :payload (.getMessage e)})))))))
 
+(defn- handle-graph-design [{:keys [llm-client store]} ch msg]
+  (let [sid     (get-in msg [:payload :session_id])
+        message (get-in msg [:payload :message])]
+    (if-not llm-client
+      (do
+        (send-ws! ch {:type "stream_chunk" :id sid
+                      :payload {:chunk "LLM not configured." :phase "decompose"}})
+        (send-ws! ch {:type "stream_end" :id sid
+                      :payload {:content "LLM not configured."}}))
+      (future
+        (try
+          (let [result (graph-agent/design-workflow
+                         llm-client sid message
+                         ;; Phase 1: decompose chunks
+                         (fn [chunk]
+                           (send-ws! ch {:type "stream_chunk" :id sid
+                                         :payload {:chunk chunk :phase "decompose"}}))
+                         :store store
+                         :on-chunk-manifest
+                         ;; Phase 2: manifest chunks
+                         (fn [chunk]
+                           (send-ws! ch {:type "stream_chunk" :id sid
+                                         :payload {:chunk chunk :phase "manifest"}}))
+                         :on-feedback
+                         (fn [event]
+                           (send-ws! ch {:type "design_event" :id sid
+                                         :payload event})))]
+            (send-ws! ch {:type "stream_end" :id sid
+                          :payload {:content (:manifest-response result)
+                                    :steps   (:steps result)}}))
+          (catch Exception e
+            (send-ws! ch {:type "stream_error" :id sid
+                          :payload (.getMessage e)})))))))
+
 (defn- handle-cell-implement [{:keys [cell-client llm-client store]} ch msg]
   (let [sid      (get-in msg [:payload :session_id])
         brief    (get-in msg [:payload :brief])
@@ -260,6 +294,7 @@
 (defn- handle-ws-message [ctx ch msg]
   (case (:type msg)
     "graph_chat"             (handle-graph-chat ctx ch msg)
+    "graph_design"           (handle-graph-design ctx ch msg)
     "cell_implement"         (handle-cell-implement ctx ch msg)
     "cell_iterate"           (handle-cell-iterate ctx ch msg)
     "orchestrate"            (handle-orchestrate ctx ch msg)

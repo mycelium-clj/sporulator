@@ -143,25 +143,33 @@
   "Two-step workflow design: first decomposes requirements into steps,
    then creates the manifest from those steps.
 
+   on-chunk-decompose — called with each token during decomposition phase
+   on-chunk-manifest  — called with each token during manifest phase
+   (If only on-chunk-decompose is provided, it's used for both phases.)
+
    Returns {:steps decomposition-response :manifest-response manifest-response}."
-  [client session-id requirements on-chunk & {:keys [store on-feedback]}]
-  (let [session (get-or-create-session session-id store)]
+  [client session-id requirements on-chunk-decompose
+   & {:keys [store on-feedback on-chunk-manifest]}]
+  (let [session (get-or-create-session session-id store)
+        on-chunk-manifest (or on-chunk-manifest on-chunk-decompose)]
     ;; Step 1: Decompose requirements into steps
     (let [decompose-msg (build-decompose-prompt requirements)]
       (persist-turn! store session-id "user" decompose-msg)
-      (let [steps-response (llm/session-send-stream session client decompose-msg on-chunk)]
+      (let [steps-response (llm/session-send-stream session client decompose-msg on-chunk-decompose)]
         (persist-turn! store session-id "assistant" steps-response)
+        (when on-feedback
+          (on-feedback {:event-type "steps_complete"
+                        :steps      steps-response}))
 
         ;; Step 2: Build manifest from the decomposed steps
         (let [manifest-msg (build-manifest-from-steps-prompt steps-response)]
           (persist-turn! store session-id "user" manifest-msg)
-          (let [manifest-response (llm/session-send-stream session client manifest-msg on-chunk)]
+          (let [manifest-response (llm/session-send-stream session client manifest-msg on-chunk-manifest)]
             (persist-turn! store session-id "assistant" manifest-response)
             (when store
               (save-response-manifest! store manifest-response))
             (when on-feedback
-              (on-feedback {:event-type "design_complete"
-                            :steps      steps-response}))
+              (on-feedback {:event-type "design_complete"}))
             {:steps             steps-response
              :manifest-response manifest-response}))))))
 
