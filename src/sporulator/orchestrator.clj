@@ -425,26 +425,28 @@
                            ;; No review callback — auto-approve
                            good-contracts))]
 
-          ;; Phase 3: Implement approved contracts
+          ;; Phase 3: Implement approved contracts in parallel
           (emit on-event "cell_implement" "started"
                 :message (str "Implementing " (count approved) " cells"))
-          (let [impl-results
+          (let [impl-futures
                 (mapv (fn [contract]
-                        (try
-                          (implement-from-contract client
-                            {:contract     contract
-                             :store        store
-                             :run-id       run-id
-                             :on-event     on-event
-                             :on-chunk     on-chunk
-                             :max-attempts max-attempts
-                             :project-path project-path
-                             :base-ns      base-ns})
-                          (catch Exception e
-                            {:status  :error
-                             :cell-id (:cell-id contract)
-                             :error   (.getMessage e)})))
+                        (future
+                          (try
+                            (implement-from-contract client
+                              {:contract     contract
+                               :store        store
+                               :run-id       run-id
+                               :on-event     on-event
+                               :on-chunk     on-chunk
+                               :max-attempts max-attempts
+                               :project-path project-path
+                               :base-ns      base-ns})
+                            (catch Exception e
+                              {:status  :error
+                               :cell-id (:cell-id contract)
+                               :error   (.getMessage e)}))))
                       approved)
+                impl-results (mapv deref impl-futures)
                 passed  (filterv #(= :ok (:status %)) impl-results)
                 failed-impl (filterv #(not= :ok (:status %)) impl-results)]
 
