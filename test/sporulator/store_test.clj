@@ -291,3 +291,89 @@
     {:run-id "run-tc4" :cell-id ":order/y" :status "approved"})
   (let [all (store/get-test-contracts *store* "run-tc4")]
     (is (= 2 (count all)))))
+
+;; =============================================================
+;; Chat sessions
+;; =============================================================
+
+(deftest create-and-get-chat-session-test
+  (testing "creates a session and retrieves it"
+    (store/create-chat-session! *store* "sess-1" "graph")
+    (let [s (store/get-chat-session *store* "sess-1")]
+      (is (some? s))
+      (is (= "sess-1" (:id s)))
+      (is (= "graph" (:agent-type s)))
+      (is (some? (:created-at s)))
+      (is (some? (:updated-at s)))))
+
+  (testing "returns nil for missing session"
+    (is (nil? (store/get-chat-session *store* "nope")))))
+
+(deftest list-chat-sessions-test
+  (testing "lists all sessions ordered by updated_at desc"
+    (store/create-chat-session! *store* "s1" "graph")
+    (store/create-chat-session! *store* "s2" "cell")
+    (store/create-chat-session! *store* "s3" "graph")
+    (let [sessions (store/list-chat-sessions *store*)]
+      (is (= 3 (count sessions)))
+      ;; All have agent-type
+      (is (every? :agent-type sessions)))))
+
+(deftest delete-chat-session-test
+  (testing "deletes session and its messages"
+    (store/create-chat-session! *store* "del-1" "graph")
+    (store/save-chat-message! *store* "del-1" "user" "hello")
+    (store/save-chat-message! *store* "del-1" "assistant" "hi")
+    (is (some? (store/get-chat-session *store* "del-1")))
+    (store/delete-chat-session! *store* "del-1")
+    (is (nil? (store/get-chat-session *store* "del-1")))
+    (is (empty? (store/load-chat-messages *store* "del-1")))))
+
+;; =============================================================
+;; Chat messages
+;; =============================================================
+
+(deftest save-and-load-chat-messages-test
+  (testing "saves messages and loads them in order"
+    (store/create-chat-session! *store* "msg-1" "graph")
+    (store/save-chat-message! *store* "msg-1" "user" "design a todo app")
+    (store/save-chat-message! *store* "msg-1" "assistant" "here is the manifest...")
+    (store/save-chat-message! *store* "msg-1" "user" "add a delete step")
+    (let [msgs (store/load-chat-messages *store* "msg-1")]
+      (is (= 3 (count msgs)))
+      (is (= "user" (:role (first msgs))))
+      (is (= "design a todo app" (:content (first msgs))))
+      (is (= "assistant" (:role (second msgs))))
+      (is (= "user" (:role (nth msgs 2))))
+      (is (some? (:created-at (first msgs)))))))
+
+(deftest load-chat-messages-empty-test
+  (testing "returns empty vec for session with no messages"
+    (store/create-chat-session! *store* "empty-1" "graph")
+    (is (empty? (store/load-chat-messages *store* "empty-1"))))
+
+  (testing "returns empty vec for nonexistent session"
+    (is (empty? (store/load-chat-messages *store* "no-such-session")))))
+
+(deftest clear-chat-messages-test
+  (testing "clears messages but keeps session"
+    (store/create-chat-session! *store* "clr-1" "graph")
+    (store/save-chat-message! *store* "clr-1" "user" "hello")
+    (store/save-chat-message! *store* "clr-1" "assistant" "hi")
+    (is (= 2 (count (store/load-chat-messages *store* "clr-1"))))
+    (store/clear-chat-messages! *store* "clr-1")
+    (is (empty? (store/load-chat-messages *store* "clr-1")))
+    (is (some? (store/get-chat-session *store* "clr-1")))))
+
+(deftest chat-session-message-count-test
+  (testing "list-chat-sessions includes message count"
+    (store/create-chat-session! *store* "cnt-1" "graph")
+    (store/save-chat-message! *store* "cnt-1" "user" "hi")
+    (store/save-chat-message! *store* "cnt-1" "assistant" "hello")
+    (store/create-chat-session! *store* "cnt-2" "cell")
+    (let [sessions (store/list-chat-sessions *store*)]
+      (is (= 2 (count sessions)))
+      (let [s1 (first (filter #(= "cnt-1" (:id %)) sessions))
+            s2 (first (filter #(= "cnt-2" (:id %)) sessions))]
+        (is (= 2 (:message-count s1)))
+        (is (= 0 (:message-count s2)))))))

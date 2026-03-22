@@ -69,7 +69,21 @@
                     feedback TEXT NOT NULL DEFAULT '', approved_at TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    UNIQUE(run_id, cell_id))"]]
+                    UNIQUE(run_id, cell_id))"
+                 "CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    agent_type TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')))"
+                 "CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE)"
+                 "CREATE INDEX IF NOT EXISTS idx_chat_messages_session
+                    ON chat_messages(session_id)"]]
       (jdbc/execute! ds [ddl]))
     {:datasource ds}))
 
@@ -118,6 +132,17 @@
   [store]
   (jdbc/execute! (ds store)
     ["SELECT c.id, c.version AS latest_version, c.doc, c.created_at
+      FROM cells c
+      INNER JOIN (SELECT id, MAX(version) AS version FROM cells GROUP BY id) latest
+        ON c.id = latest.id AND c.version = latest.version
+      ORDER BY c.id"]
+    {:builder-fn rs/as-unqualified-kebab-maps}))
+
+(defn list-latest-cells
+  "Returns all cells with their latest version's full data."
+  [store]
+  (jdbc/execute! (ds store)
+    ["SELECT c.id, c.version, c.schema, c.handler, c.doc, c.requires, c.created_at, c.created_by
       FROM cells c
       INNER JOIN (SELECT id, MAX(version) AS version FROM cells GROUP BY id) latest
         ON c.id = latest.id AND c.version = latest.version
@@ -365,3 +390,72 @@
               feedback, COALESCE(approved_at, '') AS approved_at, created_at, updated_at
         FROM test_contracts WHERE run_id = ? ORDER BY cell_id" run-id]
       {:builder-fn rs/as-unqualified-kebab-maps})))
+
+;; =============================================================
+;; Chat sessions
+;; =============================================================
+
+(defn create-chat-session!
+  "Creates a new chat session. Returns nil."
+  [store id agent-type]
+  (jdbc/execute! (ds store)
+    ["INSERT INTO chat_sessions (id, agent_type) VALUES (?, ?)"
+     id (or agent-type "")])
+  nil)
+
+(defn get-chat-session
+  "Retrieves a chat session by ID. Returns nil if not found."
+  [store id]
+  (jdbc/execute-one! (ds store)
+    ["SELECT id, agent_type, created_at, updated_at FROM chat_sessions WHERE id = ?" id]
+    {:builder-fn rs/as-unqualified-kebab-maps}))
+
+(defn list-chat-sessions
+  "Returns all chat sessions with message counts, newest first."
+  [store]
+  (jdbc/execute! (ds store)
+    ["SELECT s.id, s.agent_type, s.created_at, s.updated_at,
+             COUNT(m.id) AS message_count
+      FROM chat_sessions s
+      LEFT JOIN chat_messages m ON m.session_id = s.id
+      GROUP BY s.id
+      ORDER BY s.updated_at DESC"]
+    {:builder-fn rs/as-unqualified-kebab-maps}))
+
+(defn delete-chat-session!
+  "Deletes a chat session and all its messages."
+  [store id]
+  (jdbc/execute! (ds store)
+    ["DELETE FROM chat_messages WHERE session_id = ?" id])
+  (jdbc/execute! (ds store)
+    ["DELETE FROM chat_sessions WHERE id = ?" id])
+  nil)
+
+;; =============================================================
+;; Chat messages
+;; =============================================================
+
+(defn save-chat-message!
+  "Appends a message to a chat session. Updates the session's updated_at."
+  [store session-id role content]
+  (jdbc/execute! (ds store)
+    ["INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)"
+     session-id role (or content "")])
+  (jdbc/execute! (ds store)
+    ["UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?" session-id])
+  nil)
+
+(defn load-chat-messages
+  "Returns all messages for a session, oldest first."
+  [store session-id]
+  (jdbc/execute! (ds store)
+    ["SELECT id, session_id, role, content, created_at
+      FROM chat_messages WHERE session_id = ? ORDER BY id ASC" session-id]
+    {:builder-fn rs/as-unqualified-kebab-maps}))
+
+(defn clear-chat-messages!
+  "Deletes all messages for a session but keeps the session itself."
+  [store session-id]
+  (jdbc/execute! (ds store)
+    ["DELETE FROM chat_messages WHERE session_id = ?" session-id])
+  nil)
