@@ -101,7 +101,7 @@ WebSocket handler for `orchestrate_resume` message type.
 
 ---
 
-## Round 6: Orchestrator — Schema Validation & Integration Testing
+## Round 6: Orchestrator — Schema Validation & Integration Testing [DONE]
 
 ### 6.1 `validate-edge-schemas`
 Check schema compatibility between connected cells in a manifest.
@@ -117,7 +117,7 @@ validate end-to-end. Fix schema mismatches if found.
 
 ---
 
-## Round 7: Server — Source Generation & Graph Review
+## Round 7: Server — Source Generation & Graph Review [DONE]
 
 ### 7.1 `POST /api/source/generate`
 Generate source files from stored cells. Takes output_dir and base_namespace.

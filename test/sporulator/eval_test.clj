@@ -206,3 +206,53 @@
     (let [original "(deftest test-a\n  (is true))"]
       (is (= (str/trim original)
              (str/trim (ev/merge-test-corrections original nil)))))))
+
+;; =============================================================
+;; compile-workflow / run-workflow
+;; =============================================================
+
+(deftest compile-workflow-test
+  (testing "compiles a valid manifest EDN"
+    ;; First register a cell
+    (ev/eval-code
+      "(ns sporulator.test.cells.wf-double
+         (:require [mycelium.cell :as cell]))
+       (cell/defcell :test-wf/double
+         {:doc \"Doubles x\"
+          :input {:x :int} :output {:result :int}}
+         (fn [_ data] {:result (* 2 (:x data))}))")
+    (let [manifest "{:id :test-wf
+                     :cells {:start {:id :test-wf/double
+                                     :doc \"doubles\"
+                                     :schema {:input {:x :int} :output {:result :int}}}}
+                     :pipeline [:start]}"
+          r (ev/compile-workflow manifest)]
+      (is (= :ok (:status r)))
+      (is (some? (:compiled r)))))
+
+  (testing "returns error for unparseable EDN"
+    (let [r (ev/compile-workflow "{:id :broken :cells")]
+      (is (= :error (:status r))))))
+
+(deftest run-workflow-test
+  (testing "runs a compiled workflow end-to-end"
+    ;; Ensure cell is registered
+    (ev/eval-code
+      "(ns sporulator.test.cells.wf-run-double
+         (:require [mycelium.cell :as cell]))
+       (cell/defcell :test-wf-run/double
+         {:doc \"Doubles x\"
+          :input {:x :int} :output {:result :int}}
+         (fn [_ data] {:result (* 2 (:x data))}))")
+    (let [manifest "{:id :test-wf-run
+                     :cells {:start {:id :test-wf-run/double
+                                     :doc \"doubles\"
+                                     :schema {:input {:x :int} :output {:result :int}}}}
+                     :pipeline [:start]}"
+          r (ev/run-workflow manifest {:x 5} {})]
+      (is (= :ok (:status r)))
+      (is (= 10 (:result (:result r))))))
+
+  (testing "returns error for unparseable manifest"
+    (let [r (ev/run-workflow "{broken" {} {})]
+      (is (= :error (:status r))))))

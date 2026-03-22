@@ -1,0 +1,97 @@
+(ns sporulator.source-gen
+  "Generates Clojure source files from cells and manifests in the store."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [sporulator.store :as store]))
+
+(defn- cell-prefix
+  "Extracts the namespace prefix from a cell ID like ':order/validate' → 'order'."
+  [cell-id]
+  (let [id (if (str/starts-with? (str cell-id) ":")
+             (subs (str cell-id) 1)
+             (str cell-id))]
+    (if-let [idx (str/index-of id "/")]
+      (subs id 0 idx)
+      "core")))
+
+(defn- ns-to-path
+  "Converts a namespace like 'myapp.cells.order' to 'src/myapp/cells/order.clj'."
+  [ns-name]
+  (str "src/" (str/replace (str/replace ns-name "." "/") "-" "_") ".clj"))
+
+(defn- build-cell-namespace
+  "Generates a Clojure namespace source string for a group of cells."
+  [ns-name handlers]
+  (str "(ns " ns-name "\n"
+       "  (:require [mycelium.cell :as cell]))\n\n"
+       (str/join "\n\n" handlers) "\n"))
+
+(defn- build-manifest-namespace
+  "Generates a Clojure namespace source string for a manifest."
+  [ns-name base-ns manifest-body cell-ns-set]
+  (str "(ns " ns-name "\n"
+       "  (:require [mycelium.core :as myc]\n"
+       (str/join "\n"
+         (map #(str "            [" % "]") (sort cell-ns-set)))
+       "))\n\n"
+       "(def manifest\n  " manifest-body ")\n\n"
+       "(defn compile-workflow []\n"
+       "  (myc/pre-compile manifest))\n"))
+
+(defn- write-file!
+  "Writes content to a file, creating parent directories as needed."
+  [base-dir rel-path content]
+  (let [f (io/file base-dir rel-path)]
+    (io/make-parents f)
+    (spit f content)))
+
+(defn generate
+  "Generates source files from cells and manifests in the store.
+   Writes .clj files to output-dir.
+
+   Options:
+     :output-dir      — root directory for generated files
+     :base-namespace  — Clojure namespace prefix (e.g. 'myapp')
+
+   Returns {:files [{:path :namespace :cell-ids}...]}"
+  [store {:keys [output-dir base-namespace]}]
+  (let [cells     (store/list-latest-cells store)
+        manifests (store/list-manifests store)]
+    (if (and (empty? cells) (empty? manifests))
+      {:files []}
+      (let [;; Group cells by prefix
+            groups (group-by #(cell-prefix (:id %)) cells)
+            ;; Generate cell namespace files
+            cell-files
+            (mapv (fn [[prefix group-cells]]
+                    (let [ns-name  (str base-namespace ".cells." prefix)
+                          handlers (mapv (fn [cell]
+                                          (let [full (store/get-latest-cell store (:id cell))]
+                                            (:handler full)))
+                                        group-cells)
+                          content  (build-cell-namespace ns-name handlers)
+                          rel-path (ns-to-path ns-name)]
+                      (write-file! output-dir rel-path content)
+                      {:path      rel-path
+                       :namespace ns-name
+                       :cell-ids  (mapv :id group-cells)}))
+                  (sort-by key groups))
+            ;; Track cell namespaces for manifest requires
+            cell-ns-set (set (map :namespace cell-files))
+            ;; Generate manifest namespace files
+            manifest-files
+            (mapv (fn [m]
+                    (let [full      (store/get-latest-manifest store (:id m))
+                          clean-id  (-> (:id m)
+                                        (str/replace ":" "")
+                                        (str/replace "/" "-"))
+                          ns-name   (str base-namespace ".workflows." clean-id)
+                          content   (build-manifest-namespace
+                                      ns-name base-namespace
+                                      (:body full) cell-ns-set)
+                          rel-path  (ns-to-path ns-name)]
+                      (write-file! output-dir rel-path content)
+                      {:path      rel-path
+                       :namespace ns-name}))
+                  manifests)]
+        {:files (into cell-files manifest-files)}))))

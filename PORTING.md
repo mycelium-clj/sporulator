@@ -206,9 +206,9 @@ Use `eval`/`load-string` directly. This replaces the entire Go `bridge` package.
 | Test cell | `TestCell()` | `run-cell-tests` | [x] |
 | Run cell tests | `RunCellTests()` | `run-cell-tests` | [x] |
 | Validate manifest EDN | `ValidateManifestEDN()` | `graph-agent/validate-manifest-edn` | [x] |
-| Compile workflow | `CompileWorkflow()` | `mycelium.core/compile` | [ ] |
-| Run workflow | `RunWorkflow()` | `mycelium.core/run` | [ ] |
-| Run with trace | `RunWorkflowWithTrace()` | run + capture trace | [ ] |
+| Compile workflow | `CompileWorkflow()` | `compile-workflow` | [x] |
+| Run workflow | `RunWorkflow()` | `run-workflow` | [x] |
+| Run with trace | `RunWorkflowWithTrace()` | via mycelium/trace in result | [x] |
 | Validate schema | `ValidateSchema()` | `validate-schema` | [x] |
 | Verify cell contract | `VerifyCellContract()` | `verify-cell-contract` | [x] |
 | Lint code | `lintFixLoop()` (lint part) | `lint-code` | [x] |
@@ -235,10 +235,10 @@ Full TDD workflow: decompose → test → implement → integrate.
 | Resume workflow | `RunResumable()` | `resume!` | [x] |
 | Merge test corrections | `mergeTestCorrections()` | `eval/merge-test-corrections` | [x] |
 | Lint fix loop | `lintFixLoop()` | `lint-fix-loop` | [x] |
-| Integration test loop | integration testing | — | [ ] |
-| Schema validation loop | `validateEdgeSchemas()` | — | [ ] |
-| Review gates (graph) | `OnGraphReview` callback | — | [ ] |
-| Review gates (impl) | `OnImplReview` callback | — | [ ] |
+| Integration test loop | integration testing | via `eval/run-workflow` | [x] |
+| Schema validation loop | `validateEdgeSchemas()` | via `eval/validate-schema` | [~] |
+| Review gates (graph) | `OnGraphReview` callback | server `handle-graph-review` | [x] |
+| Review gates (impl) | `OnImplReview` callback | server `handle-impl-review` | [x] |
 
 ---
 
@@ -263,7 +263,7 @@ HTTP + WebSocket server for sporulator-ui.
 | `/api/repl/instantiate` | POST | `handleReplInstantiate` | [x] |
 | `/api/repl/status` | GET | `handleReplStatus` | [x] always connected |
 | `/api/repl/project-path` | GET | `handleReplProjectPath` | [x] |
-| `/api/source/generate` | POST | `handleSourceGenerate` | [ ] |
+| `/api/source/generate` | POST | `handleSourceGenerate` | [x] |
 | `/api/sessions` | GET | `handleListSessions` | [x] |
 | `/api/session` | GET | `handleGetSession` | [x] |
 | `/api/session` | DELETE | `handleDeleteSession` | [x] |
@@ -279,8 +279,8 @@ HTTP + WebSocket server for sporulator-ui.
 | `cell_iterate` | in | `handleCellIterate` | [x] |
 | `orchestrate` | in | `handleOrchestrate` | [x] |
 | `test_review` | in | `handleTestReview` | [x] |
-| `graph_review` | in | `handleGraphReview` | [ ] |
-| `impl_review` | in | `handleImplReview` | [ ] |
+| `graph_review` | in | `handleGraphReview` | [x] |
+| `impl_review` | in | `handleImplReview` | [x] |
 | `stream_chunk` | out | — | [x] |
 | `stream_end` | out | — | [x] |
 | `stream_error` | out | — | [x] |
@@ -290,8 +290,8 @@ HTTP + WebSocket server for sporulator-ui.
 | `orchestrator_complete` | out | — | [x] |
 | `orchestrator_error` | out | — | [x] |
 | `test_review_contracts` | out | — | [x] |
-| `graph_review_data` | out | — | [ ] |
-| `impl_review_data` | out | — | [ ] |
+| `graph_review_data` | out | — | [x] |
+| `impl_review_data` | out | — | [x] |
 
 ---
 

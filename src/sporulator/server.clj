@@ -7,6 +7,7 @@
             [sporulator.graph-agent :as graph-agent]
             [sporulator.llm :as llm]
             [sporulator.orchestrator :as orchestrator]
+            [sporulator.source-gen :as source-gen]
             [sporulator.store :as store]
             [org.httpkit.server :as http])
   (:import [java.net URLDecoder]))
@@ -221,6 +222,18 @@
     (when-let [gate (get @review-gates run-id)]
       (orchestrator/deliver-review gate responses))))
 
+(defn- handle-graph-review [_ctx _ch msg]
+  (let [run-id   (get-in msg [:payload :run_id])
+        response (get-in msg [:payload :response])]
+    (when-let [gate (get @review-gates (str run-id ":graph"))]
+      (orchestrator/deliver-review gate response))))
+
+(defn- handle-impl-review [_ctx _ch msg]
+  (let [run-id    (get-in msg [:payload :run_id])
+        responses (get-in msg [:payload :responses])]
+    (when-let [gate (get @review-gates (str run-id ":impl"))]
+      (orchestrator/deliver-review gate responses))))
+
 (defn- handle-ws-message [ctx ch msg]
   (case (:type msg)
     "graph_chat"             (handle-graph-chat ctx ch msg)
@@ -228,6 +241,8 @@
     "cell_iterate"           (handle-cell-iterate ctx ch msg)
     "orchestrate"            (handle-orchestrate ctx ch msg)
     "test_review"            (handle-test-review ctx ch msg)
+    "graph_review"           (handle-graph-review ctx ch msg)
+    "impl_review"            (handle-impl-review ctx ch msg)
     ;; default
     (send-ws! ch {:type "error"
                   :payload (str "Unknown message type: " (:type msg))})))
@@ -346,6 +361,23 @@
                 (json-response {"status" (name (:status result))
                                 "output" (:output result)
                                 "error"  (:error result)}))))))
+
+      ;; Source generation
+      (and (= method :post) (= uri "/api/source/generate"))
+      (let [{:keys [output_dir base_namespace]} (read-json-body request)]
+        (cond
+          (not output_dir)
+          (json-response {"error" "output_dir is required"} 400)
+          (not base_namespace)
+          (json-response {"error" "base_namespace is required"} 400)
+          :else
+          (try
+            (let [result (source-gen/generate store
+                           {:output-dir     output_dir
+                            :base-namespace base_namespace})]
+              (json-response result))
+            (catch Exception e
+              (json-response {"error" (.getMessage e)} 500)))))
 
       ;; Sessions
       (and (= method :get) (= uri "/api/sessions"))

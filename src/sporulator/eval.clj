@@ -88,7 +88,7 @@
             (if-not test-ns
               {:status :error
                :error  (str "Could not find test namespace: " ns-name)}
-          (let [out       (StringWriter.)
+              (let [out       (StringWriter.)
                 counters  (atom {:test 0 :pass 0 :fail 0 :error 0})
                 ;; Custom reporter that captures results without
                 ;; leaking to the parent test framework
@@ -142,6 +142,40 @@
        :error  "mycelium.cell/get-cell! not found on classpath"})
     (catch Exception e
       {:status :error :error (.getMessage e)})))
+
+;; ── Workflow compilation & execution ───────────────────────────
+
+(defn compile-workflow
+  "Compiles a manifest EDN string into a runnable workflow.
+   Returns {:status :ok :compiled workflow} or {:status :error :error msg}."
+  [manifest-edn-str]
+  (let [r (eval-code
+            (str "(require 'mycelium.core)\n"
+                 "(mycelium.core/pre-compile " manifest-edn-str ")"))]
+    (if (= :ok (:status r))
+      {:status :ok :compiled (:result r) :output (:output r)}
+      {:status :error :error (or (:error r) "Compilation failed")
+       :output (:output r)})))
+
+(defn run-workflow
+  "Compiles and runs a workflow with the given input data and resources.
+   Returns {:status :ok :result data} or {:status :error :error msg}."
+  [manifest-edn-str input resources]
+  (try
+    (let [compile-result (compile-workflow manifest-edn-str)]
+      (if (not= :ok (:status compile-result))
+        compile-result
+        (let [run-fn  (requiring-resolve 'mycelium.core/run-compiled)
+              error?  (requiring-resolve 'mycelium.core/error?)
+              wf-err  (requiring-resolve 'mycelium.core/workflow-error)
+              result  (run-fn (:compiled compile-result) resources input)]
+          (if (error? result)
+            {:status :error
+             :error  (pr-str (wf-err result))
+             :result result}
+            {:status :ok :result result}))))
+    (catch Exception e
+      {:status :error :error (ex-message e)})))
 
 ;; ── Schema validation ──────────────────────────────────────────
 

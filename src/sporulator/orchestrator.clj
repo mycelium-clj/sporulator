@@ -120,7 +120,7 @@
             test-code     (codegen/assemble-test-source
                             {:test-ns  test-ns
                              :cell-ns  cell-ns
-                             :cell-id  (keyword (subs cell-id 1))
+                             :cell-id  (keyword (subs (str cell-id) 1))
                              :test-body final-body})
             contract      {:cell-id      cell-id
                            :brief        brief
