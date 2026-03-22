@@ -1,2 +1,7 @@
 sporulator
 *.db
+.cpcache/
+.nrepl-port
+target/
+*.class
+*.jar
