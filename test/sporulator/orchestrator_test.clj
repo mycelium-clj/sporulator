@@ -183,11 +183,11 @@
                :on-chunk     (fn [_])
                :auto-approve? true
                :max-attempts  3}))]
-      (is (= :ok (:status result)))
+      (is (= "ok" (get result "status")))
       ;; Should have events
       (is (pos? (count @events)))
       ;; Should have a run in store
-      (is (some? (:run-id result))))))
+      (is (some? (get result "run_id"))))))
 
 ;; =============================================================
 ;; lint-fix-loop
@@ -284,7 +284,7 @@
                :manifest-id ":test-resume-app"
                :on-event (fn [_]) :on-chunk (fn [_])
                :auto-approve? true :max-attempts 3}))]
-      (is (= :ok (:status first-result)))
+      (is (= "ok" (get first-result "status")))
       ;; Now resume — should detect previous run
       (let [resume-result
             (with-redefs
@@ -297,4 +297,4 @@
                  :on-chunk    (fn [_])
                  :auto-approve? true}))]
         (is (some? resume-result))
-        (is (= :ok (:status resume-result)))))))
+        (is (= "ok" (get resume-result "status")))))))

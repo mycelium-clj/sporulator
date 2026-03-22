@@ -33,10 +33,15 @@
 ;; ── Events ─────────────────────────────────────────────────────
 
 (defn- emit
-  "Emits an orchestrator event via the callback."
+  "Emits an orchestrator event via the callback.
+   Converts keys to snake_case strings for consistent JSON serialization."
   [on-event phase status & {:as extra}]
   (when on-event
-    (on-event (merge {:phase phase :status status} extra))))
+    (let [base {"phase" phase "status" status}
+          converted (reduce-kv (fn [m k v]
+                                 (assoc m (str/replace (name k) "-" "_") v))
+                               base extra)]
+      (on-event converted))))
 
 ;; ── Namespace helpers ──────────────────────────────────────────
 
@@ -463,10 +468,10 @@
                     :passed (count passed)
                     :failed (+ (count failed) (count failed-impl)))
 
-              {:status       (if (= "completed" final-status) :ok :partial)
-               :run-id       run-id
-               :passed       (mapv :cell-id passed)
-               :failed       (into (mapv :cell-id failed)
+              {"status"      (if (= "completed" final-status) "ok" "partial")
+               "run_id"      run-id
+               "passed"      (mapv :cell-id passed)
+               "failed"      (into (mapv :cell-id failed)
                                    (mapv :cell-id failed-impl))
                :results      impl-results})))))))
 
@@ -516,8 +521,8 @@
             (if (empty? failed)
               (do (emit on-event "resume" "all_passed"
                         :message "All cells from previous run passed")
-                  {:status :ok :run-id (:id prev-run)
-                   :passed passed :failed []})
+                  {"status" "ok" "run_id" (:id prev-run)
+                   "passed" passed "failed" []})
 
               ;; Re-implement failed cells
               (do (emit on-event "resume" "implementing"

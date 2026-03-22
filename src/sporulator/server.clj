@@ -292,7 +292,7 @@
                                                         :payload {:chunk chunk}}))
                           :max-attempts 3})]
             (swap! review-gates dissoc run-id)
-            (send-ws! ch {:type (if (= :ok (:status result))
+            (send-ws! ch {:type (if (= "ok" (get result "status"))
                                   "orchestrator_complete"
                                   "orchestrator_error")
                           :id sid
