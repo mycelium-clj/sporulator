@@ -137,6 +137,50 @@
                           :id sid
                           :payload (.getMessage e)})))))))
 
+(defn- handle-graph-decompose [{:keys [llm-client store]} ch msg]
+  (let [sid     (get-in msg [:payload :session_id])
+        message (get-in msg [:payload :message])]
+    (if-not llm-client
+      (do
+        (send-ws! ch {:type "stream_chunk" :id sid
+                      :payload {:chunk "LLM not configured." :phase "decompose"}})
+        (send-ws! ch {:type "decompose_end" :id sid
+                      :payload {:content "LLM not configured."}}))
+      (future
+        (try
+          (let [steps (graph-agent/decompose-requirements
+                        llm-client sid message
+                        (fn [chunk]
+                          (send-ws! ch {:type "stream_chunk" :id sid
+                                        :payload {:chunk chunk :phase "decompose"}}))
+                        :store store)]
+            (send-ws! ch {:type "decompose_end" :id sid
+                          :payload {:content steps}}))
+          (catch Exception e
+            (send-ws! ch {:type "stream_error" :id sid
+                          :payload (.getMessage e)})))))))
+
+(defn- handle-graph-approve [{:keys [llm-client store]} ch msg]
+  (let [sid      (get-in msg [:payload :session_id])
+        feedback (get-in msg [:payload :feedback])]
+    (if-not llm-client
+      (send-ws! ch {:type "stream_end" :id sid
+                    :payload {:content "LLM not configured."}})
+      (future
+        (try
+          (let [response (graph-agent/build-manifest
+                           llm-client sid
+                           (fn [chunk]
+                             (send-ws! ch {:type "stream_chunk" :id sid
+                                           :payload {:chunk chunk :phase "manifest"}}))
+                           :store store
+                           :feedback (when (seq feedback) feedback))]
+            (send-ws! ch {:type "stream_end" :id sid
+                          :payload {:content response}}))
+          (catch Exception e
+            (send-ws! ch {:type "stream_error" :id sid
+                          :payload (.getMessage e)})))))))
+
 (defn- handle-graph-design [{:keys [llm-client store]} ch msg]
   (let [sid     (get-in msg [:payload :session_id])
         message (get-in msg [:payload :message])]
@@ -294,6 +338,8 @@
 (defn- handle-ws-message [ctx ch msg]
   (case (:type msg)
     "graph_chat"             (handle-graph-chat ctx ch msg)
+    "graph_decompose"        (handle-graph-decompose ctx ch msg)
+    "graph_approve"          (handle-graph-approve ctx ch msg)
     "graph_design"           (handle-graph-design ctx ch msg)
     "cell_implement"         (handle-cell-implement ctx ch msg)
     "cell_iterate"           (handle-cell-iterate ctx ch msg)

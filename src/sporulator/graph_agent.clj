@@ -139,6 +139,39 @@
        "- Every cell needs :id, :doc, and :schema with :input and :output\n"
        "- Use :pipeline for linear flows, :edges for branching\n"))
 
+(defn decompose-requirements
+  "Step 1 only: decomposes requirements into processing steps.
+   Returns the steps response string. Session is preserved for step 2."
+  [client session-id requirements on-chunk & {:keys [store]}]
+  (let [session (get-or-create-session session-id store)
+        msg     (build-decompose-prompt requirements)]
+    (persist-turn! store session-id "user" msg)
+    (let [response (llm/session-send-stream session client msg on-chunk)]
+      (persist-turn! store session-id "assistant" response)
+      response)))
+
+(defn build-manifest
+  "Step 2: builds manifest from the decomposed steps (already in session).
+   If feedback is provided, sends it to the LLM first to revise the steps,
+   then builds the manifest from the revised understanding."
+  [client session-id on-chunk & {:keys [store feedback]}]
+  (let [session (get-or-create-session session-id store)]
+    ;; If user gave feedback, send it first so LLM adjusts
+    (when feedback
+      (let [fb-msg (str "Before building the manifest, incorporate this feedback on the steps:\n\n"
+                        feedback "\n\nNow adjust your understanding accordingly.")]
+        (persist-turn! store session-id "user" fb-msg)
+        (let [response (llm/session-send-stream session client fb-msg on-chunk)]
+          (persist-turn! store session-id "assistant" response))))
+    ;; Build the manifest
+    (let [manifest-msg (build-manifest-from-steps-prompt nil)]
+      (persist-turn! store session-id "user" manifest-msg)
+      (let [response (llm/session-send-stream session client manifest-msg on-chunk)]
+        (persist-turn! store session-id "assistant" response)
+        (when store
+          (save-response-manifest! store response))
+        response))))
+
 (defn design-workflow
   "Two-step workflow design: first decomposes requirements into steps,
    then creates the manifest from those steps.
