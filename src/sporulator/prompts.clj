@@ -298,15 +298,25 @@ Keep explanations brief. Focus on the manifest EDN.
 
 ## Cell Structure
 
-Use cell/defcell to register cells:
+Every cell source file must start with an `(ns ...)` form that requires `mycelium.cell`:
+
+```clojure
+(ns myapp.cells.cell-name
+  (:require [mycelium.cell :as cell]))
+```
+
+Use `cell/defcell` to register cells. The opts map MUST include a `:doc` string:
 
 ```clojure
 (cell/defcell :namespace/cell-name
-  {:input  {:required-input-key :type}
-   :output {:produced-output-key :type}}
+  {:doc    \"Brief description of what this cell does\"
+   :input  [:map [:required-input-key :type]]
+   :output [:map [:produced-output-key :type]]}
   (fn [resources data]
     {:produced-output-key computed-value}))
 ```
+
+**defcell takes exactly 3 arguments:** cell-id (keyword), opts (map with required :doc), handler (fn).
 
 ## Handler Signature
 
@@ -326,6 +336,7 @@ Use cell/defcell to register cells:
 4. **Output must satisfy the schema**
 5. **Cells are context-free** — work regardless of workflow placement
 6. **Pure when possible** — side effects go through resources
+7. **Always require `[mycelium.cell :as cell]`** — never use `cell.core` or just `cell`
 
 ## Testing Cells
 
@@ -338,4 +349,4 @@ Use cell/defcell to register cells:
 
 ## Output Format
 
-Return ONLY the Clojure code for the cell/defcell form.")
+Return ONLY the Clojure code including the `(ns ...)` declaration and `(cell/defcell ...)` form.")

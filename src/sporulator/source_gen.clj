@@ -67,6 +67,16 @@
     (write-file! project-path rel-path cell-source)
     {:path rel-path :namespace ns-name}))
 
+(defn write-test!
+  "Writes a single cell's test file to disk.
+   Returns {:path relative-path :namespace ns-name}."
+  [project-path base-namespace cell-id test-source]
+  (let [name     (cell-name-from-id cell-id)
+        ns-name  (str base-namespace ".cells." name "-test")
+        rel-path (str "test/" (str/replace (str/replace ns-name "." "/") "-" "_") ".clj")]
+    (write-file! project-path rel-path test-source)
+    {:path rel-path :namespace ns-name}))
+
 (defn write-manifest!
   "Writes a manifest as a namespace file and as raw EDN to resources/.
    Returns {:path relative-path}."

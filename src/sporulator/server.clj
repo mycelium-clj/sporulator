@@ -1,11 +1,14 @@
 (ns sporulator.server
   "HTTP + WebSocket server for the sporulator UI."
-  (:require [clojure.data.json :as json]
+  (:require [cljfmt.core :as cljfmt]
+            [clojure.data.json :as json]
+            [zprint.core :as zp]
             [clojure.string :as str]
             [sporulator.cell-agent :as cell-agent]
             [sporulator.eval :as ev]
             [sporulator.graph-agent :as graph-agent]
             [sporulator.llm :as llm]
+            [sporulator.manifest-validate :as mv]
             [sporulator.orchestrator :as orchestrator]
             [sporulator.source-gen :as source-gen]
             [sporulator.store :as store]
@@ -264,10 +267,15 @@
                           :payload (.getMessage e)})))))))
 
 (defn- handle-orchestrate [{:keys [cell-client llm-client store project-path]} ch msg]
-  (let [sid    (get-in msg [:payload :session_id])
-        leaves (get-in msg [:payload :leaves])
-        base-ns (get-in msg [:payload :base_ns] "app")
-        client (or cell-client llm-client)]
+  (let [sid         (get-in msg [:payload :session_id])
+        leaves      (get-in msg [:payload :leaves])
+        base-ns     (get-in msg [:payload :base_ns] "app")
+        manifest-id (get-in msg [:payload :manifest_id])
+        client      (or cell-client llm-client)
+        ;; Load manifest from store for graph context + validation
+        manifest    (when (and store manifest-id)
+                      (when-let [m (store/get-latest-manifest store manifest-id)]
+                        (mv/parse-manifest (:body m))))]
     (if-not client
       (send-ws! ch {:type "stream_error" :id sid :payload "LLM not configured."})
       (future
@@ -278,6 +286,9 @@
                 result (orchestrator/orchestrate!
                          client
                          {:leaves       leaves
+                          :manifest     (when (and manifest (not (:error manifest)))
+                                          manifest)
+                          :manifest-id  (or manifest-id "")
                           :base-ns      base-ns
                           :store        store
                           :project-path project-path
@@ -319,6 +330,85 @@
     (when-let [gate (get @review-gates (str run-id ":impl"))]
       (orchestrator/deliver-review gate responses))))
 
+;; ── Interactive orchestration handlers ─────────────────────────
+
+(defn- handle-start-orchestration [{:keys [cell-client llm-client store project-path]} ch msg]
+  (let [sid         (get-in msg [:payload :session_id])
+        leaves      (get-in msg [:payload :leaves])
+        base-ns     (get-in msg [:payload :base_ns] "app")
+        manifest-id (get-in msg [:payload :manifest_id])
+        client      (or cell-client llm-client)
+        manifest    (when (and store manifest-id)
+                      (when-let [m (store/get-latest-manifest store manifest-id)]
+                        (mv/parse-manifest (:body m))))]
+    (if-not client
+      (send-ws! ch {:type "stream_error" :id sid :payload "LLM not configured."})
+      (let [run-id (orchestrator/start-orchestration! client
+                     {:leaves       leaves
+                      :manifest     (when (and manifest (not (:error manifest))) manifest)
+                      :manifest-id  (or manifest-id "")
+                      :base-ns      base-ns
+                      :store        store
+                      :project-path project-path
+                      :on-event     (fn [event]
+                                      (send-ws! ch {:type "orchestrator_event"
+                                                    :id sid
+                                                    :payload event}))
+                      :on-chunk     (fn [chunk]
+                                      (send-ws! ch {:type "stream_chunk"
+                                                    :id sid
+                                                    :payload {:chunk chunk}}))})]
+        (send-ws! ch {:type "orchestration_started" :id sid
+                      :payload {"run_id" run-id}})))))
+
+(defn- handle-approve-tests [_ctx ch msg]
+  (let [sid     (get-in msg [:payload :session_id])
+        run-id  (get-in msg [:payload :run_id])
+        cell-id (get-in msg [:payload :cell_id])]
+    (orchestrator/approve-tests! run-id cell-id)
+    (send-ws! ch {:type "ack" :id sid :payload {"action" "approve_tests" "cell_id" cell-id}})))
+
+(defn- handle-reject-tests [_ctx ch msg]
+  (let [sid      (get-in msg [:payload :session_id])
+        run-id   (get-in msg [:payload :run_id])
+        cell-id  (get-in msg [:payload :cell_id])
+        feedback (get-in msg [:payload :feedback] "")]
+    (orchestrator/reject-tests! run-id cell-id feedback)
+    (send-ws! ch {:type "ack" :id sid :payload {"action" "reject_tests" "cell_id" cell-id}})))
+
+(defn- handle-save-tests [_ctx ch msg]
+  (let [sid       (get-in msg [:payload :session_id])
+        run-id    (get-in msg [:payload :run_id])
+        cell-id   (get-in msg [:payload :cell_id])
+        test-code (get-in msg [:payload :test_code])]
+    (orchestrator/save-tests! run-id cell-id test-code)
+    (send-ws! ch {:type "ack" :id sid :payload {"action" "save_tests" "cell_id" cell-id}})))
+
+(defn- handle-approve-impl [_ctx ch msg]
+  (let [sid     (get-in msg [:payload :session_id])
+        run-id  (get-in msg [:payload :run_id])
+        cell-id (get-in msg [:payload :cell_id])]
+    (orchestrator/approve-impl! run-id cell-id)
+    (send-ws! ch {:type "ack" :id sid :payload {"action" "approve_impl" "cell_id" cell-id}})))
+
+(defn- handle-reject-impl [_ctx ch msg]
+  (let [sid      (get-in msg [:payload :session_id])
+        run-id   (get-in msg [:payload :run_id])
+        cell-id  (get-in msg [:payload :cell_id])
+        feedback (get-in msg [:payload :feedback] "")]
+    (orchestrator/reject-impl! run-id cell-id feedback)
+    (send-ws! ch {:type "ack" :id sid :payload {"action" "reject_impl" "cell_id" cell-id}})))
+
+(defn- handle-save-impl [_ctx ch msg]
+  (let [sid     (get-in msg [:payload :session_id])
+        run-id  (get-in msg [:payload :run_id])
+        cell-id (get-in msg [:payload :cell_id])
+        source  (get-in msg [:payload :source])]
+    (orchestrator/save-impl! run-id cell-id source)
+    (send-ws! ch {:type "ack" :id sid :payload {"action" "save_impl" "cell_id" cell-id}})))
+
+;; ── WS message router ────────────────────────────────────────
+
 (defn- handle-ws-message [ctx ch msg]
   (case (:type msg)
     "graph_chat"             (handle-graph-chat ctx ch msg)
@@ -331,6 +421,14 @@
     "test_review"            (handle-test-review ctx ch msg)
     "graph_review"           (handle-graph-review ctx ch msg)
     "impl_review"            (handle-impl-review ctx ch msg)
+    ;; Interactive orchestration
+    "start_orchestration"    (handle-start-orchestration ctx ch msg)
+    "approve_tests"          (handle-approve-tests ctx ch msg)
+    "reject_tests"           (handle-reject-tests ctx ch msg)
+    "save_tests"             (handle-save-tests ctx ch msg)
+    "approve_impl"           (handle-approve-impl ctx ch msg)
+    "reject_impl"            (handle-reject-impl ctx ch msg)
+    "save_impl"              (handle-save-impl ctx ch msg)
     ;; default
     (send-ws! ch {:type "error"
                   :payload (str "Unknown message type: " (:type msg))})))
@@ -370,7 +468,12 @@
       (and (= method :get) (= uri "/api/cell"))
       (if-let [id (query-param request "id")]
         (if-let [cell (store/get-latest-cell store id)]
-          (json-response (transform-keys cell))
+          (json-response (transform-keys
+                           (update cell :handler
+                                   (fn [h] (if (seq h)
+                                             (try (zp/zprint-str h {:parse-string? true :width 80})
+                                                  (catch Exception _ h))
+                                             h)))))
           (json-response {"error" "not found"} 404))
         (json-response {"error" "missing id"} 400))
 
@@ -393,6 +496,60 @@
       (if-let [id (query-param request "id")]
         (json-response (mapv transform-keys (store/get-latest-test-results store id 50)))
         (json-response {"error" "missing id"} 400))
+
+      ;; Test contracts for a cell (from any run)
+      (and (= method :get) (= uri "/api/cell/test-contract"))
+      (let [cell-id (query-param request "id")
+            run-id  (query-param request "run_id")]
+        (if-not cell-id
+          (json-response {"error" "missing id"} 400)
+          (if run-id
+            ;; Specific run
+            (if-let [tc (store/get-test-contract store run-id cell-id)]
+              (json-response (transform-keys tc))
+              (json-response {"error" "not found"} 404))
+            ;; Latest run with this cell
+            (let [contracts (store/get-test-contracts-for-cell store cell-id)]
+              (if (seq contracts)
+                (json-response (transform-keys (last contracts)))
+                (json-response {"error" "not found"} 404))))))
+
+      ;; Run tests for a cell
+      (and (= method :post) (= uri "/api/cell/run-tests"))
+      (let [{:keys [handler test-code test_code]} (read-json-body request)
+            test-src (or test-code test_code)]
+        (if-not (and handler test-src)
+          (json-response {"error" "missing handler or test-code"} 400)
+          ;; Extract the cell namespace from the test require and wrap handler if needed
+          (let [cell-ns-match (re-find #"\[([a-z][a-z0-9._-]+)\]" test-src)
+                cell-ns-name  (when cell-ns-match (second cell-ns-match))
+                ;; If handler doesn't have (ns ...), wrap it in the cell namespace
+                handler-src   (if (re-find #"^\s*\(ns\s" handler)
+                                handler
+                                (str "(ns " (or cell-ns-name "sporulator.tmp-cell")
+                                     "\n  (:require [mycelium.cell :as cell]))\n\n"
+                                     handler))
+                eval-res (ev/eval-code handler-src)]
+            (if (not= :ok (:status eval-res))
+              (json-response {"status" "error"
+                              "error" (or (:error eval-res) "Handler eval failed")
+                              "output" (or (:output eval-res) "")})
+              (let [test-res (ev/run-cell-tests test-src)]
+                (json-response {"status" (name (:status test-res))
+                                "passed" (boolean (:passed? test-res))
+                                "summary" (:summary test-res)
+                                "output" (or (:output test-res) "")
+                                "error" (:error test-res)}))))))
+
+      ;; Format code
+      (and (= method :post) (= uri "/api/format"))
+      (let [{:keys [code]} (read-json-body request)]
+        (if-not code
+          (json-response {"error" "missing code"} 400)
+          (json-response {"formatted" (try (zp/zprint-str code {:parse-string? true
+                                                                 :parse-string-all? true
+                                                                 :width 80})
+                                           (catch Exception _ code))})))
 
       ;; Manifests
       (and (= method :get) (= uri "/api/manifests"))

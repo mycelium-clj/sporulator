@@ -391,6 +391,16 @@
         FROM test_contracts WHERE run_id = ? ORDER BY cell_id" run-id]
       {:builder-fn rs/as-unqualified-kebab-maps})))
 
+(defn get-test-contracts-for-cell
+  "Returns all test contracts for a given cell ID across all runs, newest first."
+  [store cell-id]
+  (mapv scan-contract
+    (jdbc/execute! (ds store)
+      ["SELECT id, run_id, cell_id, test_code, test_body, review_notes, status, revision,
+              feedback, COALESCE(approved_at, '') AS approved_at, created_at, updated_at
+        FROM test_contracts WHERE cell_id = ? ORDER BY created_at DESC" cell-id]
+      {:builder-fn rs/as-unqualified-kebab-maps})))
+
 ;; =============================================================
 ;; Chat sessions
 ;; =============================================================

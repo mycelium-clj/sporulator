@@ -1,7 +1,9 @@
 (ns sporulator.orchestrator
   "TDD orchestrator: generate tests → review → implement → verify.
    Coordinates graph and cell agents through the full workflow."
-  (:require [clojure.data.json :as json]
+  (:require [cljfmt.core :as cljfmt]
+            [clojure.data.json :as json]
+            [zprint.core :as zp]
             [clojure.string :as str]
             [sporulator.cell-agent :as cell-agent]
             [sporulator.source-gen :as source-gen]
@@ -9,8 +11,21 @@
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
             [sporulator.llm :as llm]
+            [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
+
+;; ── Formatting ────────────────────────────────────────────────
+
+(defn- format-source
+  "Formats Clojure source code with zprint. Returns original on failure."
+  [source]
+  (try
+    (zp/zprint-str source {:parse-string? true :parse-string-all? true :width 80})
+    (catch Exception _
+      ;; Fallback to cljfmt for files with multiple top-level forms
+      (try (cljfmt/reformat-string source)
+           (catch Exception _ source)))))
 
 ;; ── Review gates ───────────────────────────────────────────────
 
@@ -276,7 +291,7 @@
 
                 ;; Tests passed
                 (:passed? test-res)
-                (do
+                (let [formatted-source (format-source source)]
                   (emit on-event "cell_test" "passed" :cell-id cell-id
                         :attempt (inc attempt))
                   ;; Save cell to store
@@ -284,13 +299,13 @@
                     (let [defcell-code (extract/extract-defcell content)]
                       (store/save-cell! store
                         {:id         cell-id
-                         :handler    (or defcell-code source)
+                         :handler    (format-source (or defcell-code source))
                          :schema     (or (:schema brief) "")
                          :doc        (or (:doc brief) "")
                          :created-by "cell-agent-tdd"})))
-                  ;; Write source file to disk
+                  ;; Write formatted source file to disk
                   (when (and project-path base-ns)
-                    (source-gen/write-cell! project-path base-ns cell-id source)
+                    (source-gen/write-cell! project-path base-ns cell-id formatted-source)
                     (emit on-event "cell_implement" "file_written"
                           :cell-id cell-id))
                   {:status :ok :cell-id cell-id
@@ -323,6 +338,7 @@
 
    Options:
      :leaves        — vector of leaf cell maps (cell-id, doc, schemas, etc.)
+     :manifest      — parsed manifest map (used for graph context + validation)
      :base-ns       — namespace prefix
      :store         — store instance
      :on-event      — event callback
@@ -331,7 +347,7 @@
      :auto-approve? — skip review gates (default false)
      :max-attempts  — max fix attempts per cell (default 3)
      :manifest-id   — manifest ID for run tracking"
-  [client {:keys [leaves base-ns store on-event on-chunk
+  [client {:keys [leaves manifest base-ns store on-event on-chunk
                   on-test-review auto-approve? max-attempts manifest-id
                   spec-hash project-path]
            :or   {auto-approve? false max-attempts 3
@@ -351,17 +367,31 @@
 
     (emit on-event "manifest" "started" :run-id run-id)
 
-    ;; Build briefs from leaves (accept both kebab and underscore keys from JSON)
-    (let [briefs (mapv (fn [leaf]
+    ;; Build reverse mapping: cell-id → cell-name (for graph context lookup)
+    (let [id->cell-name (when manifest
+                          (into {} (map (fn [[cell-name cell-def]]
+                                         [(:id cell-def) cell-name]))
+                                (:cells manifest)))
+
+          ;; Build briefs from leaves (accept both kebab and underscore keys from JSON)
+          briefs (mapv (fn [leaf]
                          (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
                                doc (or (:doc leaf) "")
                                input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
                                output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
-                               requires (or (:requires leaf) [])]
+                               requires (or (:requires leaf) [])
+                               ;; Build graph context from manifest
+                               cell-name (when id->cell-name
+                                           (get id->cell-name (keyword cell-id)
+                                                (get id->cell-name cell-id)))
+                               context (when (and manifest cell-name)
+                                         (let [ctx (mv/build-graph-context manifest cell-name)]
+                                           (mv/format-graph-context ctx)))]
                            {:id       cell-id
                             :doc      doc
                             :schema   (str "{:input " input-schema " :output " output-schema "}")
-                            :requires requires}))
+                            :requires requires
+                            :context  context}))
                        leaves)]
 
       ;; Phase 1: Generate test contracts
@@ -455,6 +485,19 @@
                 passed  (filterv #(= :ok (:status %)) impl-results)
                 failed-impl (filterv #(not= :ok (:status %)) impl-results)]
 
+            ;; Phase 4: Post-implementation workflow compilation check
+            (when (and manifest (seq passed) (empty? failed) (empty? failed-impl))
+              (emit on-event "compile" "started")
+              (try
+                (let [compile-result (ev/compile-workflow (pr-str manifest))]
+                  (if (= :ok (:status compile-result))
+                    (emit on-event "compile" "passed")
+                    (emit on-event "compile" "failed"
+                          :error (:error compile-result))))
+                (catch Exception e
+                  (emit on-event "compile" "failed"
+                        :error (.getMessage e)))))
+
             ;; Update run status and tree
             (let [final-status (if (and (empty? failed) (empty? failed-impl))
                                  "completed" "partial")
@@ -535,3 +578,391 @@
                                        :input-schema "{}"
                                        :output-schema "{}"})
                                     failed)))))))))))
+
+;; ── Interactive orchestration (event-driven) ─────────────────
+
+(defonce ^:private runs (atom {}))
+
+(defn get-run
+  "Returns the current state for an orchestration run."
+  [run-id]
+  (get @runs run-id))
+
+(defn- update-cell-status!
+  "Updates a cell's status in the run state and emits an event."
+  [run-id cell-id new-status & {:as extra}]
+  (swap! runs assoc-in [run-id :cells cell-id :status] new-status)
+  (let [run (get @runs run-id)
+        on-event (get-in run [:callbacks :on-event])]
+    (apply emit on-event "cell_status" (name new-status)
+           :cell_id cell-id :run_id run-id
+           (mapcat identity extra))))
+
+(defn- run-cell-count [run-id status]
+  (count (filter #(= status (:status (val %)))
+                 (get-in @runs [run-id :cells]))))
+
+(defn- check-orchestration-complete!
+  "Checks if all cells are done and emits orchestration_complete if so."
+  [run-id]
+  (let [run    (get @runs run-id)
+        cells  (:cells run)
+        total  (count cells)
+        done   (count (filter #(= :done (:status (val %))) cells))]
+    (when (= done total)
+      (let [on-event (get-in run [:callbacks :on-event])
+            cell-ids (keys cells)]
+        (when (:store run)
+          (store/update-run-tree! (:store run) run-id "completed"
+            (json/write-str {:passed (vec cell-ids) :failed []})))
+        (emit on-event "complete" "done"
+              :run_id run-id :passed total :failed 0)))))
+
+(defn start-orchestration!
+  "Starts interactive orchestration: creates run, writes manifest to disk,
+   generates tests for all cells in parallel. Emits test_ready per cell.
+   Does NOT block — returns the run-id immediately."
+  [client {:keys [leaves manifest base-ns store project-path
+                  on-event on-chunk manifest-id]
+           :or   {base-ns "app" manifest-id ""}}]
+  (let [run-id   (str "run-" (System/nanoTime))
+        on-event (or on-event (fn [_]))
+        on-chunk (or on-chunk (fn [_]))
+
+        ;; Build reverse mapping for graph context
+        id->cell-name (when manifest
+                        (into {} (map (fn [[cn cd]] [(:id cd) cn]))
+                              (:cells manifest)))
+
+        ;; Build briefs from leaves
+        briefs (mapv (fn [leaf]
+                       (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
+                             doc (or (:doc leaf) "")
+                             input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
+                             output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
+                             requires (or (:requires leaf) [])
+                             cell-name (when id->cell-name
+                                         (get id->cell-name (keyword cell-id)
+                                              (get id->cell-name cell-id)))
+                             context (when (and manifest cell-name)
+                                       (let [ctx (mv/build-graph-context manifest cell-name)]
+                                         (mv/format-graph-context ctx)))]
+                         {:id       cell-id
+                          :doc      doc
+                          :schema   (str "{:input " input-schema " :output " output-schema "}")
+                          :requires requires
+                          :context  context}))
+                     leaves)
+
+        ;; Initialize per-cell state
+        cells-init (into {} (map (fn [brief]
+                                   [(:id brief) {:status :test_generating
+                                                 :brief  brief}])
+                                 briefs))]
+
+    ;; Create run in store
+    (when store
+      (store/create-run! store
+        {:id run-id :spec-hash "" :manifest-id manifest-id :status "running"}))
+
+    ;; Write manifest to disk
+    (when (and project-path manifest)
+      (source-gen/write-manifest! project-path base-ns
+        (or manifest-id (str (:id manifest)))
+        (pr-str manifest)))
+
+    ;; Store run state
+    (swap! runs assoc run-id
+      {:cells        cells-init
+       :base-ns      base-ns
+       :manifest     manifest
+       :client       client
+       :store        store
+       :project-path project-path
+       :callbacks    {:on-event on-event :on-chunk on-chunk}})
+
+    (emit on-event "orchestration" "started"
+          :run_id run-id
+          :cell_ids (mapv :id briefs))
+
+    ;; Generate tests for all cells in parallel
+    (doseq [brief briefs]
+      (future
+        (try
+          (let [contract (generate-test-contract client
+                           {:brief    brief
+                            :base-ns  base-ns
+                            :store    store
+                            :run-id   run-id
+                            :on-event on-event
+                            :on-chunk on-chunk})]
+            (swap! runs assoc-in [run-id :cells (:id brief) :contract] contract)
+            (swap! runs assoc-in [run-id :cells (:id brief) :status] :test_ready)
+            ;; Emit test_ready with the test code
+            (emit on-event "cell_status" "test_ready"
+                  :cell_id (:id brief)
+                  :run_id run-id
+                  :test_code (:test-code contract)
+                  :test_body (:test-body contract)))
+          (catch Exception e
+            (swap! runs assoc-in [run-id :cells (:id brief) :status] :test_error)
+            (emit on-event "cell_status" "test_error"
+                  :cell_id (:id brief)
+                  :run_id run-id
+                  :error (.getMessage e))))))
+
+    run-id))
+
+(defn approve-tests!
+  "Approves a cell's tests. Writes test file to disk, starts implementation."
+  [run-id cell-id]
+  (let [run      (get @runs run-id)
+        cell     (get-in run [:cells cell-id])
+        contract (:contract cell)
+        store    (:store run)
+        client   (:client run)
+        base-ns  (:base-ns run)
+        on-event (get-in run [:callbacks :on-event])
+        on-chunk (get-in run [:callbacks :on-chunk])]
+    (when contract
+      ;; Update store
+      (when store
+        (store/update-test-contract-status! store run-id cell-id "approved"))
+      ;; Write test file to disk
+      (when (:project-path run)
+        (source-gen/write-test! (:project-path run) base-ns cell-id
+          (:test-code contract)))
+      (update-cell-status! run-id cell-id :test_approved)
+
+      ;; Start implementation in background
+      (swap! runs assoc-in [run-id :cells cell-id :status] :implementing)
+      (emit on-event "cell_status" "implementing"
+            :cell_id cell-id :run_id run-id)
+      (future
+        (try
+          (let [result (implement-from-contract client
+                         {:contract     contract
+                          :store        store
+                          :run-id       run-id
+                          :on-event     on-event
+                          :on-chunk     on-chunk
+                          :max-attempts 3
+                          :project-path nil ;; don't write to disk yet
+                          :base-ns      base-ns})]
+            (if (= :ok (:status result))
+              ;; Implementation succeeded — get source from store (where implement-from-contract saved it)
+              (let [latest-cell (when store (store/get-latest-cell store cell-id))
+                    impl-source (format-source (or (:handler latest-cell) ""))]
+                (if (seq impl-source)
+                  (do
+                    (swap! runs update-in [run-id :cells cell-id]
+                           assoc :impl-source impl-source :status :impl_ready)
+                    (emit on-event "cell_status" "impl_ready"
+                          :cell_id cell-id
+                          :run_id run-id
+                          :source impl-source
+                          :test_output (or (:output result) "")))
+                  (do
+                    (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
+                    (emit on-event "cell_status" "impl_error"
+                          :cell_id cell-id :run_id run-id
+                          :error "Implementation produced no source code"))))
+              (do
+                (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
+                (emit on-event "cell_status" "impl_error"
+                      :cell_id cell-id
+                      :run_id run-id
+                      :error (or (:error result) "Implementation failed")))))
+          (catch Exception e
+            (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
+            (emit on-event "cell_status" "impl_error"
+                  :cell_id cell-id :run_id run-id
+                  :error (.getMessage e))))))))
+
+(defn reject-tests!
+  "Rejects a cell's tests with feedback. Re-generates tests."
+  [run-id cell-id feedback]
+  (let [run      (get @runs run-id)
+        cell     (get-in run [:cells cell-id])
+        contract (:contract cell)
+        client   (:client run)
+        base-ns  (:base-ns run)
+        store    (:store run)
+        on-event (get-in run [:callbacks :on-event])
+        on-chunk (get-in run [:callbacks :on-chunk])]
+    (when contract
+      (update-cell-status! run-id cell-id :test_generating)
+      (future
+        (try
+          (let [session (or (:session contract)
+                            (llm/create-session (str "test:" cell-id) prompts/cell-prompt))
+                msg     (str "The tests need changes. Please regenerate:\n\n"
+                             feedback
+                             "\n\nReturn ONLY the corrected `deftest` forms.")
+                content (llm/session-send-stream session client msg on-chunk)
+                body    (or (extract/extract-first-code-block content) content)
+                cell-ns  (cell-ns-name base-ns cell-id)
+                test-ns  (test-ns-name base-ns cell-id)
+                cell-kw  (let [s (str cell-id)]
+                           (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+                test-code (codegen/assemble-test-source
+                            {:test-ns  test-ns
+                             :cell-ns  cell-ns
+                             :cell-id  cell-kw
+                             :test-body body})
+                new-contract (assoc contract
+                               :test-code test-code
+                               :test-body body
+                               :revision (inc (or (:revision contract) 0)))]
+            (when store
+              (store/save-test-contract! store
+                {:run-id run-id :cell-id cell-id
+                 :test-code test-code :test-body body
+                 :status "pending"
+                 :revision (:revision new-contract)
+                 :feedback feedback}))
+            (swap! runs assoc-in [run-id :cells cell-id :contract] new-contract)
+            (swap! runs assoc-in [run-id :cells cell-id :status] :test_ready)
+            (emit on-event "cell_status" "test_ready"
+                  :cell_id cell-id :run_id run-id
+                  :test_code test-code :test_body body))
+          (catch Exception e
+            (swap! runs assoc-in [run-id :cells cell-id :status] :test_error)
+            (emit on-event "cell_status" "test_error"
+                  :cell_id cell-id :run_id run-id
+                  :error (.getMessage e))))))))
+
+(defn save-tests!
+  "Saves user-edited test code. Updates store, writes to disk, starts implementation."
+  [run-id cell-id test-code]
+  (let [run      (get @runs run-id)
+        cell     (get-in run [:cells cell-id])
+        contract (:contract cell)
+        store    (:store run)]
+    (when contract
+      (let [new-revision (inc (or (:revision contract) 0))
+            new-contract (assoc contract
+                           :test-code test-code
+                           :test-body (:test-body contract) ;; preserve original test-body
+                           :revision new-revision)]
+        ;; Update contract in run state FIRST so approve-tests! uses the edited code
+        (swap! runs assoc-in [run-id :cells cell-id :contract] new-contract)
+        ;; Update store
+        (when store
+          (store/save-test-contract! store
+            {:run-id run-id :cell-id cell-id
+             :test-code test-code
+             :test-body (or (:test-body contract) "")
+             :status "approved"
+             :revision new-revision}))
+        ;; Delegate to approve flow (writes edited test-code to disk + starts implementation)
+        (approve-tests! run-id cell-id)))))
+
+(defn approve-impl!
+  "Approves a cell's implementation. Formats, writes to disk, saves to store."
+  [run-id cell-id]
+  (let [run         (get @runs run-id)
+        cell        (get-in run [:cells cell-id])
+        source      (format-source (or (:impl-source cell) ""))
+        store       (:store run)
+        base-ns     (:base-ns run)
+        brief       (:brief cell)
+        on-event    (get-in run [:callbacks :on-event])]
+    (if-not (seq source)
+      (emit on-event "cell_status" "impl_error"
+            :cell_id cell-id :run_id run-id
+            :error "No implementation source to approve")
+      (do
+        ;; Write to disk
+        (when (:project-path run)
+          (source-gen/write-cell! (:project-path run) base-ns cell-id source))
+        ;; Save to store
+        (when store
+          (store/save-cell! store
+            {:id         cell-id
+             :handler    source
+             :schema     (or (:schema brief) "")
+             :doc        (or (:doc brief) "")
+             :created-by "cell-agent-interactive"}))
+        (swap! runs assoc-in [run-id :cells cell-id :status] :done)
+        (emit on-event "cell_status" "done"
+              :cell_id cell-id :run_id run-id)
+        (check-orchestration-complete! run-id)))))
+
+(defn reject-impl!
+  "Rejects a cell's implementation with feedback. Re-implements."
+  [run-id cell-id feedback]
+  (let [run      (get @runs run-id)
+        cell     (get-in run [:cells cell-id])
+        contract (:contract cell)
+        client   (:client run)
+        store    (:store run)
+        base-ns  (:base-ns run)
+        on-event (get-in run [:callbacks :on-event])
+        on-chunk (get-in run [:callbacks :on-chunk])]
+    (when contract
+      (update-cell-status! run-id cell-id :implementing)
+      (future
+        (try
+          (let [session (or (:session contract)
+                            (llm/create-session (str "impl:" cell-id) prompts/cell-prompt))
+                msg     (str "The implementation needs changes:\n\n" feedback
+                             "\n\nPlease fix and return the corrected source "
+                             "including `(ns ...)` and `(cell/defcell ...)`.")
+                content (llm/session-send-stream session client msg on-chunk)
+                source  (format-source
+                          (or (extract/extract-first-code-block content) content))]
+            ;; Eval + run tests
+            (let [eval-res (ev/eval-code source)]
+              (let [[test-output passed?]
+                    (if (not= :ok (:status eval-res))
+                      [(str "Eval error: " (:error eval-res)) false]
+                      (let [test-res (ev/run-cell-tests (:test-code contract))]
+                        [(or (:output test-res) "")
+                         (and (= :ok (:status test-res)) (:passed? test-res))]))]
+                (swap! runs update-in [run-id :cells cell-id]
+                       assoc :impl-source source :status :impl_ready)
+                (emit on-event "cell_status" "impl_ready"
+                      :cell_id cell-id :run_id run-id
+                      :source source
+                      :test_output test-output
+                      :tests_passed passed?))))
+          (catch Exception e
+            (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
+            (emit on-event "cell_status" "impl_error"
+                  :cell_id cell-id :run_id run-id
+                  :error (.getMessage e))))))))
+
+(defn save-impl!
+  "Saves user-edited implementation. Evals, runs tests. If pass: writes to disk."
+  [run-id cell-id source]
+  (let [run      (get @runs run-id)
+        cell     (get-in run [:cells cell-id])
+        contract (:contract cell)
+        store    (:store run)
+        on-event (get-in run [:callbacks :on-event])
+        source   (format-source source)]
+    (when contract
+      ;; Eval the code
+      (let [eval-res (ev/eval-code source)]
+        (if (not= :ok (:status eval-res))
+          (do
+            (swap! runs assoc-in [run-id :cells cell-id :impl-source] source)
+            (emit on-event "cell_status" "impl_ready"
+                  :cell_id cell-id :run_id run-id
+                  :source source
+                  :test_output (str "Eval error: " (:error eval-res))
+                  :tests_passed false))
+          ;; Run tests
+          (let [test-res (ev/run-cell-tests (:test-code contract))]
+            (if (and (= :ok (:status test-res)) (:passed? test-res))
+              (do
+                (swap! runs assoc-in [run-id :cells cell-id :impl-source] source)
+                (approve-impl! run-id cell-id))
+              (do
+                (swap! runs assoc-in [run-id :cells cell-id :impl-source] source)
+                (emit on-event "cell_status" "impl_ready"
+                      :cell_id cell-id :run_id run-id
+                      :source source
+                      :test_output (or (:output test-res) "Tests failed")
+                      :tests_passed false)))))))))

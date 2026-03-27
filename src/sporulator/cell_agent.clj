@@ -39,7 +39,8 @@
          "\n**Required resources:** none\n")
        (when context
          (str "\n**Workflow position (predecessors/successors):**\n" context "\n"))
-       "\nReturn the complete `cell/defcell` form."))
+       "\nReturn the complete source including `(ns ... (:require [mycelium.cell :as cell]))` "
+       "and `(cell/defcell ...)` with a `:doc` string in the opts map."))
 
 ;; ── Result extraction ──────────────────────────────────────────
 

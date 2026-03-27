@@ -1,9 +1,9 @@
 (ns sporulator.graph-agent
   "Graph agent for designing Mycelium workflow manifests via LLM."
-  (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [sporulator.extract :as extract]
             [sporulator.llm :as llm]
+            [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
 
@@ -20,41 +20,51 @@
            (str/includes? text ":pipeline"))))
 
 (defn validate-manifest-edn
-  "Parses an EDN string and checks it looks like a valid manifest.
-   Returns {:status :ok :manifest parsed-map}
+  "Parses an EDN string and validates it as a manifest.
+   Uses read-string (not edn/read-string) to handle (fn ...) in dispatches.
+   Runs structural validation (reachability, schemas, edges) and schema
+   compatibility checking between connected cells.
+   Returns {:status :ok :manifest normalized-map}
         or {:status :parse-error :error message}
-        or {:status :invalid-manifest :error message}."
+        or {:status :invalid-manifest :error message :issues [...] :mismatches [...]}."
   [edn-str]
-  (try
-    (let [parsed (edn/read-string edn-str)]
-      (if (and (map? parsed)
-               (contains? parsed :id)
-               (contains? parsed :cells)
-               (or (contains? parsed :edges)
-                   (contains? parsed :pipeline)))
-        {:status :ok :manifest parsed}
+  (let [parsed (mv/parse-manifest edn-str)]
+    (if (:error parsed)
+      {:status :parse-error :error (:error parsed)}
+      (if-not (and (map? parsed)
+                   (contains? parsed :id)
+                   (contains? parsed :cells)
+                   (or (contains? parsed :edges)
+                       (contains? parsed :pipeline)))
         {:status :invalid-manifest
-         :error  "Manifest must contain :id, :cells, and :edges or :pipeline"}))
-    (catch Exception e
-      {:status :parse-error
-       :error  (.getMessage e)})))
+         :error  "Manifest must contain :id, :cells, and :edges or :pipeline"}
+        ;; Run full programmatic validation
+        (let [result (mv/validate-manifest parsed)]
+          (case (:status result)
+            :ok      {:status :ok :manifest (:manifest result)}
+            :warning {:status     :ok
+                      :manifest   (:manifest result)
+                      :mismatches (:mismatches result)}
+            :error   {:status :invalid-manifest
+                      :error  (mv/format-issues result)
+                      :issues (:issues result)
+                      :mismatches (:mismatches result)}))))))
 
 (defn extract-manifest
   "Extracts the first manifest from an LLM response.
-   Looks for fenced code blocks, parses as EDN, validates structure.
-   Returns the parsed manifest map or nil."
+   Looks for fenced code blocks, parses with read-string (handles fn forms),
+   validates structure. Returns the parsed manifest map or nil."
   [response]
   (when-let [block (extract/extract-first-code-block response)]
     (when (looks-like-manifest? block)
-      (try
-        (let [parsed (edn/read-string block)]
-          (when (and (map? parsed)
-                     (contains? parsed :id)
-                     (contains? parsed :cells)
-                     (or (contains? parsed :edges)
-                         (contains? parsed :pipeline)))
-            parsed))
-        (catch Exception _ nil)))))
+      (let [parsed (mv/parse-manifest block)]
+        (when (and (map? parsed)
+                   (not (:error parsed))
+                   (contains? parsed :id)
+                   (contains? parsed :cells)
+                   (or (contains? parsed :edges)
+                       (contains? parsed :pipeline)))
+          parsed)))))
 
 ;; ── Session management ─────────────────────────────────────────
 
@@ -258,8 +268,11 @@
                   content)
                 ;; Validation failed — retry if we have attempts left
                 (if (< attempt max-retries)
-                  (let [fix-msg (str "The manifest failed to parse:\n"
+                  (let [fix-msg (str "The manifest has validation issues:\n"
                                      (:error validation)
+                                     (when (:mismatches validation)
+                                       (str "\n\n" (mv/format-issues
+                                                     {:mismatches (:mismatches validation)})))
                                      "\n\nPlease fix the manifest and return the corrected EDN.")]
                     (when on-feedback
                       (on-feedback {:event-type "error"
