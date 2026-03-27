@@ -520,26 +520,69 @@
             test-src (or test-code test_code)]
         (if-not (and handler test-src)
           (json-response {"error" "missing handler or test-code"} 400)
-          ;; Extract the cell namespace from the test require and wrap handler if needed
+          ;; Combine handler + test into one source and eval together.
+          ;; This avoids the issue where require can't find the cell namespace
+          ;; on disk since it was only created via eval.
           (let [cell-ns-match (re-find #"\[([a-z][a-z0-9._-]+)\]" test-src)
                 cell-ns-name  (when cell-ns-match (second cell-ns-match))
-                ;; If handler doesn't have (ns ...), wrap it in the cell namespace
+                ;; Wrap bare defcell in a namespace if needed
                 handler-src   (if (re-find #"^\s*\(ns\s" handler)
                                 handler
                                 (str "(ns " (or cell-ns-name "sporulator.tmp-cell")
                                      "\n  (:require [mycelium.cell :as cell]))\n\n"
                                      handler))
-                eval-res (ev/eval-code handler-src)]
+                ;; Replace the cell require in test source with a direct namespace ref
+                ;; since the cell ns was created via eval, not from a file
+                test-src-fixed (if cell-ns-name
+                                 (str/replace test-src
+                                   (str "[" cell-ns-name "]")
+                                   (str "[" cell-ns-name " :as _cell-ns]"))
+                                 test-src)
+                ;; Eval handler + tests together in one load-string call
+                combined      (str handler-src "\n\n" test-src-fixed)
+                eval-res      (ev/eval-code combined)]
             (if (not= :ok (:status eval-res))
+              ;; Eval failed — try to give a useful error
               (json-response {"status" "error"
-                              "error" (or (:error eval-res) "Handler eval failed")
+                              "error" (or (:error eval-res) "Eval failed")
                               "output" (or (:output eval-res) "")})
-              (let [test-res (ev/run-cell-tests test-src)]
-                (json-response {"status" (name (:status test-res))
-                                "passed" (boolean (:passed? test-res))
-                                "summary" (:summary test-res)
-                                "output" (or (:output test-res) "")
-                                "error" (:error test-res)}))))))
+              ;; Eval succeeded — now run the tests
+              (let [test-ns-name (second (re-find #"\(ns\s+(\S+)" test-src))
+                    test-ns      (when test-ns-name (find-ns (symbol test-ns-name)))]
+                (if-not test-ns
+                  (json-response {"status" "error"
+                                  "error" (str "Test namespace not found: " test-ns-name)
+                                  "output" (or (:output eval-res) "")})
+                  (let [out       (java.io.StringWriter.)
+                        counters  (atom {:test 0 :pass 0 :fail 0 :error 0})
+                        reporter  (fn [m]
+                                    (case (:type m)
+                                      :begin-test-ns nil
+                                      :end-test-ns nil
+                                      :begin-test-var (swap! counters update :test inc)
+                                      :pass (swap! counters update :pass inc)
+                                      :fail (do (swap! counters update :fail inc)
+                                                (.write out
+                                                  (str "\nFAIL in " (clojure.test/testing-vars-str m) "\n"
+                                                       (:message m "")
+                                                       "\nexpected: " (pr-str (:expected m))
+                                                       "\n  actual: " (pr-str (:actual m)) "\n")))
+                                      :error (do (swap! counters update :error inc)
+                                                 (.write out
+                                                   (str "\nERROR in " (clojure.test/testing-vars-str m) "\n"
+                                                        (:message m "")
+                                                        "\n  actual: " (pr-str (:actual m)) "\n")))
+                                      :summary nil
+                                      nil))
+                        _         (binding [*out* out
+                                            clojure.test/report reporter]
+                                    (clojure.test/run-tests test-ns))
+                        summary   @counters]
+                    (json-response {"status" "ok"
+                                    "passed" (and (zero? (:fail summary))
+                                                  (zero? (:error summary)))
+                                    "summary" summary
+                                    "output" (str (:output eval-res) (str out))}))))))))
 
       ;; Format code
       (and (= method :post) (= uri "/api/format"))
