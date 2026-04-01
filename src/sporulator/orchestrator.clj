@@ -269,7 +269,36 @@
                   extracted (or (extract/extract-first-code-block fixed) fixed)]
               (recur extracted (inc attempt)))))))))
 
-;; ── Structural validation ──────────────────────────────────────
+;; ── Structural auto-fix + validation ──────────────────────────
+
+(defn- auto-fix-cell-source
+  "Mechanically fixes known deterministic issues in cell source code.
+   Corrects namespace name and cell ID since these are known values."
+  [source cell-id cell-ns]
+  (let [expected-id (cond-> (str cell-id)
+                      (str/starts-with? (str cell-id) ":") (subs 1))
+        ;; Fix namespace: replace wrong ns name with correct one
+        source (if-let [[_ found-ns] (re-find #"\(ns\s+(\S+)" source)]
+                 (if (and cell-ns (not= found-ns cell-ns))
+                   (str/replace-first source (re-pattern (java.util.regex.Pattern/quote found-ns)) cell-ns)
+                   source)
+                 source)
+        ;; Fix cell ID: replace wrong cell ID with correct one
+        source (if-let [[_ found-id] (re-find #"defcell\s+:(\S+)" source)]
+                 (if (not= found-id expected-id)
+                   (str/replace-first source (str ":" found-id) (str ":" expected-id))
+                   source)
+                 source)
+        ;; Add (ns ...) if missing entirely
+        source (if (re-find #"(?m)^\s*\(ns\s" source)
+                 source
+                 (str "(ns " cell-ns "\n  (:require [mycelium.cell :as cell]))\n\n" source))
+        ;; Add [mycelium.cell :as cell] if ns exists but require is missing
+        source (if (and (re-find #"\(ns\s" source)
+                        (not (re-find #"mycelium\.cell" source)))
+                 (str/replace-first source #"\(ns\s+(\S+)\s*\)" (str "(ns $1\n  (:require [mycelium.cell :as cell]))"))
+                 source)]
+    source))
 
 (defn- validate-cell-source
   "Validates cell source code structurally before eval.
@@ -361,7 +390,8 @@
         (emit on-event "cell_implement" "written" :cell-id cell-id
               :attempt (inc attempt))
 
-        ;; Structural validation before eval
+        ;; Auto-fix deterministic issues (namespace, cell ID) then validate
+        (let [source (auto-fix-cell-source source cell-id cell-ns)]
         (if-let [issues (validate-cell-source source cell-id cell-ns)]
           ;; Structural problems — fix before attempting eval
           (do
@@ -461,7 +491,7 @@
                     {:status :error
                      :error  (str "Tests failed after " (inc attempt) " attempts")
                      :cell-id cell-id
-                     :output (:output test-res)})))))))))))
+                     :output (:output test-res)}))))))))))))
 ;; ── Main orchestration ─────────────────────────────────────────
 
 (defn orchestrate!
