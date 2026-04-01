@@ -352,15 +352,41 @@
 ;; ── Implementation ─────────────────────────────────────────────
 
 (defn- build-impl-prompt
-  "Builds the prompt to implement a cell against its test contract."
+  "Builds the prompt to implement a cell against its test contract.
+   Asks the LLM to return ONLY the handler function (and optional helpers).
+   The ns, defcell, doc, schema, requires are injected by codegen."
   [{:keys [brief test-body]}]
-  (str "Implement the following Mycelium cell. The tests are already written "
-       "and locked — your code must pass them.\n\n"
-       (cell-agent/build-cell-prompt brief)
-       "\n\n**Tests your implementation must pass:**\n```clojure\n"
+  (str "Implement the handler function for the following Mycelium cell.\n\n"
+       "**Cell ID:** `" (:id brief) "`\n"
+       (when (:doc brief)
+         (str "**Purpose:** " (:doc brief) "\n"))
+       (when (:schema brief)
+         (str "**Schema:** `" (:schema brief) "`\n"))
+       (when (seq (:requires brief))
+         (str "**Resources available in handler:**\n"
+              (str/join "\n"
+                (map (fn [r]
+                       (let [doc (get (:resource-docs brief) (keyword r)
+                                     (get (:resource-docs brief) r))]
+                         (if doc
+                           (str "- `" r "` — " doc)
+                           (str "- `" r "`"))))
+                     (:requires brief)))
+              "\n\nAccess via: `(let [{:keys ["
+              (str/join " " (map name (:requires brief)))
+              "]} resources] ...)`\n"))
+       (when (:context brief)
+         (str "\n" (:context brief) "\n"))
+       "\n**Tests your implementation must pass:**\n```clojure\n"
        test-body "\n```\n"
        (when (prompts/needs-math-precision? (:schema brief))
-         (str "\n" prompts/math-precision-rules "\n"))))
+         (str "\n" prompts/math-precision-rules "\n"))
+       "\nReturn ONLY:\n"
+       "1. (OPTIONAL) Helper functions — define any helper `defn` forms you need\n"
+       "2. (REQUIRED) `(fn [resources data] ...)` — MUST be the LAST form\n\n"
+       "If you need extra requires beyond `[mycelium.cell :as cell]`, list each as a comment:\n"
+       ";; REQUIRE: [clojure.string :as str]\n\n"
+       "Do NOT include `(ns ...)` or `(cell/defcell ...)` — those are generated for you.\n"))
 
 (defn implement-from-contract
   "Implements a cell from a test contract using the LLM + eval feedback loop.
@@ -385,30 +411,36 @@
     (loop [msg     (build-impl-prompt contract)
            attempt 0]
       (let [content  (llm/session-send-stream session client msg on-chunk)
-            source   (or (extract/extract-first-code-block content) content)]
+            raw-code (or (extract/extract-first-code-block content) content)
+            ;; Extract fn body + helpers from LLM response, assemble with codegen
+            fn-body       (extract/extract-fn-body raw-code)
+            helpers       (extract/extract-helpers raw-code)
+            extra-requires (extract/extract-extra-requires raw-code)
+            cell-id-kw    (let [s (str cell-id)]
+                            (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+            ;; Parse schema from brief string
+            schema-parsed (try (binding [*read-eval* false]
+                                 (clojure.edn/read-string (:schema brief)))
+                               (catch Exception _ {:input [:map] :output [:map]}))
+            ;; If LLM returned a full (ns ...) + (cell/defcell ...) form, use it directly
+            ;; Otherwise assemble from extracted parts
+            source (if fn-body
+                     (codegen/assemble-cell-source
+                       {:cell-ns        cell-ns
+                        :cell-id        cell-id-kw
+                        :doc            (or (:doc brief) "")
+                        :schema         schema-parsed
+                        :requires       (mapv keyword (or (:requires brief) []))
+                        :extra-requires (or extra-requires [])
+                        :helpers        (or helpers [])
+                        :fn-body        fn-body})
+                     ;; Fallback: LLM returned full source, auto-fix it
+                     (auto-fix-cell-source raw-code cell-id cell-ns))]
 
         (emit on-event "cell_implement" "written" :cell-id cell-id
               :attempt (inc attempt))
 
-        ;; Auto-fix deterministic issues (namespace, cell ID) then validate
-        (let [source (auto-fix-cell-source source cell-id cell-ns)]
-        (if-let [issues (validate-cell-source source cell-id cell-ns)]
-          ;; Structural problems — fix before attempting eval
-          (do
-            (emit on-event "cell_implement" "error" :cell-id cell-id
-                  :message (str "Structural: " (first (str/split-lines issues)))
-                  :attempt (inc attempt))
-            (when store
-              (store/save-cell-attempt! store
-                {:run-id run-id :cell-id cell-id :attempt-type "implement"
-                 :attempt-number (inc attempt) :code source
-                 :output issues :passed? false}))
-            (if (< attempt max-attempts)
-              (recur (build-structural-fix-prompt source issues cell-id cell-ns)
-                     (inc attempt))
-              {:status :error :error issues :cell-id cell-id}))
-
-        ;; Structure OK — eval the implementation
+        ;; Eval the assembled implementation
         (let [eval-res (ev/eval-code source)]
           (if (not= :ok (:status eval-res))
             ;; Eval failed
@@ -491,7 +523,7 @@
                     {:status :error
                      :error  (str "Tests failed after " (inc attempt) " attempts")
                      :cell-id cell-id
-                     :output (:output test-res)}))))))))))))
+                     :output (:output test-res)}))))))))))
 ;; ── Main orchestration ─────────────────────────────────────────
 
 (defn orchestrate!
