@@ -419,15 +419,24 @@
                                      (clojure.edn/read-string (:schema brief)))
                                 fix-keys (fn fix-keys [v]
                                            (cond
-                                             (and (map? v) (every? string? (keys v)))
+                                             ;; Map with string or symbol keys → keyword-key map (lite Malli)
+                                             (and (map? v)
+                                                  (seq v)
+                                                  (every? #(or (string? %) (symbol? %)) (keys v)))
                                              (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
+                                             ;; Already keyword-keyed map → pass through (valid lite Malli)
+                                             (and (map? v) (seq v) (every? keyword? (keys v)))
+                                             v
+                                             ;; Vector starting with "map" string → convert to [:map ...]
                                              (and (vector? v) (= "map" (first v)))
                                              (into [:map] (map (fn [entry]
                                                                   (if (vector? entry)
                                                                     [(keyword (first entry)) (keyword (second entry))]
                                                                     (keyword entry)))
                                                                 (rest v)))
+                                             ;; String or symbol → keyword
                                              (string? v) (keyword v)
+                                             (symbol? v) (keyword v)
                                              :else v))]
                             {:input  (fix-keys (:input raw))
                              :output (fix-keys (:output raw))})
