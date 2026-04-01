@@ -247,6 +247,42 @@
             (send-ws! ch {:type "stream_error" :id sid
                           :payload (.getMessage e)})))))))
 
+(defn- handle-test-regenerate [{:keys [cell-client llm-client store]} ch msg]
+  (let [sid      (get-in msg [:payload :session_id])
+        brief    (get-in msg [:payload :brief])
+        feedback (get-in msg [:payload :feedback])
+        base-ns  (get-in msg [:payload :base_ns] "app")
+        client   (or cell-client llm-client)]
+    (if-not client
+      (send-ws! ch {:type "stream_error" :id sid :payload "LLM not configured."})
+      (future
+        (try
+          (let [;; Add feedback to the brief doc so the agent knows what to change
+                brief-with-feedback (if (seq feedback)
+                                     (update brief :doc str "\n\nTest feedback: " feedback)
+                                     brief)
+                run-id (str "test-regen-" (System/nanoTime))
+                contract (orchestrator/generate-test-contract client
+                           {:brief    brief-with-feedback
+                            :base-ns  base-ns
+                            :store    store
+                            :run-id   run-id
+                            :on-event (fn [event]
+                                        (send-ws! ch {:type "orchestrator_event"
+                                                      :id sid :payload event}))
+                            :on-chunk (fn [chunk]
+                                        (send-ws! ch {:type "stream_chunk"
+                                                      :id sid
+                                                      :payload {:chunk chunk}}))})]
+            (send-ws! ch {:type "test_result" :id sid
+                          :payload {"cell_id"   (:cell-id contract)
+                                    "test_code" (:test-code contract)
+                                    "test_body" (:test-body contract)
+                                    "status"    "ok"}}))
+          (catch Exception e
+            (send-ws! ch {:type "stream_error" :id sid
+                          :payload (.getMessage e)})))))))
+
 (defn- handle-cell-iterate [{:keys [cell-client llm-client]} ch msg]
   (let [sid      (get-in msg [:payload :session_id])
         feedback (get-in msg [:payload :feedback])
@@ -417,6 +453,7 @@
     "graph_design"           (handle-graph-design ctx ch msg)
     "cell_implement"         (handle-cell-implement ctx ch msg)
     "cell_iterate"           (handle-cell-iterate ctx ch msg)
+    "test_regenerate"        (handle-test-regenerate ctx ch msg)
     "orchestrate"            (handle-orchestrate ctx ch msg)
     "test_review"            (handle-test-review ctx ch msg)
     "graph_review"           (handle-graph-review ctx ch msg)
