@@ -201,10 +201,12 @@
                             (or (extract/extract-first-code-block review-resp)
                                 test-body))
             ;; Assemble full test source
+            cell-id-kw    (let [s (str cell-id)]
+                            (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
             test-code     (codegen/assemble-test-source
                             {:test-ns  test-ns
                              :cell-ns  cell-ns
-                             :cell-id  (keyword (subs (str cell-id) 1))
+                             :cell-id  cell-id-kw
                              :test-body final-body})
             contract      {:cell-id      cell-id
                            :brief        brief
