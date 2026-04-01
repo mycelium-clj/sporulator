@@ -16,6 +16,58 @@
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
 
+;; ── System EDN reading ────────────────────────────────────────
+
+(def ^:private aero-readers
+  "Data readers for Aero/Integrant tags so we can parse system.edn
+   without the Aero runtime. Maps tags to tolerant handler functions."
+  {'or       second        ;; #or [a b] → b (default)
+   'env      identity      ;; #env FOO → "FOO"
+   'long     identity      ;; #long "3000" → "3000"
+   'profile  identity      ;; #profile {...} → {...}
+   'ig/ref   identity      ;; #ig/ref :key → :key
+   'ig/refset identity     ;; #ig/refset :key → :key
+   'app-path identity})    ;; #app-path → identity
+
+(defn read-system-edn
+  "Reads a system.edn file tolerantly, handling Aero/Integrant reader tags.
+   Returns the parsed map, or nil on failure."
+  [path]
+  (try
+    (let [f (java.io.File. (str path))]
+      (when (.exists f)
+        (clojure.edn/read-string {:readers aero-readers} (slurp f))))
+    (catch Exception _ nil)))
+
+(defn extract-resource-docs
+  "Extracts :mycelium/doc metadata from a parsed system.edn map.
+   Cross-references with :reitit.routes/pages to find the key name
+   each resource is injected under (e.g. :db, not :sqlite).
+   Returns {resource-keyword doc-string}."
+  [sys-edn]
+  (when sys-edn
+    (let [;; Build mapping: integrant-key → :mycelium/doc
+          docs-by-ig-key (->> sys-edn
+                              (keep (fn [[k v]]
+                                      (when (and (map? v) (:mycelium/doc v))
+                                        [k (:mycelium/doc v)])))
+                              (into {}))
+          ;; Get the routes config to find injection key names
+          ;; :reitit.routes/pages {:db #ig/ref :db/sqlite} → :db/sqlite is injected as :db
+          routes-cfg (get sys-edn :reitit.routes/pages)
+          ;; Build reverse: integrant-key → injection-key
+          ig->injection (when (map? routes-cfg)
+                          (into {} (map (fn [[inject-key ig-ref]]
+                                         (when (keyword? ig-ref)
+                                           [ig-ref inject-key]))
+                                       routes-cfg)))]
+      (->> docs-by-ig-key
+           (map (fn [[ig-key doc]]
+                  (let [inject-key (or (get ig->injection ig-key)
+                                      (keyword (name ig-key)))]
+                    [inject-key doc])))
+           (into {})))))
+
 ;; ── Formatting ────────────────────────────────────────────────
 
 (defn- format-source
@@ -385,18 +437,9 @@
                                 (:cells manifest)))
 
           ;; Load resource docs from system.edn
-          resource-docs (try
-                          (when project-path
-                            (let [f (java.io.File. (str project-path "/resources/system.edn"))]
-                              (when (.exists f)
-                                (let [sys (binding [*read-eval* false]
-                                            (read-string (slurp f)))]
-                                  (->> sys
-                                       (keep (fn [[k v]]
-                                               (when (and (map? v) (:mycelium/doc v))
-                                                 [(keyword (name k)) (:mycelium/doc v)])))
-                                       (into {}))))))
-                          (catch Exception _ nil))
+          resource-docs (when project-path
+                          (extract-resource-docs
+                            (read-system-edn (str project-path "/resources/system.edn"))))
 
           ;; Build briefs from leaves (accept both kebab and underscore keys from JSON)
           briefs (mapv (fn [leaf]

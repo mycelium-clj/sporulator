@@ -9,7 +9,7 @@
             [sporulator.graph-agent :as graph-agent]
             [sporulator.llm :as llm]
             [sporulator.manifest-validate :as mv]
-            [sporulator.orchestrator :as orchestrator]
+            [sporulator.orchestrator :as orchestrator :refer [read-system-edn]]
             [sporulator.source-gen :as source-gen]
             [sporulator.store :as store]
             [sporulator.tools :as tools]
@@ -599,21 +599,24 @@
       ;; Components WITH :mycelium/doc are exposed as resources.
       ;; Components without it are treated as infrastructure.
       (and (= method :get) (= uri "/api/resources"))
-      (let [sys-edn (try (when project-path
-                           (let [f (java.io.File. (str project-path "/resources/system.edn"))]
-                             (when (.exists f)
-                               (binding [*read-eval* false]
-                                 (read-string (slurp f))))))
-                         (catch Exception _ nil))
+      (let [sys-edn (when project-path
+                      (read-system-edn (str project-path "/resources/system.edn")))
             ;; Resources are integrant components with :mycelium/doc metadata
+            ;; Map through routes config to get injection key names
+            routes-cfg (when (map? sys-edn) (get sys-edn :reitit.routes/pages))
+            ig->inject (when (map? routes-cfg)
+                         (into {} (keep (fn [[ik igr]] (when (keyword? igr) [igr ik])))
+                               routes-cfg))
             available  (when sys-edn
                          (->> sys-edn
                               (keep (fn [[k v]]
                                       (when-let [doc (and (map? v) (:mycelium/doc v))]
-                                        {"key"          (str k)
-                                         "resource_key" (name k)
-                                         "doc"          doc
-                                         "config"       (pr-str (dissoc v :mycelium/doc))})))
+                                        (let [inject-key (or (get ig->inject k)
+                                                             (keyword (name k)))]
+                                          {"key"          (str k)
+                                           "resource_key" (name inject-key)
+                                           "doc"          doc
+                                           "config"       (pr-str (dissoc v :mycelium/doc))}))))
                               vec))
             available-keys (set (map #(keyword (get % "resource_key")) (or available [])))
             ;; Cross-reference with manifest cell :requires
