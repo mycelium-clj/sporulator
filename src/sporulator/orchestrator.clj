@@ -384,6 +384,20 @@
                                          [(:id cell-def) cell-name]))
                                 (:cells manifest)))
 
+          ;; Load resource docs from system.edn
+          resource-docs (try
+                          (when project-path
+                            (let [f (java.io.File. (str project-path "/resources/system.edn"))]
+                              (when (.exists f)
+                                (let [sys (binding [*read-eval* false]
+                                            (read-string (slurp f)))]
+                                  (->> sys
+                                       (keep (fn [[k v]]
+                                               (when (and (map? v) (:mycelium/doc v))
+                                                 [(keyword (name k)) (:mycelium/doc v)])))
+                                       (into {}))))))
+                          (catch Exception _ nil))
+
           ;; Build briefs from leaves (accept both kebab and underscore keys from JSON)
           briefs (mapv (fn [leaf]
                          (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
@@ -398,11 +412,12 @@
                                context (when (and manifest cell-name)
                                          (let [ctx (mv/build-graph-context manifest cell-name)]
                                            (mv/format-graph-context ctx)))]
-                           {:id       cell-id
-                            :doc      doc
-                            :schema   (str "{:input " input-schema " :output " output-schema "}")
-                            :requires requires
-                            :context  context}))
+                           {:id            cell-id
+                            :doc           doc
+                            :schema        (str "{:input " input-schema " :output " output-schema "}")
+                            :requires      requires
+                            :resource-docs resource-docs
+                            :context       context}))
                        leaves)]
 
       ;; Phase 1: Generate test contracts
@@ -645,6 +660,20 @@
                         (into {} (map (fn [[cn cd]] [(:id cd) cn]))
                               (:cells manifest)))
 
+        ;; Load resource docs from system.edn
+        resource-docs (try
+                        (when project-path
+                          (let [f (java.io.File. (str project-path "/resources/system.edn"))]
+                            (when (.exists f)
+                              (let [sys (binding [*read-eval* false]
+                                          (read-string (slurp f)))]
+                                (->> sys
+                                     (keep (fn [[k v]]
+                                             (when (and (map? v) (:mycelium/doc v))
+                                               [(keyword (name k)) (:mycelium/doc v)])))
+                                     (into {}))))))
+                        (catch Exception _ nil))
+
         ;; Build briefs from leaves
         briefs (mapv (fn [leaf]
                        (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
@@ -658,11 +687,12 @@
                              context (when (and manifest cell-name)
                                        (let [ctx (mv/build-graph-context manifest cell-name)]
                                          (mv/format-graph-context ctx)))]
-                         {:id       cell-id
-                          :doc      doc
-                          :schema   (str "{:input " input-schema " :output " output-schema "}")
-                          :requires requires
-                          :context  context}))
+                         {:id            cell-id
+                          :doc           doc
+                          :schema        (str "{:input " input-schema " :output " output-schema "}")
+                          :requires      requires
+                          :resource-docs resource-docs
+                          :context       context}))
                      leaves)
 
         ;; Initialize per-cell state

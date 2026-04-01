@@ -595,6 +595,9 @@
                                            (catch Exception _ code))})))
 
       ;; Resources discovery
+      ;; Discovers resources from system.edn using :mycelium/doc metadata.
+      ;; Components WITH :mycelium/doc are exposed as resources.
+      ;; Components without it are treated as infrastructure.
       (and (= method :get) (= uri "/api/resources"))
       (let [sys-edn (try (when project-path
                            (let [f (java.io.File. (str project-path "/resources/system.edn"))]
@@ -602,16 +605,16 @@
                                (binding [*read-eval* false]
                                  (read-string (slurp f))))))
                          (catch Exception _ nil))
-            ;; Extract integrant keys that look like resources (not infrastructure)
-            infra-keys #{:system/env :server/http :handler/ring :router/routes
-                         :router/core :reitit.routes/pages}
+            ;; Resources are integrant components with :mycelium/doc metadata
             available  (when sys-edn
-                         (->> (keys sys-edn)
-                              (remove infra-keys)
-                              (mapv (fn [k]
-                                      {"key" (str k)
-                                       "resource_key" (name k)
-                                       "config" (pr-str (get sys-edn k))}))))
+                         (->> sys-edn
+                              (keep (fn [[k v]]
+                                      (when-let [doc (and (map? v) (:mycelium/doc v))]
+                                        {"key"          (str k)
+                                         "resource_key" (name k)
+                                         "doc"          doc
+                                         "config"       (pr-str (dissoc v :mycelium/doc))})))
+                              vec))
             available-keys (set (map #(keyword (get % "resource_key")) (or available [])))
             ;; Cross-reference with manifest cell :requires
             manifest  (when store

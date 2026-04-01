@@ -352,7 +352,7 @@ Use `cell/defcell` to register cells. The opts map MUST include a `:doc` string:
 (fn [resources data] -> data-map)
 ```
 
-- **resources**: Map of external dependencies (e.g. {:db conn})
+- **resources**: Map of external dependencies injected by the application (e.g. {:db datasource, :cache cache-client}). Destructure with `(let [{:keys [db cache]} resources] ...)`. Each resource's type and API will be documented in the cell's **Required resources** section.
 - **data**: Accumulating data map from prior cells
 - **Returns**: Map of NEW keys only (key propagation is on by default)
 

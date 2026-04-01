@@ -24,8 +24,8 @@
 
 (defn build-cell-prompt
   "Constructs an implementation prompt from a cell brief map.
-   Brief keys: :id, :doc, :schema, :requires, :context"
-  [{:keys [id doc schema requires context]}]
+   Brief keys: :id, :doc, :schema, :requires, :context, :resource-docs"
+  [{:keys [id doc schema requires context resource-docs]}]
   (str "Implement the following Mycelium cell.\n\n"
        (when id
          (str "**Cell ID:** `" id "`\n"))
@@ -34,8 +34,19 @@
        (when schema
          (str "\n**Contract (input/output schema):**\n```\n" schema "\n```\n"))
        (if (seq requires)
-         (str "\n**Required resources:** "
-              (str/join ", " (map #(str "`" % "`") requires)) "\n")
+         (str "\n**Required resources:**\n"
+              (str/join "\n"
+                (map (fn [r]
+                       (let [r-name (str r)
+                             doc (get resource-docs (keyword r-name)
+                                     (get resource-docs r-name))]
+                         (if doc
+                           (str "- `" r-name "` — " doc)
+                           (str "- `" r-name "`"))))
+                     requires))
+              "\n\nAccess resources in the handler: `(let [{:keys ["
+              (str/join " " (map #(str (name %)) requires))
+              "]} resources] ...)`\n")
          "\n**Required resources:** none\n")
        (when context
          (str "\n**Workflow position (predecessors/successors):**\n" context "\n"))
