@@ -420,10 +420,26 @@
             extra-requires (extract/extract-extra-requires raw-code)
             cell-id-kw    (let [s (str cell-id)]
                             (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
-            ;; Parse schema from brief string
-            schema-parsed (try (binding [*read-eval* false]
-                                 (clojure.edn/read-string (:schema brief)))
-                               (catch Exception _ {:input [:map] :output [:map]}))
+            ;; Parse schema from brief string and normalize to Malli
+            schema-parsed (try
+                            (let [raw (binding [*read-eval* false]
+                                        (clojure.edn/read-string (:schema brief)))
+                                  ;; Convert string-key maps to keyword-key maps (lite Malli)
+                                  fix-keys (fn fix-keys [v]
+                                             (cond
+                                               (and (map? v) (every? string? (keys v)))
+                                               (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
+                                               (and (vector? v) (= "map" (first v)))
+                                               (into [:map] (map (fn [entry]
+                                                                    (if (vector? entry)
+                                                                      [(keyword (first entry)) (keyword (second entry))]
+                                                                      (keyword entry)))
+                                                                  (rest v)))
+                                               (string? v) (keyword v)
+                                               :else v))]
+                              {:input  (fix-keys (:input raw))
+                               :output (fix-keys (:output raw))})
+                            (catch Exception _ {:input [:map] :output [:map]}))
             ;; If LLM returned a full (ns ...) + (cell/defcell ...) form, use it directly
             ;; Otherwise assemble from extracted parts
             source (if fn-body
@@ -442,10 +458,17 @@
         (emit on-event "cell_implement" "written" :cell-id cell-id
               :attempt (inc attempt))
 
-        ;; Eval the assembled implementation
-        (let [eval-res (ev/eval-code source)]
+        ;; Eval cell + tests together (avoids require-can't-find-namespace issue)
+        ;; Replace the cell require in test source so it doesn't try to load from disk
+        (let [test-src-fixed (if cell-ns
+                               (str/replace test-code
+                                 (str "[" cell-ns "]")
+                                 (str "[" cell-ns " :as _cell-ns]"))
+                               test-code)
+              combined (str source "\n\n" test-src-fixed)
+              eval-res (ev/eval-code combined)]
           (if (not= :ok (:status eval-res))
-            ;; Eval failed
+            ;; Eval failed (cell or test loading)
             (do
               (emit on-event "cell_implement" "error" :cell-id cell-id
                     :message (:error eval-res) :attempt (inc attempt))
@@ -457,12 +480,50 @@
               (if (< attempt max-attempts)
                 (recur (str "The code produced this error:\n```\n"
                             (:error eval-res)
-                            "\n```\nPlease fix and return the corrected source.")
+                            "\n```\nPlease fix and return the corrected "
+                            "(fn [resources data] ...) handler.")
                        (inc attempt))
                 {:status :error :error (:error eval-res) :cell-id cell-id}))
 
-            ;; Eval succeeded — now load tests and run them
-            (let [test-res (ev/run-cell-tests test-code)]
+            ;; Eval succeeded — run the tests from the loaded test namespace
+            (let [test-ns-name (second (re-find #"\(ns\s+(\S+)" test-code))
+                  test-ns      (when test-ns-name (find-ns (symbol test-ns-name)))
+                  test-res     (if test-ns
+                                 ;; Run tests via clojure.test
+                                 (let [out       (java.io.StringWriter.)
+                                       counters  (atom {:test 0 :pass 0 :fail 0 :error 0})
+                                       reporter  (fn [m]
+                                                   (case (:type m)
+                                                     :begin-test-ns nil
+                                                     :end-test-ns nil
+                                                     :begin-test-var (swap! counters update :test inc)
+                                                     :pass (swap! counters update :pass inc)
+                                                     :fail (do (swap! counters update :fail inc)
+                                                               (.write out
+                                                                 (str "\nFAIL in " (clojure.test/testing-vars-str m) "\n"
+                                                                      (:message m "")
+                                                                      "\nexpected: " (pr-str (:expected m))
+                                                                      "\n  actual: " (pr-str (:actual m)) "\n")))
+                                                     :error (do (swap! counters update :error inc)
+                                                                (.write out
+                                                                  (str "\nERROR in " (clojure.test/testing-vars-str m) "\n"
+                                                                       (:message m "")
+                                                                       "\n  actual: " (pr-str (:actual m)) "\n")))
+                                                     :summary nil
+                                                     nil))
+                                       _         (binding [*out* out
+                                                           clojure.test/report reporter]
+                                                   (clojure.test/run-tests test-ns))
+                                       summary   @counters]
+                                   {:status  :ok
+                                    :passed? (and (zero? (:fail summary))
+                                                  (zero? (:error summary)))
+                                    :summary summary
+                                    :output  (str (:output eval-res) (str out))})
+                                 ;; Test namespace not found
+                                 {:status :error
+                                  :error  (str "Test namespace not found: " test-ns-name)
+                                  :output (:output eval-res)})]
               (when store
                 (store/save-cell-attempt! store
                   {:run-id run-id :cell-id cell-id :attempt-type "test"
