@@ -594,6 +594,46 @@
                                                                  :width 80})
                                            (catch Exception _ code))})))
 
+      ;; Resources discovery
+      (and (= method :get) (= uri "/api/resources"))
+      (let [sys-edn (try (when project-path
+                           (let [f (java.io.File. (str project-path "/resources/system.edn"))]
+                             (when (.exists f)
+                               (binding [*read-eval* false]
+                                 (read-string (slurp f))))))
+                         (catch Exception _ nil))
+            ;; Extract integrant keys that look like resources (not infrastructure)
+            infra-keys #{:system/env :server/http :handler/ring :router/routes
+                         :router/core :reitit.routes/pages}
+            available  (when sys-edn
+                         (->> (keys sys-edn)
+                              (remove infra-keys)
+                              (mapv (fn [k]
+                                      {"key" (str k)
+                                       "resource_key" (name k)
+                                       "config" (pr-str (get sys-edn k))}))))
+            available-keys (set (map #(keyword (get % "resource_key")) (or available [])))
+            ;; Cross-reference with manifest cell :requires
+            manifest  (when store
+                        (when-let [m (first (store/list-manifests store))]
+                          (when-let [full (store/get-latest-manifest store (:id m))]
+                            (try (binding [*read-eval* false]
+                                   (read-string (:body full)))
+                                 (catch Exception _ nil)))))
+            usage     (when manifest
+                        (reduce (fn [acc [_cell-name cell-def]]
+                                  (reduce (fn [a r]
+                                            (update a (name r) (fnil conj [])
+                                                    (str (:id cell-def))))
+                                          acc
+                                          (or (:requires cell-def) [])))
+                                {} (:cells manifest)))
+            required  (set (map keyword (keys (or usage {}))))
+            missing   (vec (map name (clojure.set/difference required available-keys)))]
+        (json-response {"available" (or available [])
+                        "usage" (or usage {})
+                        "missing" missing}))
+
       ;; Manifests
       (and (= method :get) (= uri "/api/manifests"))
       (json-response (mapv format-manifest-summary (store/list-manifests store)))
