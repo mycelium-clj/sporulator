@@ -108,7 +108,7 @@
             [llm/session-send-stream
              (mock-llm-send-stream
                (fn [_]
-                 "```clojure\n(ns test.implapp.cells.compute-tax\n  (:require [mycelium.cell :as cell]))\n\n(cell/defcell :order/compute-tax\n  {:doc \"Computes tax as subtotal * 0.1\"\n   :input {:subtotal :double}\n   :output {:tax :double}}\n  (fn [_ data] {:tax (* (:subtotal data) 0.1)}))\n```"))]
+                 "```clojure\n(fn [_ data] {:tax (* (:subtotal data) 0.1)})\n```"))]
             (orch/implement-from-contract
               nil
               {:contract contract
@@ -160,7 +160,7 @@
                  (cond
                    ;; Test generation
                    (and msg (str/includes? msg "Implement"))
-                   "```clojure\n(ns test.orch.cells.compute-tax\n  (:require [mycelium.cell :as cell]))\n\n(cell/defcell :order/compute-tax\n  {:doc \"Computes tax\"\n   :input {:subtotal :double}\n   :output {:tax :double}}\n  (fn [_ data] {:tax (* (:subtotal data) 0.1)}))\n```"
+                   "```clojure\n(fn [_ data] {:tax (* (:subtotal data) 0.1)})\n```"
 
                    ;; Test writing
                    (and msg (str/includes? msg "test"))
@@ -272,7 +272,7 @@
                (fn [msg]
                  (cond
                    (and msg (str/includes? msg "Implement"))
-                   "```clojure\n(ns test.resume.cells.compute-tax\n  (:require [mycelium.cell :as cell]))\n\n(cell/defcell :order/compute-tax\n  {:doc \"Computes tax\"\n   :input {:subtotal :double}\n   :output {:tax :double}}\n  (fn [_ data] {:tax (* (:subtotal data) 0.1)}))\n```"
+                   "```clojure\n(fn [_ data] {:tax (* (:subtotal data) 0.1)})\n```"
                    (and msg (str/includes? msg "test"))
                    "(deftest tax-test\n  (is (= {:tax 10.0} (handler {} {:subtotal 100.0}))))"
                    :else "ALL TESTS VERIFIED")))]

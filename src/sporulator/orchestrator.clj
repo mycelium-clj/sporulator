@@ -410,50 +410,67 @@
                     (llm/create-session (str "impl:" cell-id) prompts/cell-prompt))]
     (emit on-event "cell_implement" "started" :cell-id cell-id)
 
+    ;; Pre-parse schema once (used in every iteration)
+    (let [cell-id-kw (let [s (str cell-id)]
+                       (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+          schema-parsed (try
+                          (let [raw (binding [*read-eval* false]
+                                     (clojure.edn/read-string (:schema brief)))
+                                fix-keys (fn fix-keys [v]
+                                           (cond
+                                             (and (map? v) (every? string? (keys v)))
+                                             (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
+                                             (and (vector? v) (= "map" (first v)))
+                                             (into [:map] (map (fn [entry]
+                                                                  (if (vector? entry)
+                                                                    [(keyword (first entry)) (keyword (second entry))]
+                                                                    (keyword entry)))
+                                                                (rest v)))
+                                             (string? v) (keyword v)
+                                             :else v))]
+                            {:input  (fix-keys (:input raw))
+                             :output (fix-keys (:output raw))})
+                          (catch Exception _ {:input [:map] :output [:map]}))]
+
     (loop [msg     (build-impl-prompt contract)
            attempt 0]
       (let [content  (llm/session-send-stream session client msg on-chunk)
             raw-code (or (extract/extract-first-code-block content) content)
-            ;; Extract fn body + helpers from LLM response, assemble with codegen
             fn-body       (extract/extract-fn-body raw-code)
             helpers       (extract/extract-helpers raw-code)
-            extra-requires (extract/extract-extra-requires raw-code)
-            cell-id-kw    (let [s (str cell-id)]
-                            (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
-            ;; Parse schema from brief string and normalize to Malli
-            schema-parsed (try
-                            (let [raw (binding [*read-eval* false]
-                                        (clojure.edn/read-string (:schema brief)))
-                                  ;; Convert string-key maps to keyword-key maps (lite Malli)
-                                  fix-keys (fn fix-keys [v]
-                                             (cond
-                                               (and (map? v) (every? string? (keys v)))
-                                               (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
-                                               (and (vector? v) (= "map" (first v)))
-                                               (into [:map] (map (fn [entry]
-                                                                    (if (vector? entry)
-                                                                      [(keyword (first entry)) (keyword (second entry))]
-                                                                      (keyword entry)))
-                                                                  (rest v)))
-                                               (string? v) (keyword v)
-                                               :else v))]
-                              {:input  (fix-keys (:input raw))
-                               :output (fix-keys (:output raw))})
-                            (catch Exception _ {:input [:map] :output [:map]}))
-            ;; If LLM returned a full (ns ...) + (cell/defcell ...) form, use it directly
-            ;; Otherwise assemble from extracted parts
-            source (if fn-body
-                     (codegen/assemble-cell-source
-                       {:cell-ns        cell-ns
-                        :cell-id        cell-id-kw
-                        :doc            (or (:doc brief) "")
-                        :schema         schema-parsed
-                        :requires       (mapv keyword (or (:requires brief) []))
-                        :extra-requires (or extra-requires [])
-                        :helpers        (or helpers [])
-                        :fn-body        fn-body})
-                     ;; Fallback: LLM returned full source, auto-fix it
-                     (auto-fix-cell-source raw-code cell-id cell-ns))]
+            extra-requires (extract/extract-extra-requires raw-code)]
+
+        ;; If we couldn't extract a (fn ...) form, tell the LLM exactly what's wrong
+        (if (and (nil? fn-body) (< attempt max-attempts))
+          (do
+            (emit on-event "cell_implement" "error" :cell-id cell-id
+                  :message "No (fn [resources data] ...) form found" :attempt (inc attempt))
+            (when store
+              (store/save-cell-attempt! store
+                {:run-id run-id :cell-id cell-id :attempt-type "implement"
+                 :attempt-number (inc attempt) :code raw-code
+                 :output "Could not find (fn [resources data] ...) in your response" :passed? false}))
+            (recur (str "Your response did not contain a valid `(fn [resources data] ...)` form.\n\n"
+                        "I received:\n```\n" (subs raw-code 0 (min 500 (count raw-code))) "\n```\n\n"
+                        "You MUST return a `(fn [resources data] ...)` as the LAST form in your response.\n"
+                        "The function should take two arguments:\n"
+                        "- `resources` — map of injected dependencies (e.g. {:db datasource})\n"
+                        "- `data` — map of input data with keyword keys (e.g. {:handle \"user\" :message \"hi\"})\n\n"
+                        "Return ONLY the function. Example:\n"
+                        "```clojure\n(fn [resources data]\n  {:result-key (some-computation (:input-key data))})\n```")
+                   (inc attempt)))
+
+          ;; We have a fn-body (or exhausted attempts) — assemble and eval
+          (let [fn-body (or fn-body '(fn [resources data] data)) ;; last-resort identity
+                source (codegen/assemble-cell-source
+                         {:cell-ns        cell-ns
+                          :cell-id        cell-id-kw
+                          :doc            (or (:doc brief) "")
+                          :schema         schema-parsed
+                          :requires       (mapv keyword (or (:requires brief) []))
+                          :extra-requires (or extra-requires [])
+                          :helpers        (or helpers [])
+                          :fn-body        fn-body})]
 
         (emit on-event "cell_implement" "written" :cell-id cell-id
               :attempt (inc attempt))
@@ -478,10 +495,17 @@
                    :attempt-number (inc attempt) :code source
                    :output (:error eval-res) :passed? false}))
               (if (< attempt max-attempts)
-                (recur (str "The code produced this error:\n```\n"
+                (recur (str "The code produced this error when evaluated:\n```\n"
                             (:error eval-res)
-                            "\n```\nPlease fix and return the corrected "
-                            "(fn [resources data] ...) handler.")
+                            "\n```\n\n"
+                            "Your handler function (which was assembled into the cell) was:\n```clojure\n"
+                            (pr-str fn-body)
+                            "\n```\n\n"
+                            "Please fix and return ONLY the corrected `(fn [resources data] ...)` handler.\n"
+                            "Remember:\n"
+                            "- Input data uses KEYWORD keys like `:handle`, `:message` (not strings)\n"
+                            "- Return a map with KEYWORD keys\n"
+                            "- Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you")
                        (inc attempt))
                 {:status :error :error (:error eval-res) :cell-id cell-id}))
 
@@ -539,9 +563,12 @@
                   (emit on-event "cell_test" "error" :cell-id cell-id
                         :message (:error test-res))
                   (if (< attempt max-attempts)
-                    (recur (str "Tests failed to load:\n```\n"
+                    (recur (str "Tests failed to load with this error:\n```\n"
                                 (:error test-res)
-                                "\n```\nPlease fix the implementation.")
+                                "\n```\n\n"
+                                "Your handler was:\n```clojure\n" (pr-str fn-body) "\n```\n\n"
+                                "Please fix and return ONLY the corrected `(fn [resources data] ...)` handler.\n"
+                                "Remember: use KEYWORD keys (:handle, :message) not string keys.")
                            (inc attempt))
                     {:status :error :error (:error test-res) :cell-id cell-id}))
 
@@ -586,7 +613,7 @@
                     {:status :error
                      :error  (str "Tests failed after " (inc attempt) " attempts")
                      :cell-id cell-id
-                     :output (:output test-res)}))))))))))
+                     :output (:output test-res)})))))))))))))
 ;; ── Main orchestration ─────────────────────────────────────────
 
 (defn orchestrate!
