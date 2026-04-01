@@ -34,7 +34,7 @@
   [schema-str]
   (boolean
     (and (string? schema-str)
-         (re-find #":(?:double|int|float|decimal|number)\b" schema-str))))
+         (re-find #":(?:double|int(?:eger)?|float|decimal|number)\b" schema-str))))
 
 ;; =============================================================
 ;; Fix tier escalation
@@ -55,7 +55,7 @@
    from focused prompts over information-dense ones."
   [attempt model-name]
   (let [deepseek? (and (string? model-name)
-                       (str/starts-with? model-name "deepseek"))]
+                       (str/starts-with? (str/lower-case model-name) "deepseek"))]
     (if deepseek?
       ;; DeepSeek: narrowed → fresh (skip standard)
       (if (<= attempt 1) :narrowed :fresh)
@@ -120,7 +120,8 @@
          "\n## Current Implementation\n```clojure\n" impl-code "\n```\n\n"
          "## Test Output\n```\n" test-output "\n```\n\n"
          "## Test Code\n```clojure\n" test-code "\n```\n\n"
-         math-precision-rules "\n\n"
+         (when (needs-math-precision? (:schema brief))
+           (str math-precision-rules "\n\n"))
          "Fix the implementation. Return ONLY:\n"
          "1. (OPTIONAL) Helper functions — define any helper functions you need\n"
          "2. (REQUIRED) (fn [resources data] ...) — MUST be the LAST form\n\n"
@@ -147,7 +148,8 @@
              extra
              "\n## Current Implementation\n```clojure\n" impl-code "\n```\n\n"
              "## Full Test Code\n```clojure\n" test-code "\n```\n\n"
-             math-precision-rules "\n\n"
+             (when (needs-math-precision? (:schema brief))
+               (str math-precision-rules "\n\n"))
              "Focus on fixing this specific failure first. Trace through the logic step-by-step:\n"
              "1. What input does this test provide?\n"
              "2. What does your current code do with that input?\n"
@@ -173,7 +175,8 @@
          extra
          "\n## Tests That Must Pass\n```clojure\n" test-code "\n```\n\n"
          "## Most Recent Test Output (showing what went wrong)\n```\n" test-output "\n```\n\n"
-         math-precision-rules "\n\n"
+         (when (needs-math-precision? (:schema brief))
+           (str math-precision-rules "\n\n"))
          "Implement the cell from scratch. Think step by step:\n"
          "1. Read each test carefully to understand the expected behavior.\n"
          "2. Design a clean implementation that satisfies ALL tests.\n"

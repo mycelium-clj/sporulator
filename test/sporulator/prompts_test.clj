@@ -126,6 +126,28 @@
         (testing (str "attempt " attempt " includes ns exclusion")
           (is (str/includes? prompt "Do NOT include (ns")))))))
 
+(deftest fix-prompt-conditional-math-rules-test
+  (testing "fix prompt omits math rules for string-only schema"
+    (let [prompt (prompts/build-fix-prompt
+                   {:test-output "FAIL"
+                    :test-code "(deftest t ...)"
+                    :impl-code "(fn [r d] {})"
+                    :brief {:id ":x/y" :doc "test" :schema "{:input [:map [:name :string]]}"}
+                    :cell-id ":x/y"
+                    :attempt 1
+                    :max-attempts 3})]
+      (is (not (str/includes? prompt "NUMERICAL PRECISION")))))
+  (testing "fix prompt includes math rules for double schema"
+    (let [prompt (prompts/build-fix-prompt
+                   {:test-output "FAIL"
+                    :test-code "(deftest t ...)"
+                    :impl-code "(fn [r d] {})"
+                    :brief {:id ":x/y" :doc "test" :schema "{:input [:map [:price :double]]}"}
+                    :cell-id ":x/y"
+                    :attempt 1
+                    :max-attempts 3})]
+      (is (str/includes? prompt "NUMERICAL PRECISION")))))
+
 (deftest narrowed-fallback-to-expanded-test
   (testing "no FAIL pattern falls back to standard"
     (let [prompt (prompts/build-graduated-fix-prompt
@@ -169,6 +191,8 @@
   (testing "mixed schema with double needs math precision"
     (is (true? (prompts/needs-math-precision?
                  "{:input [:map [:name :string] [:price :double]]}"))))
+  (testing ":integer schema needs math precision"
+    (is (true? (prompts/needs-math-precision? "{:input [:map [:n :integer]]}"))))
   (testing "nil returns false"
     (is (false? (prompts/needs-math-precision? nil)))))
 
@@ -188,9 +212,11 @@
     (is (str/includes? prompts/cell-prompt "(fn [resources data]"))))
 
 (deftest fix-tier-for-model-test
-  (testing "deepseek starts narrowed on attempt 1"
+  (testing "deepseek starts narrowed on attempt 1 (case-insensitive)"
     (is (= :narrowed (prompts/fix-tier-for-model 1 "deepseek-chat")))
-    (is (= :narrowed (prompts/fix-tier-for-model 1 "deepseek-coder"))))
+    (is (= :narrowed (prompts/fix-tier-for-model 1 "deepseek-coder")))
+    (is (= :narrowed (prompts/fix-tier-for-model 1 "DeepSeek-V3")))
+    (is (= :narrowed (prompts/fix-tier-for-model 1 "DEEPSEEK-REASONER"))))
   (testing "deepseek goes fresh on attempt 2"
     (is (= :fresh (prompts/fix-tier-for-model 2 "deepseek-chat"))))
   (testing "non-deepseek uses standard tiers"

@@ -39,8 +39,9 @@
          "\n**Required resources:** none\n")
        (when context
          (str "\n**Workflow position (predecessors/successors):**\n" context "\n"))
-       "\nReturn the complete source including `(ns ... (:require [mycelium.cell :as cell]))` "
-       "and `(cell/defcell ...)` with a `:doc` string in the opts map."))
+       "\nReturn a single ```clojure fenced code block with the complete source: "
+       "`(ns ...)` with `[mycelium.cell :as cell]` require, "
+       "then `(cell/defcell ...)` with a `:doc` string in the opts map."))
 
 ;; ── Result extraction ──────────────────────────────────────────
 
