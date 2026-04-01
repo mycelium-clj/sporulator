@@ -150,3 +150,51 @@
                     :attempt 3
                     :max-attempts 5})]
       (is (str/includes? prompt "attempt 3/5")))))
+
+;; =============================================================
+;; Conditional math precision rules
+;; =============================================================
+
+(deftest needs-math-precision-test
+  (testing "double schema needs math precision"
+    (is (true? (prompts/needs-math-precision? "{:input [:map [:x :double]]}"))))
+  (testing "int schema needs math precision"
+    (is (true? (prompts/needs-math-precision? "{:input [:map [:count :int]]}"))))
+  (testing "string-only schema does not need math precision"
+    (is (false? (prompts/needs-math-precision? "{:input [:map [:handle :string]]}"))))
+  (testing "generic map does not need math precision"
+    (is (false? (prompts/needs-math-precision? "{:input [:map]}"))))
+  (testing "empty schema does not need math precision"
+    (is (false? (prompts/needs-math-precision? "{}"))))
+  (testing "mixed schema with double needs math precision"
+    (is (true? (prompts/needs-math-precision?
+                 "{:input [:map [:name :string] [:price :double]]}"))))
+  (testing "nil returns false"
+    (is (false? (prompts/needs-math-precision? nil)))))
+
+;; =============================================================
+;; Model-aware fix tiers
+;; =============================================================
+
+;; =============================================================
+;; Output format template in cell-prompt
+;; =============================================================
+
+(deftest cell-prompt-contains-template-test
+  (testing "cell-prompt includes defcell template structure"
+    (is (str/includes? prompts/cell-prompt "(ns <cell-namespace>"))
+    (is (str/includes? prompts/cell-prompt "(cell/defcell <cell-id>"))
+    (is (str/includes? prompts/cell-prompt ":doc"))
+    (is (str/includes? prompts/cell-prompt "(fn [resources data]"))))
+
+(deftest fix-tier-for-model-test
+  (testing "deepseek starts narrowed on attempt 1"
+    (is (= :narrowed (prompts/fix-tier-for-model 1 "deepseek-chat")))
+    (is (= :narrowed (prompts/fix-tier-for-model 1 "deepseek-coder"))))
+  (testing "deepseek goes fresh on attempt 2"
+    (is (= :fresh (prompts/fix-tier-for-model 2 "deepseek-chat"))))
+  (testing "non-deepseek uses standard tiers"
+    (is (= :standard (prompts/fix-tier-for-model 1 "claude-sonnet-4-20250514")))
+    (is (= :narrowed (prompts/fix-tier-for-model 2 "gpt-4o"))))
+  (testing "nil model uses standard tiers"
+    (is (= :standard (prompts/fix-tier-for-model 1 nil)))))

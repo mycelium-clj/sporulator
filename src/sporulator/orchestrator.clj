@@ -11,6 +11,7 @@
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
             [sporulator.llm :as llm]
+            [sporulator.hashline :as hashline]
             [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
@@ -77,18 +78,28 @@
 
 (defn- build-test-prompt
   "Builds the prompt to ask the LLM to write tests for a cell."
-  [{:keys [id doc schema requires]}]
+  [{:keys [id doc schema requires context]}]
   (str "Write tests for the following Mycelium cell using clojure.test.\n\n"
        "**Cell ID:** `" id "`\n"
        "**Requirements:** " doc "\n"
        "**Schema:** `" schema "`\n"
        (when (seq requires)
          (str "**Resources:** " (str/join ", " requires) "\n"))
-       "\n" prompts/math-precision-rules "\n"
+       (when context
+         (str "\n" context "\n"))
+       (when (prompts/needs-math-precision? schema)
+         (str "\n" prompts/math-precision-rules "\n"))
        "\nReturn ONLY the `deftest` forms. Do NOT include the `(ns ...)` declaration "
        "or any requires — those are added automatically.\n"
        "The handler is available as `handler` and resources as `{}`.\n"
-       "Use `(handler {} {:input-key value})` to call the cell.\n"))
+       "Use `(handler {} {:input-key value})` to call the cell.\n\n"
+       "Example test structure:\n"
+       "```clojure\n"
+       "(deftest test-basic-case\n"
+       "  (let [result (handler {} {:key \"value\"})]\n"
+       "    (is (contains? result :expected-key))\n"
+       "    (is (= expected-value (:expected-key result)))))\n"
+       "```\n"))
 
 (defn- self-review-prompt
   "Builds the self-review prompt for generated tests."
@@ -215,9 +226,9 @@
        "and locked — your code must pass them.\n\n"
        (cell-agent/build-cell-prompt brief)
        "\n\n**Tests your implementation must pass:**\n```clojure\n"
-       test-body "\n```\n\n"
-       prompts/math-precision-rules "\n"
-       "\nReturn the complete source including `(ns ...)` and `(cell/defcell ...)`."))
+       test-body "\n```\n"
+       (when (prompts/needs-math-precision? (:schema brief))
+         (str "\n" prompts/math-precision-rules "\n"))))
 
 (defn implement-from-contract
   "Implements a cell from a test contract using the LLM + eval feedback loop.
@@ -796,9 +807,12 @@
         (try
           (let [session (or (:session contract)
                             (llm/create-session (str "test:" cell-id) prompts/cell-prompt))
-                msg     (str "The tests need changes. Please regenerate:\n\n"
+                annotated (hashline/annotate-hashlines (:test-code contract))
+                msg     (str "The tests need changes:\n\n"
                              feedback
-                             "\n\nReturn ONLY the corrected `deftest` forms.")
+                             "\n\n**Current test code:**\n```\n"
+                             annotated
+                             "\n```\n\nReturn ONLY the corrected `deftest` forms.")
                 content (llm/session-send-stream session client msg on-chunk)
                 body    (or (extract/extract-first-code-block content) content)
                 cell-ns  (cell-ns-name base-ns cell-id)
@@ -906,7 +920,12 @@
         (try
           (let [session (or (:session contract)
                             (llm/create-session (str "impl:" cell-id) prompts/cell-prompt))
+                annotated (hashline/annotate-hashlines
+                            (or (:impl-source cell) ""))
                 msg     (str "The implementation needs changes:\n\n" feedback
+                             (when (seq annotated)
+                               (str "\n\n**Current implementation:**\n```\n"
+                                    annotated "\n```"))
                              "\n\nPlease fix and return the corrected source "
                              "including `(ns ...)` and `(cell/defcell ...)`.")
                 content (llm/session-send-stream session client msg on-chunk)

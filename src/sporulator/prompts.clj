@@ -25,6 +25,18 @@
 5. Use bigdec for intermediate calculations to avoid floating-point accumulation errors.")
 
 ;; =============================================================
+;; Conditional math precision
+;; =============================================================
+
+(defn needs-math-precision?
+  "Returns true if the schema string contains numeric types (:double, :int)
+   that would benefit from math precision rules."
+  [schema-str]
+  (boolean
+    (and (string? schema-str)
+         (re-find #":(?:double|int|float|decimal|number)\b" schema-str))))
+
+;; =============================================================
 ;; Fix tier escalation
 ;; =============================================================
 
@@ -36,6 +48,19 @@
     (<= attempt 1) :standard
     (= attempt 2)  :narrowed
     :else           :fresh))
+
+(defn fix-tier-for-model
+  "Returns the escalation tier for a given attempt and model.
+   DeepSeek models start narrowed (less context) since they benefit
+   from focused prompts over information-dense ones."
+  [attempt model-name]
+  (let [deepseek? (and (string? model-name)
+                       (str/starts-with? model-name "deepseek"))]
+    (if deepseek?
+      ;; DeepSeek: narrowed → fresh (skip standard)
+      (if (<= attempt 1) :narrowed :fresh)
+      ;; Other models: standard escalation
+      (fix-tier attempt))))
 
 ;; =============================================================
 ;; First failing test extraction
@@ -349,4 +374,21 @@ Use `cell/defcell` to register cells. The opts map MUST include a `:doc` string:
 
 ## Output Format
 
-Return ONLY the Clojure code including the `(ns ...)` declaration and `(cell/defcell ...)` form.")
+Return a single ```clojure fenced code block containing exactly this structure:
+
+```clojure
+(ns <cell-namespace>
+  (:require [mycelium.cell :as cell]
+            ;; add other requires as needed
+            ))
+
+(cell/defcell <cell-id>
+  {:doc \"<purpose>\"
+   :input <input-schema>
+   :output <output-schema>}
+  (fn [resources data]
+    ;; your implementation here
+    ))
+```
+
+Do NOT return anything outside the code block. Do NOT include explanations.")

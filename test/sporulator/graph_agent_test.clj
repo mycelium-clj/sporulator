@@ -87,7 +87,11 @@
 
 (deftest validate-manifest-edn-test
   (testing "valid manifest returns parsed map"
-    (let [edn "{:id :todo :cells {:start {:id :todo/parse}} :pipeline [:start]}"
+    (let [edn (str "{:id :todo"
+                   " :cells {:start {:id :todo/parse"
+                   "                 :doc \"Parses input\""
+                   "                 :schema {:input [:map] :output [:map [:result :string]]}}}"
+                   " :pipeline [:start]}")
           result (ga/validate-manifest-edn edn)]
       (is (= :ok (:status result)))
       (is (= :todo (get-in result [:manifest :id])))))
