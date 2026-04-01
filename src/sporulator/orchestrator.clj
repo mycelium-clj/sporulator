@@ -269,6 +269,57 @@
                   extracted (or (extract/extract-first-code-block fixed) fixed)]
               (recur extracted (inc attempt)))))))))
 
+;; ── Structural validation ──────────────────────────────────────
+
+(defn- validate-cell-source
+  "Validates cell source code structurally before eval.
+   Returns nil if valid, or a string describing the problem with fix instructions."
+  [source cell-id cell-ns]
+  (let [issues (transient [])]
+    ;; Check for (ns ...) form
+    (when-not (re-find #"(?m)^\s*\(ns\s" source)
+      (conj! issues (str "Missing (ns ...) declaration. The source MUST start with:\n"
+                         "(ns " cell-ns "\n  (:require [mycelium.cell :as cell]))")))
+    ;; Check for correct namespace name
+    (when-let [[_ found-ns] (re-find #"\(ns\s+(\S+)" source)]
+      (when (and cell-ns (not= found-ns cell-ns))
+        (conj! issues (str "Wrong namespace: found `" found-ns "` but expected `" cell-ns "`"))))
+    ;; Check for (cell/defcell ...) or (mycelium.cell/defcell ...)
+    (when-not (re-find #"(?:cell/defcell|mycelium\.cell/defcell)" source)
+      (conj! issues "Missing (cell/defcell ...) form. Must use cell/defcell to register the cell."))
+    ;; Check cell ID matches
+    (when-let [[_ found-id] (re-find #"defcell\s+:(\S+)" source)]
+      (let [expected (cond-> (str cell-id)
+                       (str/starts-with? (str cell-id) ":") (subs 1))]
+        (when (not= found-id expected)
+          (conj! issues (str "Wrong cell ID: found `:" found-id "` but expected `:" expected "`")))))
+    ;; Check for :doc in defcell opts
+    (when (and (re-find #"defcell" source)
+               (not (re-find #":doc\s" source)))
+      (conj! issues "Missing :doc key in defcell opts map. The opts MUST include :doc."))
+    ;; Check for [mycelium.cell :as cell] require
+    (when (and (re-find #"\(ns\s" source)
+               (not (re-find #"mycelium\.cell" source)))
+      (conj! issues "Missing [mycelium.cell :as cell] in :require. Add it to the ns form."))
+    ;; Return combined issues or nil
+    (let [result (persistent! issues)]
+      (when (seq result)
+        (str/join "\n\n" result)))))
+
+(defn- build-structural-fix-prompt
+  "Builds a prompt asking the LLM to fix structural issues in the source."
+  [source issues cell-id cell-ns]
+  (str "The implementation has structural problems that must be fixed:\n\n"
+       issues "\n\n"
+       "**Expected structure:**\n```clojure\n"
+       "(ns " cell-ns "\n"
+       "  (:require [mycelium.cell :as cell]))\n\n"
+       "(cell/defcell :" cell-id "\n"
+       "  {:doc \"...\" :input [...] :output [...]}\n"
+       "  (fn [resources data] ...))\n```\n\n"
+       "**Current code:**\n```clojure\n" source "\n```\n\n"
+       "Fix ALL the structural issues above and return the corrected source."))
+
 ;; ── Implementation ─────────────────────────────────────────────
 
 (defn- build-impl-prompt
@@ -310,7 +361,24 @@
         (emit on-event "cell_implement" "written" :cell-id cell-id
               :attempt (inc attempt))
 
-        ;; Eval the implementation
+        ;; Structural validation before eval
+        (if-let [issues (validate-cell-source source cell-id cell-ns)]
+          ;; Structural problems — fix before attempting eval
+          (do
+            (emit on-event "cell_implement" "error" :cell-id cell-id
+                  :message (str "Structural: " (first (str/split-lines issues)))
+                  :attempt (inc attempt))
+            (when store
+              (store/save-cell-attempt! store
+                {:run-id run-id :cell-id cell-id :attempt-type "implement"
+                 :attempt-number (inc attempt) :code source
+                 :output issues :passed? false}))
+            (if (< attempt max-attempts)
+              (recur (build-structural-fix-prompt source issues cell-id cell-ns)
+                     (inc attempt))
+              {:status :error :error issues :cell-id cell-id}))
+
+        ;; Structure OK — eval the implementation
         (let [eval-res (ev/eval-code source)]
           (if (not= :ok (:status eval-res))
             ;; Eval failed
@@ -393,7 +461,7 @@
                     {:status :error
                      :error  (str "Tests failed after " (inc attempt) " attempts")
                      :cell-id cell-id
-                     :output (:output test-res)}))))))))))
+                     :output (:output test-res)})))))))))))
 ;; ── Main orchestration ─────────────────────────────────────────
 
 (defn orchestrate!
