@@ -186,9 +186,10 @@
         session  (llm/create-session (str "test:" cell-id) prompts/cell-prompt)]
     (emit on-event "cell_test" "started" :cell-id cell-id)
 
-    ;; Generate test body
+    ;; Generate test body (strip code fences if present)
     (let [test-prompt (build-test-prompt brief)
-          test-body   (llm/session-send-stream session client test-prompt on-chunk)]
+          raw-test    (llm/session-send-stream session client test-prompt on-chunk)
+          test-body   (or (extract/extract-first-code-block raw-test) raw-test)]
 
       (emit on-event "cell_test" "written" :cell-id cell-id)
 
