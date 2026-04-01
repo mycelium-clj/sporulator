@@ -471,7 +471,9 @@
           (json-response (transform-keys
                            (update cell :handler
                                    (fn [h] (if (seq h)
-                                             (try (zp/zprint-str h {:parse-string? true :width 80})
+                                             (try (zp/zprint-str h {:parse-string? true
+                                                                        :parse-string-all? true
+                                                                        :width 80})
                                                   (catch Exception _ h))
                                              h)))))
           (json-response {"error" "not found"} 404))
