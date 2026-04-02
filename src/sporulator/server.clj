@@ -110,7 +110,11 @@
         message  (get-in msg [:payload :message])
         manifest (get-in msg [:payload :manifest])
         full-msg (if manifest
-                   (str message "\n\nCurrent manifest:\n```edn\n" manifest "\n```")
+                   (str message "\n\nCurrent manifest:\n```edn\n" manifest "\n```\n\n"
+                        "IMPORTANT: When modifying the manifest, output the COMPLETE updated manifest. "
+                        "Every cell MUST have :doc and :schema with :input and :output using lite Malli syntax "
+                        "(e.g. {:handle :string, :message :string}). "
+                        "New cells must have schemas compatible with their neighbors in the pipeline/edges.")
                    message)]
     (if-not llm-client
       (do

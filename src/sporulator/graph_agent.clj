@@ -40,15 +40,37 @@
          :error  "Manifest must contain :id, :cells, and :edges or :pipeline"}
         ;; Run full programmatic validation
         (let [result (mv/validate-manifest parsed)]
-          (case (:status result)
-            :ok      {:status :ok :manifest (:manifest result)}
-            :warning {:status     :ok
-                      :manifest   (:manifest result)
-                      :mismatches (:mismatches result)}
-            :error   {:status :invalid-manifest
-                      :error  (mv/format-issues result)
-                      :issues (:issues result)
-                      :mismatches (:mismatches result)}))))))
+          (let [base-result
+                (case (:status result)
+                  :ok      {:status :ok :manifest (:manifest result)}
+                  :warning {:status     :ok
+                            :manifest   (:manifest result)
+                            :mismatches (:mismatches result)}
+                  :error   {:status :invalid-manifest
+                            :error  (mv/format-issues result)
+                            :issues (:issues result)
+                            :mismatches (:mismatches result)})]
+            ;; Check for cells with generic [:map] schemas (no fields)
+            (if (= :ok (:status base-result))
+              (let [generic-cells
+                    (->> (:cells (:manifest base-result))
+                         (keep (fn [[cell-name cell-def]]
+                                 (let [in  (get-in cell-def [:schema :input])
+                                       out (get-in cell-def [:schema :output])]
+                                   (when (or (= in [:map]) (= in '(:map))
+                                             (= out [:map]) (= out '(:map)))
+                                     cell-name))))
+                         vec)]
+                (if (seq generic-cells)
+                  {:status     :invalid-manifest
+                   :error      (str "These cells have generic [:map] schemas without fields: "
+                                    (str/join ", " generic-cells)
+                                    ". Each cell must have field-level schemas like "
+                                    "{:input {:handle :string, :message :string} "
+                                    ":output {:handle :string, :message :string}}.")
+                   :issues     [(str "Generic schemas on: " (str/join ", " generic-cells))]}
+                  base-result))
+              base-result)))))))
 
 (defn extract-manifest
   "Extracts the first manifest from an LLM response.

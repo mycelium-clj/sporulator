@@ -90,7 +90,7 @@
     (let [edn (str "{:id :todo"
                    " :cells {:start {:id :todo/parse"
                    "                 :doc \"Parses input\""
-                   "                 :schema {:input [:map] :output [:map [:result :string]]}}}"
+                   "                 :schema {:input {:data :string} :output {:result :string}}}}"
                    " :pipeline [:start]}")
           result (ga/validate-manifest-edn edn)]
       (is (= :ok (:status result)))
