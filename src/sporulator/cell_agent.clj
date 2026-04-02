@@ -4,6 +4,7 @@
             [sporulator.codegen :as codegen]
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
+            [sporulator.feedback :refer [feedback-loop]]
             [sporulator.llm :as llm]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
@@ -99,6 +100,7 @@
 
 (defn implement-with-feedback
   "Generates a cell, evaluates it in-process, and auto-fixes errors.
+   Uses the general-purpose feedback-loop with eval + registry validation.
 
    on-chunk    — called with each token fragment
    on-feedback — called with {:event-type :attempt :code :output :message}
@@ -109,74 +111,53 @@
    & {:keys [on-feedback max-attempts]
       :or   {max-attempts 3}}]
   (let [session  (create-cell-session (:id brief))
-        prompt   (build-cell-prompt brief)
-        feedback (or on-feedback (fn [_]))]
-    (loop [msg     prompt
-           attempt 0]
-      (let [content (llm/session-send-stream session client msg on-chunk)
-            result  (build-result (:id brief) content)
-            code    (:code result)]
-        (if-not code
-          (do
-            (feedback {:event-type "error"
-                       :attempt    (inc attempt)
-                       :message    "No defcell form found in LLM response"})
-            (assoc result :status :error
-                          :error "No defcell form found"
-                          :session session))
+        cell-kw  (->keyword (:id brief))
+        feedback (or on-feedback (fn [_]))
+        result   (feedback-loop
+                   {:client      client
+                    :session     session
+                    :initial-msg (build-cell-prompt brief)
+                    :extract-fn  (fn [content]
+                                   (let [code (extract/extract-defcell content)
+                                         source (or (extract/extract-first-code-block content) code)]
+                                     {:content content :code code :source source}))
+                    :validate-fn (fn [{:keys [code source]}]
+                                   (cond
+                                     (nil? code)
+                                     {:error "No defcell form found in LLM response"}
 
-          ;; Try to eval the cell
-          (let [source   (or (extract/extract-first-code-block content) code)
-                eval-res (ev/eval-code source)]
-            (if (= :ok (:status eval-res))
-              ;; Eval succeeded — verify cell registered
-              (let [verify (ev/verify-cell-contract
-                             (->keyword (:id brief)))]
-                (if (= :ok (:status verify))
-                  (do
-                    (feedback {:event-type "success"
-                               :attempt    (inc attempt)
-                               :code       source
-                               :output     (:output eval-res)
-                               :message    "Cell loaded successfully"})
-                    (assoc result :status :ok :session session))
-                  ;; Cell not in registry
-                  (do
-                    (feedback {:event-type "error"
-                               :attempt    (inc attempt)
-                               :code       source
-                               :output     (:error verify)
-                               :message    "Cell not registered after eval"})
-                    (if (< attempt max-attempts)
-                      (recur (str "The code evaluated without error but the cell "
-                                  (:id brief) " was not found in the registry.\n\n"
-                                  "Please fix and return the complete source including "
-                                  "the `(ns ...)` form and `(cell/defcell ...)` form.")
-                             (inc attempt))
-                      (assoc result :status :error
-                                    :error (:error verify)
-                                    :session session)))))
+                                     (not= :ok (:status (ev/eval-code source)))
+                                     {:error (str "Eval error: " (:error (ev/eval-code source)))}
 
-              ;; Eval failed — ask LLM to fix
-              (do
-                (feedback {:event-type "error"
-                           :attempt    (inc attempt)
-                           :code       source
-                           :output     (:error eval-res)
-                           :message    "Eval error, requesting fix"})
-                (if (< attempt max-attempts)
-                  (do
-                    (feedback {:event-type "fix"
-                               :attempt    (inc attempt)
-                               :message    "Requesting fix from LLM"})
-                    (recur (str "The code produced this error when evaluated:\n\n```\n"
-                                (:error eval-res)
-                                "\n```\n\nPlease fix the issue and return the corrected "
-                                "`cell/defcell` form with the full `(ns ...)` declaration.")
-                           (inc attempt)))
-                  (assoc result :status :error
-                                :error (:error eval-res)
-                                :session session))))))))))
+                                     (not= :ok (:status (ev/verify-cell-contract cell-kw)))
+                                     {:error (str "Cell " (:id brief) " not found in registry after eval")}
+
+                                     :else
+                                     {:ok {:code code :source source}}))
+                    :error-msg-fn (fn [{:keys [source]} error]
+                                    (str error "\n\n"
+                                         (when source
+                                           (str "Your code:\n```clojure\n" source "\n```\n\n"))
+                                         "Please fix and return the corrected "
+                                         "`cell/defcell` form with the full `(ns ...)` declaration."))
+                    :on-chunk    on-chunk
+                    :on-attempt  (fn [{:keys [attempt extracted error]}]
+                                   (feedback {:event-type (if error "error" "success")
+                                              :attempt    attempt
+                                              :code       (:source extracted)
+                                              :output     (or error "")
+                                              :message    (if error error "Cell loaded successfully")}))
+                    :max-attempts max-attempts})]
+    (if (= :ok (:status result))
+      {:status  :ok
+       :cell-id (:id brief)
+       :code    (get-in result [:result :code])
+       :raw     (get-in result [:result :source])
+       :session session}
+      {:status  :error
+       :cell-id (:id brief)
+       :error   (:error result)
+       :session session})))
 
 ;; ── Parallel implementation ────────────────────────────────────
 
