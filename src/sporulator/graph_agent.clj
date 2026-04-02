@@ -2,6 +2,7 @@
   "Graph agent for designing Mycelium workflow manifests via LLM."
   (:require [clojure.string :as str]
             [sporulator.extract :as extract]
+            [sporulator.feedback :refer [feedback-loop]]
             [sporulator.llm :as llm]
             [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
@@ -266,51 +267,45 @@
   [client session-id message on-chunk
    & {:keys [store on-feedback max-retries]
       :or {max-retries 3}}]
-  (let [session (get-or-create-session session-id store)]
-    (loop [msg     message
-           attempt 0]
-      (persist-turn! store session-id "user" msg)
-      (let [content (llm/session-send-stream session client msg on-chunk)]
-        (persist-turn! store session-id "assistant" content)
-        ;; Check for manifest in response
-        (let [block (extract/extract-first-code-block content)]
-          (if (and block (looks-like-manifest? block))
-            ;; Validate the manifest EDN
-            (let [validation (validate-manifest-edn block)]
-              (if (= :ok (:status validation))
-                (do
-                  (when store
-                    (save-response-manifest! store content))
-                  (when on-feedback
-                    (on-feedback {:event-type "success"
-                                  :attempt    (inc attempt)
-                                  :code       block
-                                  :output     ""
-                                  :message    "Manifest validated"}))
-                  content)
-                ;; Validation failed — retry if we have attempts left
-                (if (< attempt max-retries)
-                  (let [fix-msg (str "The manifest has validation issues:\n"
-                                     (:error validation)
-                                     (when (:mismatches validation)
-                                       (str "\n\n" (mv/format-issues
-                                                     {:mismatches (:mismatches validation)})))
-                                     "\n\nPlease fix the manifest and return the corrected EDN.")]
-                    (when on-feedback
-                      (on-feedback {:event-type "error"
-                                    :attempt    (inc attempt)
-                                    :code       block
-                                    :output     (:error validation)
-                                    :message    "Manifest validation failed, retrying"}))
-                    (recur fix-msg (inc attempt)))
-                  ;; Out of retries — return as-is
-                  (do
-                    (when on-feedback
-                      (on-feedback {:event-type "error"
-                                    :attempt    (inc attempt)
-                                    :code       block
-                                    :output     (:error validation)
-                                    :message    "Max retries reached"}))
-                    content))))
-            ;; No manifest in response — just return
-            content))))))
+  (let [session (get-or-create-session session-id store)
+        result  (feedback-loop
+                  {:client      client
+                   :session     session
+                   :initial-msg message
+                   :extract-fn  (fn [content]
+                                  (persist-turn! store session-id "assistant" content)
+                                  (let [block (extract/extract-first-code-block content)]
+                                    {:content content :block block}))
+                   :validate-fn (fn [{:keys [content block]}]
+                                  (if (and block (looks-like-manifest? block))
+                                    (let [validation (validate-manifest-edn block)]
+                                      (if (= :ok (:status validation))
+                                        (do (when store (save-response-manifest! store content))
+                                            {:ok content})
+                                        {:error (str (:error validation)
+                                                     (when (:mismatches validation)
+                                                       (str "\n\n" (mv/format-issues
+                                                                     {:mismatches (:mismatches validation)}))))
+                                         :mismatches (:mismatches validation)}))
+                                    ;; No manifest — accept as-is
+                                    {:ok content}))
+                   :error-msg-fn (fn [_ error]
+                                   (str "The manifest has validation issues:\n"
+                                        error
+                                        "\n\nPlease fix the manifest and return the corrected EDN."))
+                   :on-chunk    on-chunk
+                   :on-attempt  (fn [{:keys [attempt extracted error]}]
+                                  (persist-turn! store session-id "user"
+                                    (if error
+                                      (str "Fix manifest: " error)
+                                      ""))
+                                  (when on-feedback
+                                    (on-feedback
+                                      {:event-type (if error "error" "success")
+                                       :attempt    attempt
+                                       :code       (:block extracted)
+                                       :output     (or error "")
+                                       :message    (if error "Manifest validation failed, retrying"
+                                                       "Manifest validated")})))
+                   :max-attempts max-retries})]
+    (or (:result result) (:last-value result))))

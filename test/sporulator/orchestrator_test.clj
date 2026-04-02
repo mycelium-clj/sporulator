@@ -1,6 +1,7 @@
 (ns sporulator.orchestrator-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.string :as str]
+            [sporulator.feedback :as fb]
             [sporulator.orchestrator :as orch]
             [sporulator.store :as store]
             [sporulator.llm :as llm]))
@@ -310,7 +311,7 @@
           (with-redefs
             [llm/session-send-stream
              (mock-llm-send-stream (fn [_] (swap! call-count inc) "good-value"))]
-            (orch/feedback-loop
+            (fb/feedback-loop
               {:client      nil
                :session     (llm/create-session "test-fb" "")
                :initial-msg "generate something"
@@ -331,7 +332,7 @@
                (fn [_]
                  (swap! call-count inc)
                  (if (= 1 @call-count) "bad-value" "good-value")))]
-            (orch/feedback-loop
+            (fb/feedback-loop
               {:client      nil
                :session     (llm/create-session "test-fb2" "")
                :initial-msg "generate something"
@@ -347,7 +348,7 @@
           (with-redefs
             [llm/session-send-stream
              (mock-llm-send-stream (fn [_] "always-bad"))]
-            (orch/feedback-loop
+            (fb/feedback-loop
               {:client      nil
                :session     (llm/create-session "test-fb3" "")
                :initial-msg "generate something"
@@ -364,7 +365,7 @@
           (with-redefs
             [llm/session-send-stream
              (mock-llm-send-stream (fn [_] "```clojure\n42\n```"))]
-            (orch/feedback-loop
+            (fb/feedback-loop
               {:client      nil
                :session     (llm/create-session "test-fb4" "")
                :initial-msg "give me a number"

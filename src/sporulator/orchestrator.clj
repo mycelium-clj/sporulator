@@ -10,50 +10,12 @@
             [sporulator.codegen :as codegen]
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
+            [sporulator.feedback :refer [feedback-loop]]
             [sporulator.llm :as llm]
             [sporulator.hashline :as hashline]
             [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
-
-;; ── Feedback loop ─────────────────────────────────────────────
-
-(defn feedback-loop
-  "General-purpose LLM feedback loop. Sends a prompt, evaluates the response
-   mechanically, and iterates with error feedback until success or max attempts.
-
-   Options:
-     :client       — LLM client
-     :session      — LLM session (or creates a new one)
-     :initial-msg  — first prompt to send
-     :extract-fn   — (fn [raw-response] -> extracted-value) to parse LLM output
-     :validate-fn  — (fn [extracted] -> {:ok result} | {:error message}) mechanical check
-     :error-msg-fn — (fn [extracted error] -> fix-prompt-string) builds feedback for LLM
-     :on-chunk     — streaming callback
-     :on-attempt   — (fn [{:keys [attempt extracted error]}]) progress callback
-     :max-attempts — max retries (default 3)
-
-   Returns {:status :ok :result value :attempts n}
-        or {:status :error :error message :last-value value :attempts n}."
-  [{:keys [client session initial-msg extract-fn validate-fn error-msg-fn
-           on-chunk on-attempt max-attempts]
-    :or {max-attempts 3
-         extract-fn identity
-         on-chunk (fn [_])
-         on-attempt (fn [_])}}]
-  (loop [msg     initial-msg
-         attempt 0]
-    (let [raw       (llm/session-send-stream session client msg on-chunk)
-          extracted (extract-fn raw)
-          result    (validate-fn extracted)]
-      (on-attempt {:attempt (inc attempt) :extracted extracted
-                   :error (:error result) :ok? (contains? result :ok)})
-      (if (contains? result :ok)
-        {:status :ok :result (:ok result) :attempts (inc attempt)}
-        (if (>= attempt max-attempts)
-          {:status :error :error (:error result) :last-value extracted :attempts (inc attempt)}
-          (recur (error-msg-fn extracted (:error result))
-                 (inc attempt)))))))
 
 ;; ── System EDN reading ────────────────────────────────────────
 
@@ -275,6 +237,9 @@
 
 ;; ── Lint fix loop ──────────────────────────────────────────────
 
+(defn- format-lint-errors [lint]
+  (str/join "\n" (map #(str "- Line " (:line %) ": " (:message %)) (:errors lint))))
+
 (defn lint-fix-loop
   "Runs clj-kondo on code. If lint errors found, asks LLM to fix syntax
    only (no logic changes). Retries up to max-attempts.
@@ -282,34 +247,38 @@
   [client session code cell-id
    & {:keys [max-attempts on-chunk on-event]
       :or   {max-attempts 3}}]
-  (loop [current-code code
-         attempt      0]
-    (let [lint (ev/lint-code current-code)]
-      (if-not (seq (:errors lint))
-        {:status :ok :code current-code}
-        ;; Lint errors found
-        (do
-          (when on-event
-            (on-event {:phase "cell_implement" :status "lint_fix"
-                       :cell-id cell-id :attempt (inc attempt)
-                       :message (str (count (:errors lint)) " lint errors")}))
-          (if (>= attempt max-attempts)
-            {:status :error
-             :error  (str "Lint errors persist after " max-attempts " attempts: "
-                          (str/join "; " (map :message (:errors lint))))}
-            ;; Ask LLM to fix syntax only
-            (let [fix-prompt (str "Fix ONLY the syntax errors in this code. "
-                                  "Do NOT change any logic.\n\n"
-                                  "**Errors:**\n"
-                                  (str/join "\n" (map #(str "- Line " (:line %) ": " (:message %))
-                                                      (:errors lint)))
-                                  "\n\n**Code:**\n```clojure\n" current-code "\n```")
-                  fixed (if session
-                          (llm/session-send-stream session client fix-prompt
-                            (or on-chunk (fn [_])))
-                          current-code)
-                  extracted (or (extract/extract-first-code-block fixed) fixed)]
-              (recur extracted (inc attempt)))))))))
+  ;; Check if code is already clean
+  (let [lint (ev/lint-code code)]
+    (if-not (seq (:errors lint))
+      {:status :ok :code code}
+      ;; Lint errors — enter feedback loop
+      (let [result (feedback-loop
+                     {:client      client
+                      :session     (or session (llm/create-session (str "lint:" cell-id) ""))
+                      :initial-msg (str "Fix ONLY the syntax errors in this code. "
+                                        "Do NOT change any logic.\n\n"
+                                        "**Errors:**\n" (format-lint-errors lint)
+                                        "\n\n**Code:**\n```clojure\n" code "\n```")
+                      :extract-fn  (fn [raw] (or (extract/extract-first-code-block raw) raw))
+                      :validate-fn (fn [fixed-code]
+                                     (let [lint (ev/lint-code fixed-code)]
+                                       (if (seq (:errors lint))
+                                         {:error (format-lint-errors lint)}
+                                         {:ok fixed-code})))
+                      :error-msg-fn (fn [fixed-code error]
+                                      (str "Fix ONLY the syntax errors. Do NOT change logic.\n\n"
+                                           "**Remaining errors:**\n" error
+                                           "\n\n**Code:**\n```clojure\n" fixed-code "\n```"))
+                      :on-chunk    (or on-chunk (fn [_]))
+                      :on-attempt  (fn [{:keys [attempt error]}]
+                                     (when on-event
+                                       (on-event {:phase "cell_implement" :status "lint_fix"
+                                                  :cell-id cell-id :attempt attempt
+                                                  :message (or error "")})))
+                      :max-attempts max-attempts})]
+        (if (= :ok (:status result))
+          {:status :ok :code (:result result)}
+          {:status :error :error (:error result)})))))
 
 ;; ── Structural auto-fix + validation ──────────────────────────
 
