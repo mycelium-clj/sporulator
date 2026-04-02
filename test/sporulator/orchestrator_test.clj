@@ -298,3 +298,79 @@
                  :auto-approve? true}))]
         (is (some? resume-result))
         (is (= "ok" (get resume-result "status")))))))
+
+;; =============================================================
+;; feedback-loop
+;; =============================================================
+
+(deftest feedback-loop-test
+  (testing "succeeds on first attempt when validation passes"
+    (let [call-count (atom 0)
+          result
+          (with-redefs
+            [llm/session-send-stream
+             (mock-llm-send-stream (fn [_] (swap! call-count inc) "good-value"))]
+            (orch/feedback-loop
+              {:client      nil
+               :session     (llm/create-session "test-fb" "")
+               :initial-msg "generate something"
+               :validate-fn (fn [v] (if (= v "good-value") {:ok v} {:error "bad"}))
+               :error-msg-fn (fn [v e] (str "Fix: " e))
+               :max-attempts 3}))]
+      (is (= :ok (:status result)))
+      (is (= "good-value" (:result result)))
+      (is (= 1 (:attempts result)))
+      (is (= 1 @call-count))))
+
+  (testing "retries and succeeds on second attempt"
+    (let [call-count (atom 0)
+          result
+          (with-redefs
+            [llm/session-send-stream
+             (mock-llm-send-stream
+               (fn [_]
+                 (swap! call-count inc)
+                 (if (= 1 @call-count) "bad-value" "good-value")))]
+            (orch/feedback-loop
+              {:client      nil
+               :session     (llm/create-session "test-fb2" "")
+               :initial-msg "generate something"
+               :validate-fn (fn [v] (if (= v "good-value") {:ok v} {:error "not good"}))
+               :error-msg-fn (fn [v e] (str "You returned '" v "'. " e ". Try again."))
+               :max-attempts 3}))]
+      (is (= :ok (:status result)))
+      (is (= "good-value" (:result result)))
+      (is (= 2 (:attempts result)))))
+
+  (testing "fails after max attempts"
+    (let [result
+          (with-redefs
+            [llm/session-send-stream
+             (mock-llm-send-stream (fn [_] "always-bad"))]
+            (orch/feedback-loop
+              {:client      nil
+               :session     (llm/create-session "test-fb3" "")
+               :initial-msg "generate something"
+               :validate-fn (fn [_] {:error "still wrong"})
+               :error-msg-fn (fn [_ e] (str "Fix: " e))
+               :max-attempts 2}))]
+      (is (= :error (:status result)))
+      (is (= "still wrong" (:error result)))
+      (is (= "always-bad" (:last-value result)))
+      (is (= 3 (:attempts result)))))
+
+  (testing "extract-fn transforms LLM output before validation"
+    (let [result
+          (with-redefs
+            [llm/session-send-stream
+             (mock-llm-send-stream (fn [_] "```clojure\n42\n```"))]
+            (orch/feedback-loop
+              {:client      nil
+               :session     (llm/create-session "test-fb4" "")
+               :initial-msg "give me a number"
+               :extract-fn  (fn [raw] (str/trim (str/replace raw #"```\w*\n?|```" "")))
+               :validate-fn (fn [v] (if (= v "42") {:ok 42} {:error "not 42"}))
+               :error-msg-fn (fn [_ e] e)
+               :max-attempts 1}))]
+      (is (= :ok (:status result)))
+      (is (= 42 (:result result))))))
