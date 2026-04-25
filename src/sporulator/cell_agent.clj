@@ -1,11 +1,10 @@
 (ns sporulator.cell-agent
   "Cell agent for implementing Mycelium cells via LLM with eval feedback loops."
   (:require [clojure.string :as str]
-            [sporulator.codegen :as codegen]
-            [sporulator.eval :as ev]
+            [sporulator.agent-loop :as agent-loop]
             [sporulator.extract :as extract]
-            [sporulator.feedback :refer [feedback-loop]]
             [sporulator.llm :as llm]
+            [sporulator.mcp-bridge :as mcp]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
 
@@ -99,65 +98,49 @@
            :session session)))
 
 (defn implement-with-feedback
-  "Generates a cell, evaluates it in-process, and auto-fixes errors.
-   Uses the general-purpose feedback-loop with eval + registry validation.
+  "Generates a cell using the interactive agent loop.
+   The agent loop uses tool-call dispatch (DISPATCH -> REVIEW phases)
+   for exploration and incremental implementation.
 
    on-chunk    — called with each token fragment
    on-feedback — called with {:event-type :attempt :code :output :message}
+   code-graph  — code graph facts set (from build-cell-graph)
+   mcp-ctx     — mcp-bridge context map
 
    Returns {:status :ok :cell-id :code :raw :session}
         or {:status :error :error msg}"
   [client brief on-chunk
-   & {:keys [on-feedback max-attempts]
+   & {:keys [on-feedback max-attempts code-graph mcp-ctx]
       :or   {max-attempts 3}}]
-  (let [session  (create-cell-session (:id brief))
-        cell-kw  (->keyword (:id brief))
+  (let [cell-kw  (->keyword (:id brief))
         feedback (or on-feedback (fn [_]))
-        result   (feedback-loop
+        result   (agent-loop/run!
                    {:client      client
-                    :session     session
-                    :initial-msg (build-cell-prompt brief)
-                    :extract-fn  (fn [content]
-                                   (let [code (extract/extract-defcell content)
-                                         source (or (extract/extract-first-code-block content) code)]
-                                     {:content content :code code :source source}))
-                    :validate-fn (fn [{:keys [code source]}]
-                                   (cond
-                                     (nil? code)
-                                     {:error "No defcell form found in LLM response"}
-
-                                     (not= :ok (:status (ev/eval-code source)))
-                                     {:error (str "Eval error: " (:error (ev/eval-code source)))}
-
-                                     (not= :ok (:status (ev/verify-cell-contract cell-kw)))
-                                     {:error (str "Cell " (:id brief) " not found in registry after eval")}
-
-                                     :else
-                                     {:ok {:code code :source source}}))
-                    :error-msg-fn (fn [{:keys [source]} error]
-                                    (str error "\n\n"
-                                         (when source
-                                           (str "Your code:\n```clojure\n" source "\n```\n\n"))
-                                         "Please fix and return the corrected "
-                                         "`cell/defcell` form with the full `(ns ...)` declaration."))
+                    :cell-id     cell-kw
+                    :brief       brief
+                    :graph       code-graph
+                    :mcp-ctx     (or mcp-ctx
+                                   (mcp/build-context
+                                     {:cell-id   cell-kw
+                                      :brief     brief
+                                      :graph     code-graph}))
+                    :turn-budget max-attempts
                     :on-chunk    on-chunk
-                    :on-attempt  (fn [{:keys [attempt extracted error]}]
-                                   (feedback {:event-type (if error "error" "success")
-                                              :attempt    attempt
-                                              :code       (:source extracted)
-                                              :output     (or error "")
-                                              :message    (if error error "Cell loaded successfully")}))
-                    :max-attempts max-attempts})]
+                    :on-event    (fn [event]
+                                  (feedback {:event-type (get event "status" "event")
+                                             :message    (get event "message" "")
+                                             :code       (get event "code" "")
+                                             :output     (get event "output" "")}))})]
     (if (= :ok (:status result))
       {:status  :ok
        :cell-id (:id brief)
-       :code    (get-in result [:result :code])
-       :raw     (get-in result [:result :source])
-       :session session}
+       :code    (:code result)
+       :raw     (:raw result)
+       :session (:session result)}
       {:status  :error
        :cell-id (:id brief)
        :error   (:error result)
-       :session session})))
+       :session (:session result)})))
 
 ;; ── Parallel implementation ────────────────────────────────────
 

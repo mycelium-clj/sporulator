@@ -5,8 +5,9 @@
             [clojure.data.json :as json]
             [zprint.core :as zp]
             [clojure.string :as str]
+            [sporulator.agent-loop :as agent-loop]
             [sporulator.cell-agent :as cell-agent]
-            [sporulator.source-gen :as source-gen]
+            [sporulator.code-graph :as cg]
             [sporulator.codegen :as codegen]
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
@@ -14,7 +15,9 @@
             [sporulator.llm :as llm]
             [sporulator.hashline :as hashline]
             [sporulator.manifest-validate :as mv]
+            [sporulator.mcp-bridge :as mcp]
             [sporulator.prompts :as prompts]
+            [sporulator.source-gen :as source-gen]
             [sporulator.store :as store]))
 
 ;; ── System EDN reading ────────────────────────────────────────
@@ -400,7 +403,9 @@
        "Do NOT include `(ns ...)` or `(cell/defcell ...)` — those are generated for you.\n"))
 
 (defn implement-from-contract
-  "Implements a cell from a test contract using the LLM + eval feedback loop.
+  "Implements a cell from a test contract using the interactive agent loop.
+   The agent loop uses tool-call dispatch (DISPATCH -> REVIEW phases) instead
+   of the old monolithic eval-feedback retry loop.
 
    Options:
      :contract     — test contract map
@@ -408,230 +413,57 @@
      :run-id       — orchestration run ID
      :on-event     — event callback
      :on-chunk     — streaming callback
-     :max-attempts — max fix attempts (default 3)
+     :max-attempts — max fix attempts (default 3) — forwarded as turn-budget
      :project-path — project root directory for writing source files
-     :base-ns      — base namespace for source files"
+     :base-ns      — base namespace for source files
+     :graph        — code graph facts set (from manifest)
+     :mcp-ctx      — mcp-bridge context map
+     :task         — overall orchestration task description"
   [client {:keys [contract store run-id on-event on-chunk max-attempts
-                  project-path base-ns]
+                  project-path base-ns graph mcp-ctx task]
            :or   {max-attempts 3}}]
   (let [{:keys [cell-id brief test-code cell-ns]} contract
-        session (or (:session contract)
-                    (llm/create-session (str "impl:" cell-id) prompts/cell-prompt))]
-    (emit on-event "cell_implement" "started" :cell-id cell-id)
-
-    ;; Pre-parse schema once (used in every iteration)
-    (let [cell-id-kw (let [s (str cell-id)]
-                       (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
-          schema-parsed (try
-                          (let [raw (binding [*read-eval* false]
-                                     (clojure.edn/read-string (:schema brief)))
-                                fix-keys (fn fix-keys [v]
-                                           (cond
-                                             ;; Map with string or symbol keys → keyword-key map (lite Malli)
-                                             (and (map? v)
-                                                  (seq v)
-                                                  (every? #(or (string? %) (symbol? %)) (keys v)))
-                                             (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
-                                             ;; Already keyword-keyed map → pass through (valid lite Malli)
-                                             (and (map? v) (seq v) (every? keyword? (keys v)))
-                                             v
-                                             ;; Vector starting with "map" string → convert to [:map ...]
-                                             (and (vector? v) (= "map" (first v)))
-                                             (into [:map] (map (fn [entry]
-                                                                  (if (vector? entry)
-                                                                    [(keyword (first entry)) (keyword (second entry))]
-                                                                    (keyword entry)))
-                                                                (rest v)))
-                                             ;; String or symbol → keyword
-                                             (string? v) (keyword v)
-                                             (symbol? v) (keyword v)
-                                             :else v))]
-                            {:input  (fix-keys (:input raw))
-                             :output (fix-keys (:output raw))})
-                          (catch Exception _ {:input [:map] :output [:map]}))]
-
-    (loop [msg     (build-impl-prompt contract)
-           attempt 0]
-      (let [content  (llm/session-send-stream session client msg on-chunk)
-            raw-code (or (extract/extract-first-code-block content) content)
-            fn-body       (extract/extract-fn-body raw-code)
-            helpers       (extract/extract-helpers raw-code)
-            extra-requires (extract/extract-extra-requires raw-code)]
-
-        ;; If we couldn't extract a (fn ...) form, tell the LLM exactly what's wrong
-        (if (and (nil? fn-body) (< attempt max-attempts))
-          (do
-            (emit on-event "cell_implement" "error" :cell-id cell-id
-                  :message "No (fn [resources data] ...) form found" :attempt (inc attempt))
-            (when store
-              (store/save-cell-attempt! store
-                {:run-id run-id :cell-id cell-id :attempt-type "implement"
-                 :attempt-number (inc attempt) :code raw-code
-                 :output "Could not find (fn [resources data] ...) in your response" :passed? false}))
-            (recur (str "Your response did not contain a valid `(fn [resources data] ...)` form.\n\n"
-                        "I received:\n```\n" (subs raw-code 0 (min 500 (count raw-code))) "\n```\n\n"
-                        "You MUST return a `(fn [resources data] ...)` as the LAST form in your response.\n"
-                        "The function should take two arguments:\n"
-                        "- `resources` — map of injected dependencies (e.g. {:db datasource})\n"
-                        "- `data` — map of input data with keyword keys (e.g. {:handle \"user\" :message \"hi\"})\n\n"
-                        "Return ONLY the function. Example:\n"
-                        "```clojure\n(fn [resources data]\n  {:result-key (some-computation (:input-key data))})\n```")
-                   (inc attempt)))
-
-          ;; We have a fn-body (or exhausted attempts) — assemble and eval
-          (let [fn-body (or fn-body '(fn [resources data] data)) ;; last-resort identity
-                source (codegen/assemble-cell-source
-                         {:cell-ns        cell-ns
-                          :cell-id        cell-id-kw
-                          :doc            (or (:doc brief) "")
-                          :schema         schema-parsed
-                          :requires       (mapv keyword (or (:requires brief) []))
-                          :extra-requires (or extra-requires [])
-                          :helpers        (or helpers [])
-                          :fn-body        fn-body})]
-
-        (emit on-event "cell_implement" "written" :cell-id cell-id
-              :attempt (inc attempt))
-
-        ;; Eval cell + tests together (avoids require-can't-find-namespace issue)
-        ;; Replace the cell require in test source so it doesn't try to load from disk
-        (let [test-src-fixed (if cell-ns
-                               (str/replace test-code
-                                 (str "[" cell-ns "]")
-                                 (str "[" cell-ns " :as _cell-ns]"))
-                               test-code)
-              combined (str source "\n\n" test-src-fixed)
-              eval-res (ev/eval-code combined)]
-          (if (not= :ok (:status eval-res))
-            ;; Eval failed (cell or test loading)
-            (do
-              (emit on-event "cell_implement" "error" :cell-id cell-id
-                    :message (:error eval-res) :attempt (inc attempt))
-              (when store
-                (store/save-cell-attempt! store
-                  {:run-id run-id :cell-id cell-id :attempt-type "implement"
-                   :attempt-number (inc attempt) :code source
-                   :output (:error eval-res) :passed? false}))
-              (if (< attempt max-attempts)
-                (recur (str "The code produced this error when evaluated:\n```\n"
-                            (:error eval-res)
-                            "\n```\n\n"
-                            "Your handler function (which was assembled into the cell) was:\n```clojure\n"
-                            (pr-str fn-body)
-                            "\n```\n\n"
-                            "Please fix and return ONLY the corrected `(fn [resources data] ...)` handler.\n"
-                            "Remember:\n"
-                            "- Input data uses KEYWORD keys like `:handle`, `:message` (not strings)\n"
-                            "- Return a map with KEYWORD keys\n"
-                            "- Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you")
-                       (inc attempt))
-                {:status :error :error (:error eval-res) :cell-id cell-id}))
-
-            ;; Eval succeeded — run the tests from the loaded test namespace
-            (let [test-ns-name (second (re-find #"\(ns\s+(\S+)" test-code))
-                  test-ns      (when test-ns-name (find-ns (symbol test-ns-name)))
-                  test-res     (if test-ns
-                                 ;; Run tests via clojure.test
-                                 (let [out       (java.io.StringWriter.)
-                                       counters  (atom {:test 0 :pass 0 :fail 0 :error 0})
-                                       reporter  (fn [m]
-                                                   (case (:type m)
-                                                     :begin-test-ns nil
-                                                     :end-test-ns nil
-                                                     :begin-test-var (swap! counters update :test inc)
-                                                     :pass (swap! counters update :pass inc)
-                                                     :fail (do (swap! counters update :fail inc)
-                                                               (.write out
-                                                                 (str "\nFAIL in " (clojure.test/testing-vars-str m) "\n"
-                                                                      (:message m "")
-                                                                      "\nexpected: " (pr-str (:expected m))
-                                                                      "\n  actual: " (pr-str (:actual m)) "\n")))
-                                                     :error (do (swap! counters update :error inc)
-                                                                (.write out
-                                                                  (str "\nERROR in " (clojure.test/testing-vars-str m) "\n"
-                                                                       (:message m "")
-                                                                       "\n  actual: " (pr-str (:actual m)) "\n")))
-                                                     :summary nil
-                                                     nil))
-                                       _         (binding [*out* out
-                                                           clojure.test/report reporter]
-                                                   (clojure.test/run-tests test-ns))
-                                       summary   @counters]
-                                   {:status  :ok
-                                    :passed? (and (zero? (:fail summary))
-                                                  (zero? (:error summary)))
-                                    :summary summary
-                                    :output  (str (:output eval-res) (str out))})
-                                 ;; Test namespace not found
-                                 {:status :error
-                                  :error  (str "Test namespace not found: " test-ns-name)
-                                  :output (:output eval-res)})]
-              (when store
-                (store/save-cell-attempt! store
-                  {:run-id run-id :cell-id cell-id :attempt-type "test"
-                   :attempt-number (inc attempt) :code source
-                   :test-code test-code
-                   :output (:output test-res)
-                   :passed? (and (= :ok (:status test-res)) (:passed? test-res))}))
-
-              (cond
-                ;; Tests not runnable
-                (not= :ok (:status test-res))
-                (do
-                  (emit on-event "cell_test" "error" :cell-id cell-id
-                        :message (:error test-res))
-                  (if (< attempt max-attempts)
-                    (recur (str "Tests failed to load with this error:\n```\n"
-                                (:error test-res)
-                                "\n```\n\n"
-                                "Your handler was:\n```clojure\n" (pr-str fn-body) "\n```\n\n"
-                                "Please fix and return ONLY the corrected `(fn [resources data] ...)` handler.\n"
-                                "Remember: use KEYWORD keys (:handle, :message) not string keys.")
-                           (inc attempt))
-                    {:status :error :error (:error test-res) :cell-id cell-id}))
-
-                ;; Tests passed
-                (:passed? test-res)
-                (let [formatted-source (format-source source)]
-                  (emit on-event "cell_test" "passed" :cell-id cell-id
-                        :attempt (inc attempt))
-                  ;; Save cell to store
-                  (when store
-                    (let [defcell-code (extract/extract-defcell content)]
-                      (store/save-cell! store
-                        {:id         cell-id
-                         :handler    (format-source (or defcell-code source))
-                         :schema     (or (:schema brief) "")
-                         :doc        (or (:doc brief) "")
-                         :created-by "cell-agent-tdd"})))
-                  ;; Write formatted source file to disk
-                  (when (and project-path base-ns)
-                    (source-gen/write-cell! project-path base-ns cell-id formatted-source)
-                    (emit on-event "cell_implement" "file_written"
-                          :cell-id cell-id))
-                  {:status :ok :cell-id cell-id
-                   :output (:output test-res)
-                   :summary (:summary test-res)})
-
-                ;; Tests failed — retry
-                :else
-                (do
-                  (emit on-event "cell_test" "failed" :cell-id cell-id
-                        :attempt (inc attempt))
-                  (if (< attempt max-attempts)
-                    (let [fix-prompt (prompts/build-graduated-fix-prompt
-                                      {:test-output (:output test-res)
-                                       :test-code   test-code
-                                       :impl-code   source
-                                       :brief       brief
-                                       :cell-id     cell-id
-                                       :attempt     (inc attempt)
-                                       :max-attempts max-attempts})]
-                      (recur fix-prompt (inc attempt)))
-                    {:status :error
-                     :error  (str "Tests failed after " (inc attempt) " attempts")
-                     :cell-id cell-id
-                     :output (:output test-res)})))))))))))))
+        cell-id-kw (let [s (str cell-id)]
+                     (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+        schema-parsed (try
+                        (let [raw (binding [*read-eval* false]
+                                   (clojure.edn/read-string (:schema brief)))
+                              fix-keys (fn fix-keys [v]
+                                         (cond
+                                           (and (map? v) (seq v)
+                                                (every? #(or (string? %) (symbol? %)) (keys v)))
+                                           (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
+                                           (and (map? v) (seq v) (every? keyword? (keys v)))
+                                           v
+                                           (and (vector? v) (= "map" (first v)))
+                                           (into [:map] (map (fn [entry]
+                                                                (if (vector? entry)
+                                                                  [(keyword (first entry)) (keyword (second entry))]
+                                                                  (keyword entry)))
+                                                              (rest v)))
+                                           (string? v) (keyword v)
+                                           (symbol? v) (keyword v)
+                                           :else v))]
+                          {:input  (fix-keys (:input raw))
+                           :output (fix-keys (:output raw))})
+                        (catch Exception _ {:input [:map] :output [:map]}))]
+    (agent-loop/run!
+      {:client        client
+       :cell-id       cell-id-kw
+       :cell-ns       cell-ns
+       :brief         brief
+       :test-code     test-code
+       :schema-parsed schema-parsed
+       :graph         graph
+       :mcp-ctx       mcp-ctx
+       :turn-budget   max-attempts
+       :on-event      on-event
+       :on-chunk      on-chunk
+       :store         store
+       :run-id        run-id
+       :project-path  project-path
+       :base-ns       base-ns
+       :task          task})))
 ;; ── Main orchestration ─────────────────────────────────────────
 
 (defn orchestrate!
@@ -673,6 +505,9 @@
                           (into {} (map (fn [[cell-name cell-def]]
                                          [(:id cell-def) cell-name]))
                                 (:cells manifest)))
+
+          ;; Build code graph from manifest for agent-loop context tools
+          graph (when manifest (cg/build-cell-graph manifest))
 
           ;; Load resource docs from system.edn
           resource-docs (when project-path
@@ -770,19 +605,40 @@
           ;; Phase 3: Implement approved contracts in parallel
           (emit on-event "cell_implement" "started"
                 :message (str "Implementing " (count approved) " cells"))
-          (let [impl-futures
+          (let [;; Build sibling context for each cell
+                sibling-infos (into {}
+                                (map (fn [c]
+                                       (let [b (first (filter #(= (:id %) (:cell-id c)) briefs))]
+                                         [(:cell-id c)
+                                          {:spec    b
+                                           :handler nil
+                                           :tests   (:test-code c)}]))
+                                     approved))
+                impl-futures
                 (mapv (fn [contract]
                         (future
                           (try
-                            (implement-from-contract client
-                              {:contract     contract
-                               :store        store
-                               :run-id       run-id
-                               :on-event     on-event
-                               :on-chunk     on-chunk
-                               :max-attempts max-attempts
-                               :project-path project-path
-                               :base-ns      base-ns})
+                            (let [cell-kw (let [s (str (:cell-id contract))]
+                                            (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+                                  mcp-ctx (mcp/build-context
+                                            {:cell-id      cell-kw
+                                             :cell-ns      (:cell-ns contract)
+                                             :brief        (first (filter #(= (:id %) (:cell-id contract)) briefs))
+                                             :test-code    (:test-code contract)
+                                             :graph        graph
+                                             :siblings     (remove #(= (:id %) cell-kw) briefs)
+                                             :sibling-data sibling-infos})]
+                              (implement-from-contract client
+                                {:contract     contract
+                                 :store        store
+                                 :run-id       run-id
+                                 :on-event     on-event
+                                 :on-chunk     on-chunk
+                                 :max-attempts max-attempts
+                                 :project-path project-path
+                                 :base-ns      base-ns
+                                 :graph        graph
+                                 :mcp-ctx      mcp-ctx}))
                             (catch Exception e
                               {:status  :error
                                :cell-id (:cell-id contract)
@@ -993,11 +849,12 @@
         (or manifest-id (str (:id manifest)))
         (pr-str manifest)))
 
-    ;; Store run state
+    ;; Store run state with graph
     (swap! runs assoc run-id
       {:cells        cells-init
        :base-ns      base-ns
        :manifest     manifest
+       :graph        (when manifest (cg/build-cell-graph manifest))
        :client       client
        :store        store
        :project-path project-path
@@ -1044,6 +901,7 @@
         store    (:store run)
         client   (:client run)
         base-ns  (:base-ns run)
+        graph    (:graph run)
         on-event (get-in run [:callbacks :on-event])
         on-chunk (get-in run [:callbacks :on-chunk])]
     (when contract
@@ -1062,15 +920,42 @@
             :cell_id cell-id :run_id run-id)
       (future
         (try
-          (let [result (implement-from-contract client
+          (let [;; Build sibling data from all cells in the run
+                all-cells    (get-in @runs [run-id :cells])
+                sibling-infos (into {}
+                                (keep (fn [[cid cdata]]
+                                        (when (not= cid cell-id)
+                                          (let [cc (:contract cdata)
+                                                brief (:brief cdata)]
+                                            [cid {:spec    brief
+                                                  :handler (when cc (:handler cc))
+                                                  :tests   (when cc (:test-code cc))}]))))
+                                    all-cells)
+                ;; Build mcp context
+                cell-kw (let [s (str cell-id)]
+                          (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+                mcp-ctx (mcp/build-context
+                          {:cell-id      cell-kw
+                           :cell-ns      (:cell-ns contract)
+                           :brief        (or (:brief cell) {})
+                           :test-code    (:test-code contract)
+                           :graph        graph
+                           :siblings     (keep (fn [[cid cdata]]
+                                                (when (not= cid cell-id)
+                                                  (:brief cdata)))
+                                              all-cells)
+                           :sibling-data sibling-infos})
+                result (implement-from-contract client
                          {:contract     contract
                           :store        store
                           :run-id       run-id
                           :on-event     on-event
                           :on-chunk     on-chunk
-                          :max-attempts 3
+                          :max-attempts 15
                           :project-path nil ;; don't write to disk yet
-                          :base-ns      base-ns})]
+                          :base-ns      base-ns
+                          :graph        graph
+                          :mcp-ctx      mcp-ctx})]
             (if (= :ok (:status result))
               ;; Implementation succeeded — get source from store (where implement-from-contract saved it)
               (let [latest-cell (when store (store/get-latest-cell store cell-id))
