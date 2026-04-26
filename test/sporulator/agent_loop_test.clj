@@ -172,6 +172,34 @@
           prompt     (#'agent-loop/render-initial-prompt cell-state)]
       (is (not (str/includes? prompt "JDBC handler patterns"))))))
 
+(deftest eval-runs-with-cell-helpers-in-scope-test
+  (testing "after writing helpers + handler, eval can call helpers by name"
+    ;; The system prompt encourages the agent to verify helpers via
+    ;; `eval (my-helper x)`. For that to work the harness has to load
+    ;; the cell's current source into its namespace before running
+    ;; the agent's expression. Without this fix the agent gets an
+    ;; "Unable to resolve symbol" error and has to spend extra turns
+    ;; figuring out the require form — exactly the opposite of what
+    ;; the prompt promises.
+    (let [result (run-with
+                   [(tc :write_file
+                        {:path "helpers.clj"
+                         :content "(defn doubled [x] (* x 2))"})
+                    (tc :write_file
+                        {:path "handler.clj"
+                         :content "(fn [_ d] {:n (doubled (:n d))})"})
+                    (tc :eval {:code "(doubled 21)"})
+                    (tc :run_tests)
+                    (tc :complete)])
+          msgs (-> result :session :messages deref)
+          eval-result (->> msgs
+                           (filter #(= "tool" (:role %)))
+                           (drop 2)              ;; 2 write_files
+                           first
+                           :content)]
+      (is (str/includes? eval-result "42")
+          "eval should resolve `doubled` and return its actual result"))))
+
 (deftest no-block-or-warning-on-tool-choice-test
   (testing "the dispatcher does NOT warn or block on tool selection"
     ;; Phase 4 validation 2026-04-26: earlier guard variants (Fix H/J)

@@ -592,7 +592,38 @@ You're done when complete succeeds.")
 
       :eval
       (if-let [code (:code args)]
-        (let [res (ev/eval-code code)]
+        (let [;; Best-effort: if the cell's current handler.clj parses
+              ;; cleanly, assemble + load the full cell source first so
+              ;; helpers, the handler, and the cell registry entry are
+              ;; all in scope. The agent's eval expression then runs in
+              ;; the cell's own namespace, so it can call any helper by
+              ;; name and exercise the handler via
+              ;;   `((:handler (mycelium.cell/get-cell! :the/cell)) ... )`.
+              cell-ns       (:cell-ns state)
+              files         (:files state)
+              handler-src   (get files "handler.clj")
+              helpers-src   (get files "helpers.clj")
+              handler-form  (parse-handler-buffer handler-src)
+              helpers-forms (parse-helpers-buffer helpers-src)
+              eval-src      (if (and (seq cell-ns)
+                                     handler-form
+                                     (seq? handler-form)
+                                     (= 'fn (first handler-form))
+                                     (some? helpers-forms))
+                              (str (codegen/assemble-cell-source
+                                     {:cell-ns        cell-ns
+                                      :cell-id        (:cell-id state)
+                                      :doc            (or (:doc (:brief state)) "")
+                                      :schema         (:schema-parsed state)
+                                      :requires       (mapv keyword
+                                                            (or (:requires (:brief state)) []))
+                                      :extra-requires []
+                                      :helpers        helpers-forms
+                                      :fn-body        handler-form})
+                                   "\n\n(in-ns '" cell-ns ")\n"
+                                   code)
+                              code)
+              res (ev/eval-code eval-src)]
           (if (= :ok (:status res))
             (ok state (str (pr-str (:result res))
                            (when (seq (:output res)) (str "\n" (:output res)))))
