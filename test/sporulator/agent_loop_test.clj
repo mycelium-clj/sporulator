@@ -140,6 +140,38 @@
 ;; End-to-end: helpers.clj + handler.clj
 ;; =============================================================
 
+(deftest jdbc-handler-block-rendered-for-db-cells-test
+  (testing "the initial prompt for a :db-requiring cell includes JDBC handler patterns"
+    ;; Phase 4 fix I: persist-entry stagnated trying to find the right
+    ;; JDBC pattern for "insert returning id". The implementor prompt
+    ;; now ships ready-to-use patterns so the agent doesn't burn its
+    ;; budget exploring via eval.
+    (let [cell-state {:cell-id   :guestbook/persist-entry
+                      :brief     {:doc "Inserts a row." :requires [:db]}
+                      :schema-parsed {:input  [:map [:k :string]]
+                                      :output {:success [:map [:id :int]]
+                                               :failure [:map [:error :string]]}}
+                      :files     {"handler.clj" "" "helpers.clj" "" "test.clj" ""}
+                      :task      nil
+                      :change-summary nil}
+          prompt     (#'agent-loop/render-initial-prompt cell-state)]
+      (is (str/includes? prompt "JDBC handler patterns")
+          "JDBC handler-shape block must render for :db cells")
+      (is (or (str/includes? prompt "RETURNING")
+              (str/includes? prompt "execute-one!"))
+          "must show the canonical insert-returning-id shape")))
+
+  (testing "non-db cells do NOT get the JDBC handler block"
+    (let [cell-state {:cell-id   :x/y
+                      :brief     {:doc "Pure cell" :requires []}
+                      :schema-parsed {:input  [:map [:n :int]]
+                                      :output [:map [:m :int]]}
+                      :files     {"handler.clj" "" "helpers.clj" "" "test.clj" ""}
+                      :task      nil
+                      :change-summary nil}
+          prompt     (#'agent-loop/render-initial-prompt cell-state)]
+      (is (not (str/includes? prompt "JDBC handler patterns"))))))
+
 (deftest stagnation-guard-warns-after-non-progress-streak-test
   (testing "after >3 consecutive non-progress tool calls, the harness appends a sharp warning"
     ;; Phase 4 validation 2026-04-26: prompt-only workflow discipline
