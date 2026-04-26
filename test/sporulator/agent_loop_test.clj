@@ -172,6 +172,30 @@
           prompt     (#'agent-loop/render-initial-prompt cell-state)]
       (is (not (str/includes? prompt "JDBC handler patterns"))))))
 
+(deftest stagnation-guard-blocks-past-block-threshold-test
+  (testing "after 6 consecutive non-progress calls the dispatcher refuses to execute"
+    ;; Phase 4 validation 2026-04-26: deepseek ignored the warning text
+    ;; for 17+ consecutive eval calls on persist-entry. The block step
+    ;; replaces the tool's actual result so the agent CAN'T keep
+    ;; browsing — it has to switch to a progress tool.
+    (let [result (run-with
+                   [(tc :read_file {:path "handler.clj"})    ;; 1
+                    (tc :read_file {:path "test.clj"})       ;; 2
+                    (tc :read_file {:path "helpers.clj"})    ;; 3
+                    (tc :list_files)                          ;; 4 (warned)
+                    (tc :read_file {:path "test.clj"})       ;; 5 (warned)
+                    (tc :read_file {:path "test.clj"})       ;; 6 (warned)
+                    (tc :read_file {:path "test.clj"})       ;; 7 (BLOCKED — past threshold)
+                    (tc :write_file {:path "handler.clj" :content "(fn [_ d] {:n 1})"})
+                    (tc :run_tests)
+                    (tc :complete)])
+          msgs   (-> result :session :messages deref)
+          contents (mapv :content (filter #(= "tool" (:role %)) msgs))]
+      (is (str/includes? (nth contents 6) "BLOCKED")
+          "the 7th consecutive non-progress call should be refused")
+      (is (str/includes? (nth contents 6) "write_file")
+          "the block message should point at progress tools"))))
+
 (deftest stagnation-guard-warns-after-non-progress-streak-test
   (testing "after >3 consecutive non-progress tool calls, the harness appends a sharp warning"
     ;; Phase 4 validation 2026-04-26: prompt-only workflow discipline

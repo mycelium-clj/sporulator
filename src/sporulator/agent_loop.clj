@@ -664,10 +664,18 @@ You're done when complete succeeds.")
    validation: deepseek-reasoner reliably stagnated past 3 in a row."
   3)
 
+(def ^:private non-progress-block-threshold
+  "After this many consecutive non-progress tool calls the harness
+   refuses to execute further non-progress tools and forces the agent
+   to choose write_file / edit_file / run_tests / complete / give_up.
+   Phase 4 validation: warnings alone weren't enough — deepseek
+   ignored them past 17 consecutive evals on persist-entry."
+  6)
+
 (defn- non-progress-warning
   "The text appended to a tool result when the agent has just executed
-   `n` consecutive non-progress tools (n > threshold). Tells the agent
-   to commit code instead of continuing to browse."
+   `n` consecutive non-progress tools (n > warn threshold). Tells the
+   agent to commit code instead of continuing to browse."
   [n]
   (str "\n\n⚠ STAGNATION GUARD: this is your " n
        "th consecutive non-write tool call. Stop browsing and commit "
@@ -676,14 +684,37 @@ You're done when complete succeeds.")
        "than further reads/evals/inspects — and burning the turn budget "
        "on exploration is the canonical stagnation pattern."))
 
+(defn- non-progress-block-message
+  "Replaces the tool result entirely once the streak passes the block
+   threshold. The tool is NOT executed — the dispatcher forces the
+   agent to switch to a progress tool on the next turn."
+  [tool-name n]
+  (str "BLOCKED — `" (clojure.core/name tool-name) "` refused.\n"
+       "You have made " n " consecutive non-progress tool calls. The "
+       "harness now requires you to call one of:\n"
+       "- write_file  (commit your best attempt to handler.clj or helpers.clj)\n"
+       "- edit_file   (revise an existing file)\n"
+       "- run_tests   (see what's actually wrong)\n"
+       "- complete    (declare done if you believe tests will pass)\n"
+       "- give_up     (bail with a reason if the task is genuinely impossible)\n"
+       "Reads, evals, and ns introspection are blocked until you do. "
+       "If `run_tests` was failing, write a different attempt and re-run "
+       "— the test output already says what to fix."))
+
 (defn- dispatch-tool-call
   "Runs one tool call against the agent state, appends the tool result to the
    LLM session, and returns the new state.
 
    Tracks consecutive non-progress tool calls in `:non-progress-streak`
-   so the harness can append a stagnation warning after the threshold —
-   the prompt-only nudge (system-prompt 'Workflow discipline' block)
-   isn't enough to break deepseek-reasoner's harder-cell eval spirals."
+   and uses two thresholds:
+   - past `non-progress-warning-threshold`: append a stagnation warning
+     to the tool's actual result.
+   - past `non-progress-block-threshold`: refuse to execute the tool —
+     the dispatcher forces the agent to call a progress tool next.
+
+   The two thresholds + blocking step together took persist-entry's
+   eval-spiral pattern from a stagnation to a turn-budget-cleared
+   recovery in Phase 4 validation."
   [state {:keys [id name arguments]}]
   (let [tool-name (tools/normalize-tool-name name)
         session   (:session state)]
@@ -691,17 +722,30 @@ You're done when complete succeeds.")
       (do (llm/session-append-tool-result! session id
             (str "ERROR — unknown tool '" (clojure.core/name tool-name) "'."))
           state)
-      (let [{new-state :state result :result}
-            (handle-dispatch-tool state {:name tool-name :args arguments})
-            progress?    (contains? progress-tools tool-name)
-            prev-streak  (or (:non-progress-streak state) 0)
-            new-streak   (if progress? 0 (inc prev-streak))
-            warned?      (> new-streak non-progress-warning-threshold)
-            final-result (if warned?
-                           (str result (non-progress-warning new-streak))
-                           result)]
-        (llm/session-append-tool-result! session id final-result)
-        (assoc new-state :non-progress-streak new-streak)))))
+      (let [progress?     (contains? progress-tools tool-name)
+            prev-streak   (or (:non-progress-streak state) 0)
+            ;; Project the streak this call WOULD produce — used to decide
+            ;; whether to block before executing.
+            projected-streak (if progress? 0 (inc prev-streak))
+            block?        (and (not progress?)
+                               (> projected-streak non-progress-block-threshold))]
+        (cond
+          ;; Hard block: refuse to execute, hold the streak so a single
+          ;; progress call resets it; encourage a write/run/complete next.
+          block?
+          (do (llm/session-append-tool-result! session id
+                (non-progress-block-message tool-name projected-streak))
+              (assoc state :non-progress-streak projected-streak))
+
+          :else
+          (let [{new-state :state result :result}
+                (handle-dispatch-tool state {:name tool-name :args arguments})
+                warned?      (> projected-streak non-progress-warning-threshold)
+                final-result (if warned?
+                               (str result (non-progress-warning projected-streak))
+                               result)]
+            (llm/session-append-tool-result! session id final-result)
+            (assoc new-state :non-progress-streak projected-streak)))))))
 
 (defn- process-turn
   "One LLM round-trip:
