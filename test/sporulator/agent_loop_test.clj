@@ -172,71 +172,68 @@
           prompt     (#'agent-loop/render-initial-prompt cell-state)]
       (is (not (str/includes? prompt "JDBC handler patterns"))))))
 
-(deftest stagnation-guard-blocks-past-block-threshold-test
-  (testing "after 6 consecutive non-progress calls the dispatcher refuses to execute"
-    ;; Phase 4 validation 2026-04-26: deepseek ignored the warning text
-    ;; for 17+ consecutive eval calls on persist-entry. The block step
-    ;; replaces the tool's actual result so the agent CAN'T keep
-    ;; browsing — it has to switch to a progress tool.
+(deftest no-block-or-warning-on-tool-choice-test
+  (testing "the dispatcher does NOT warn or block on tool selection"
+    ;; Phase 4 validation 2026-04-26: earlier guard variants (Fix H/J)
+    ;; appended warnings or refused execution after consecutive non-
+    ;; progress tool calls. That was an anti-pattern — the agent uses
+    ;; eval / read / inspect to learn the environment. The dispatcher
+    ;; now executes every known tool transparently and lets the model
+    ;; orchestrate.
     (let [result (run-with
-                   [(tc :read_file {:path "handler.clj"})    ;; 1
-                    (tc :read_file {:path "test.clj"})       ;; 2
-                    (tc :read_file {:path "helpers.clj"})    ;; 3
-                    (tc :list_files)                          ;; 4 (warned)
-                    (tc :read_file {:path "test.clj"})       ;; 5 (warned)
-                    (tc :read_file {:path "test.clj"})       ;; 6 (warned)
-                    (tc :read_file {:path "test.clj"})       ;; 7 (BLOCKED — past threshold)
+                   [(tc :read_file {:path "handler.clj"})
+                    (tc :read_file {:path "test.clj"})
+                    (tc :read_file {:path "helpers.clj"})
+                    (tc :list_files)
+                    (tc :inspect_ns {:ns "clojure.core"})
+                    (tc :read_file {:path "handler.clj"})
                     (tc :write_file {:path "handler.clj" :content "(fn [_ d] {:n 1})"})
                     (tc :run_tests)
                     (tc :complete)])
           msgs   (-> result :session :messages deref)
           contents (mapv :content (filter #(= "tool" (:role %)) msgs))]
-      (is (str/includes? (nth contents 6) "BLOCKED")
-          "the 7th consecutive non-progress call should be refused")
-      (is (str/includes? (nth contents 6) "write_file")
-          "the block message should point at progress tools"))))
+      (is (not-any? #(str/includes? % "STAGNATION GUARD") contents)
+          "no STAGNATION GUARD warnings should appear")
+      (is (not-any? #(str/includes? % "BLOCKED") contents)
+          "no BLOCKED messages should appear"))))
 
-(deftest stagnation-guard-warns-after-non-progress-streak-test
-  (testing "after >3 consecutive non-progress tool calls, the harness appends a sharp warning"
-    ;; Phase 4 validation 2026-04-26: prompt-only workflow discipline
-    ;; tamed the simple cells but PE/RLH still ran 9-15 evals before
-    ;; running out of budget. The stagnation guard fires structurally
-    ;; via the dispatcher so deepseek can't ignore it.
-    (let [result (run-with
-                   [(tc :read_file {:path "handler.clj"})
-                    (tc :read_file {:path "test.clj"})
-                    (tc :read_file {:path "helpers.clj"})
-                    (tc :list_files)            ;; 4th non-progress → warned
-                    (tc :write_file {:path "handler.clj" :content "(fn [_ d] {:n 1})"})
-                    (tc :read_file {:path "test.clj"})  ;; streak reset → no warning
-                    (tc :complete)])
+(deftest reframe-hint-after-repeated-test-failures-test
+  (testing "after 3 consecutive run_tests failures, the harness appends a reframe hint"
+    ;; The hint is informational — the agent gets the actual test
+    ;; output AND the suggestion to step back. It can ignore or
+    ;; follow. No block, no censoring of the underlying error.
+    (let [bad-handler "(fn [_ data] {:n (* 2 (:m data))})"
+          result (run-with
+                   [(tc :write_file {:path "handler.clj" :content bad-handler})
+                    (tc :run_tests)                  ;; 1st failure
+                    (tc :write_file {:path "handler.clj" :content bad-handler})
+                    (tc :run_tests)                  ;; 2nd failure (still no hint)
+                    (tc :write_file {:path "handler.clj" :content bad-handler})
+                    (tc :run_tests)                  ;; 3rd failure → hint
+                    (tc :give_up {:reason "demo"})])
           msgs   (-> result :session :messages deref)
-          tool-results (filter #(= "tool" (:role %)) msgs)
-          contents (mapv :content tool-results)]
-      ;; Ordered tool results align 1:1 with the tool calls above.
-      (is (not (str/includes? (nth contents 0) "STAGNATION GUARD"))
-          "1st non-progress should not warn")
-      (is (not (str/includes? (nth contents 1) "STAGNATION GUARD"))
-          "2nd non-progress should not warn")
-      (is (not (str/includes? (nth contents 2) "STAGNATION GUARD"))
-          "3rd non-progress should not warn (threshold)")
-      (is (str/includes? (nth contents 3) "STAGNATION GUARD")
-          "4th non-progress should warn")
-      (is (not (str/includes? (nth contents 5) "STAGNATION GUARD"))
-          "after a write_file, the streak resets — next read should not warn"))))
+          contents (mapv :content (filter #(= "tool" (:role %)) msgs))]
+      ;; tool-result indexes align with the tc order above.
+      (is (str/includes? (nth contents 5) "failed 3 times in a row")
+          "3rd consecutive run_tests failure should mention the streak")
+      (is (not (str/includes? (nth contents 1) "failed 3 times in a row"))
+          "1st failure should NOT include the hint yet")
+      (is (not (str/includes? (nth contents 3) "failed 3 times in a row"))
+          "2nd failure should NOT include the hint yet"))))
 
-(deftest system-prompt-workflow-discipline-test
-  (testing "system-prompt nudges agents toward write+test rhythm"
-    ;; Phase 4 validation 2026-04-26: deepseek-reasoner consistently
-    ;; burned its turn budget on eval/read_file/inspect_ns exploration
-    ;; instead of committing code via write_file + run_tests. The
-    ;; system prompt now warns explicitly against this pattern.
+(deftest system-prompt-encourages-repl-experimentation-test
+  (testing "system-prompt frames eval as a first-class REPL affordance"
+    ;; Earlier prompt told the agent to AVOID eval/inspect (anti-
+    ;; pattern). New prompt explicitly encourages them, including
+    ;; running DB calls and exercising the handler directly.
     (let [p agent-loop/system-prompt]
-      (is (str/includes? p "Workflow discipline")
-          "must call out the workflow discipline section by name")
-      (is (or (str/includes? p "consecutive")
-              (str/includes? p "without a write_file"))
-          "must warn against repeated reads/evals without writes"))))
+      (is (str/includes? p "live REPL")
+          "must frame the workspace as a live REPL")
+      (is (or (str/includes? p "experiment")
+              (str/includes? p "Try a helper"))
+          "must encourage trying things in eval")
+      (is (str/includes? p "step back")
+          "must tell the agent to reframe when stuck"))))
 
 (deftest helpers-rejects-ns-form-test
   (testing "writing helpers.clj with a top-level (ns ...) returns an error"

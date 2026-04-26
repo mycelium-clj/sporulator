@@ -69,22 +69,41 @@ The handler signature is `(fn [resources data] ...)`.
   they pass, the cell is finalized. If they fail, you keep working.
 - give_up — bail out with a reason if the task isn't achievable.
 
-## Workflow discipline — read carefully
-Default rhythm: **write_file → run_tests → fix what failed → repeat.**
-`run_tests` is the source of truth — it tells you exactly what's wrong.
+## You're working in a live REPL — use it
+Every time you write_file, the harness reloads the cell into a real
+running JVM. The functions you just wrote are immediately callable.
+Use `eval` like you would a Clojure REPL session:
 
-Use `eval` / `inspect_ns` / `list_functions` / `list_ns` ONLY when
-`run_tests` returns an error you genuinely can't decode (a confusing
-exception class, an opaque library quirk). They are NOT a Clojure REPL
-for browsing the environment, and they are NOT a substitute for trying
-something. The shortest path to converging is to commit code via
-write_file and let run_tests teach you.
+- Try a helper against a sample input: `(my-helper {:n 1})` — does it
+  return what you expected? If not, you don't need run_tests to know
+  the helper is wrong.
+- Exercise the handler directly:
+    `((:handler (mycelium.cell/get-cell! :your/cell-id))
+      {:db ds} {:k \"v\"})`
+  faster than running the whole test suite for a single case.
+- For `:db` cells, set up a real `next.jdbc/get-datasource` against an
+  in-memory sqlite, create the table the test uses, and try your INSERT
+  / SELECT / UPDATE there. JDBC has subtle key-shape and return-shape
+  defaults; experimenting beats guessing.
+- `inspect_ns`, `list_functions`, `get_callers`, etc. are also there
+  when you want to navigate.
 
-If you find yourself doing 3+ consecutive reads / evals / inspects
-without a write_file, stop: pick your best guess, write it, and run
-the tests. Multiple read/eval/inspect cycles without writing is the
-canonical stagnation pattern — agents that lose the budget reliably
-got there by exploring instead of trying.
+Use whatever rhythm fits. write→test, eval→write→test, eval→eval→
+write→test — all valid. The tools exist because reasoning is faster
+when grounded in actual JVM feedback.
+
+## When tests keep failing — step back, don't double down
+If `run_tests` has failed several times in a row, the harness will
+append a reframe hint to the failure output. Take it seriously: the
+canonical stagnation pattern is refining the same approach instead of
+considering whether the approach itself is wrong. Some prompts to use:
+- What hidden assumption am I making?
+- Can I decompose this into smaller helpers I can verify in isolation?
+- Is the test contract itself sensible for the brief? You can edit
+  test.clj if a test asserts something the brief doesn't promise.
+- Try a completely different shape (different INSERT pattern, different
+  data layout, different control flow) before fighting with the
+  current attempt for one more cycle.
 
 You're done when complete succeeds.")
 
@@ -652,69 +671,54 @@ You're done when complete succeeds.")
             :give-up-reason (or (:reason args) "No reason given"))
           (str "Gave up: " (or (:reason args) "no reason"))))))
 
-(def ^:private progress-tools
-  "Tools that count as 'making progress' — committing code or verifying
-   the result. Calling one of these resets the consecutive-non-progress
-   counter that tames eval/read/inspect spirals."
-  #{:write_file :edit_file :run_tests :complete :give_up})
-
-(def ^:private non-progress-warning-threshold
-  "After this many consecutive non-progress tool calls, the harness
-   appends a sharp 'commit code' nudge to the tool result. Phase 4
-   validation: deepseek-reasoner reliably stagnated past 3 in a row."
+(def ^:private repeated-failure-hint-threshold
+  "After this many consecutive failed run_tests calls, the harness
+   appends a soft advisory suggesting the agent reframe the problem
+   or decompose it. Hint is informational — the agent still chooses
+   what to do. Phase 4 validation: persist-entry sometimes needed to
+   step back and try a different INSERT shape rather than tweak the
+   same one repeatedly."
   3)
 
-(def ^:private non-progress-block-threshold
-  "After this many consecutive non-progress tool calls the harness
-   refuses to execute further non-progress tools and forces the agent
-   to choose write_file / edit_file / run_tests / complete / give_up.
-   Phase 4 validation: warnings alone weren't enough — deepseek
-   ignored them past 17 consecutive evals on persist-entry."
-  6)
-
-(defn- non-progress-warning
-  "The text appended to a tool result when the agent has just executed
-   `n` consecutive non-progress tools (n > warn threshold). Tells the
-   agent to commit code instead of continuing to browse."
+(defn- repeated-failure-hint
+  "Soft advisory appended to a failed run_tests result after `n` >=
+   threshold consecutive failures. Does NOT block — just reframes."
   [n]
-  (str "\n\n⚠ STAGNATION GUARD: this is your " n
-       "th consecutive non-write tool call. Stop browsing and commit "
-       "your best attempt via write_file (handler.clj or helpers.clj), "
-       "then run_tests. The exact error from run_tests is more useful "
-       "than further reads/evals/inspects — and burning the turn budget "
-       "on exploration is the canonical stagnation pattern."))
-
-(defn- non-progress-block-message
-  "Replaces the tool result entirely once the streak passes the block
-   threshold. The tool is NOT executed — the dispatcher forces the
-   agent to switch to a progress tool on the next turn."
-  [tool-name n]
-  (str "BLOCKED — `" (clojure.core/name tool-name) "` refused.\n"
-       "You have made " n " consecutive non-progress tool calls. The "
-       "harness now requires you to call one of:\n"
-       "- write_file  (commit your best attempt to handler.clj or helpers.clj)\n"
-       "- edit_file   (revise an existing file)\n"
-       "- run_tests   (see what's actually wrong)\n"
-       "- complete    (declare done if you believe tests will pass)\n"
-       "- give_up     (bail with a reason if the task is genuinely impossible)\n"
-       "Reads, evals, and ns introspection are blocked until you do. "
-       "If `run_tests` was failing, write a different attempt and re-run "
-       "— the test output already says what to fix."))
+  (str "\n\n— Tests have failed " n " times in a row. If you feel "
+       "stuck, consider stepping back rather than tweaking the same "
+       "approach:\n"
+       "- Verify each helper in isolation. `eval` lets you call any\n"
+       "  function you've written and inspect what it actually returns,\n"
+       "  including database calls — set up an in-memory sqlite, run\n"
+       "  the helper against a sample row, and compare to what the\n"
+       "  test expects.\n"
+       "- Eval the handler directly with a test input:\n"
+       "    `((:handler (mycelium.cell/get-cell! :your-cell-id))\n"
+       "      {:db ds} {...})` — what does it return? Is the shape\n"
+       "    wrong, or is the data different from what the test sets up?\n"
+       "- Is your initial hypothesis wrong? If you've been refining\n"
+       "  the same INSERT/SELECT/parse strategy and it still fails,\n"
+       "  try a completely different shape — RETURNING vs SELECT after\n"
+       "  insert, qualified vs unqualified keys, separate helper vs\n"
+       "  inline.\n"
+       "- Is the test contract reasonable for the brief? You can\n"
+       "  edit test.clj if a test asserts something the brief doesn't\n"
+       "  promise.\n"
+       "Use the REPL — the cell file you wrote on the last write_file\n"
+       "is loaded; explore freely."))
 
 (defn- dispatch-tool-call
-  "Runs one tool call against the agent state, appends the tool result to the
-   LLM session, and returns the new state.
+  "Runs one tool call against the agent state, appends the tool result to
+   the LLM session, and returns the new state.
 
-   Tracks consecutive non-progress tool calls in `:non-progress-streak`
-   and uses two thresholds:
-   - past `non-progress-warning-threshold`: append a stagnation warning
-     to the tool's actual result.
-   - past `non-progress-block-threshold`: refuse to execute the tool —
-     the dispatcher forces the agent to call a progress tool next.
-
-   The two thresholds + blocking step together took persist-entry's
-   eval-spiral pattern from a stagnation to a turn-budget-cleared
-   recovery in Phase 4 validation."
+   The agent has free run of every tool: read, write, edit, eval, inspect,
+   run_tests, complete, give_up. The harness adds NO blocks or warnings on
+   tool selection — orchestration belongs to the model. The one piece of
+   advisory feedback is on the run_tests result itself: after the agent has
+   seen `repeated-failure-hint-threshold` consecutive test failures, the
+   tool output gets a transparent hint suggesting it reframe rather than
+   keep tweaking. The hint is appended to the actual test output, not in
+   place of it, so the agent still has the underlying error to work with."
   [state {:keys [id name arguments]}]
   (let [tool-name (tools/normalize-tool-name name)
         session   (:session state)]
@@ -722,30 +726,26 @@ You're done when complete succeeds.")
       (do (llm/session-append-tool-result! session id
             (str "ERROR — unknown tool '" (clojure.core/name tool-name) "'."))
           state)
-      (let [progress?     (contains? progress-tools tool-name)
-            prev-streak   (or (:non-progress-streak state) 0)
-            ;; Project the streak this call WOULD produce — used to decide
-            ;; whether to block before executing.
-            projected-streak (if progress? 0 (inc prev-streak))
-            block?        (and (not progress?)
-                               (> projected-streak non-progress-block-threshold))]
-        (cond
-          ;; Hard block: refuse to execute, hold the streak so a single
-          ;; progress call resets it; encourage a write/run/complete next.
-          block?
-          (do (llm/session-append-tool-result! session id
-                (non-progress-block-message tool-name projected-streak))
-              (assoc state :non-progress-streak projected-streak))
-
-          :else
-          (let [{new-state :state result :result}
-                (handle-dispatch-tool state {:name tool-name :args arguments})
-                warned?      (> projected-streak non-progress-warning-threshold)
-                final-result (if warned?
-                               (str result (non-progress-warning projected-streak))
-                               result)]
-            (llm/session-append-tool-result! session id final-result)
-            (assoc new-state :non-progress-streak projected-streak)))))))
+      (let [{new-state :state result :result}
+            (handle-dispatch-tool state {:name tool-name :args arguments})
+            ;; Track consecutive run_tests failures so the harness can
+            ;; offer a 'reframe' hint after the agent has seen the same
+            ;; class of failure several times.
+            run-tests?      (= :run_tests tool-name)
+            tests-failed?   (and run-tests? (str/starts-with? result "ERROR"))
+            tests-passed?   (and run-tests? (str/starts-with? result "ok"))
+            prev-failures   (or (:consecutive-test-failures state) 0)
+            new-failures    (cond
+                              tests-passed? 0
+                              tests-failed? (inc prev-failures)
+                              :else         prev-failures)
+            hint?           (and tests-failed?
+                                 (>= new-failures repeated-failure-hint-threshold))
+            final-result    (if hint?
+                              (str result (repeated-failure-hint new-failures))
+                              result)]
+        (llm/session-append-tool-result! session id final-result)
+        (assoc new-state :consecutive-test-failures new-failures)))))
 
 (defn- process-turn
   "One LLM round-trip:
