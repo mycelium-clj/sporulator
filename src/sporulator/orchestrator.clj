@@ -131,6 +131,76 @@
 
 ;; ── Test contract generation ───────────────────────────────────
 
+(defn parse-schema-output
+  "Parses a brief's :schema string and returns the :output value, or nil
+   if the string is unparseable. Tolerates symbol/string keys."
+  [schema-str]
+  (when (seq (str schema-str))
+    (try
+      (let [raw (binding [*read-eval* false]
+                  (clojure.edn/read-string (str schema-str)))
+            kw  (fn kw [v]
+                  (cond
+                    (and (map? v) (seq v)
+                         (some #(or (string? %) (symbol? %)) (keys v)))
+                    (into {} (map (fn [[k vv]] [(keyword (name k)) (kw vv)])) v)
+                    (map? v) (into {} (map (fn [[k vv]] [k (kw vv)])) v)
+                    :else v))]
+        (kw (:output raw)))
+      (catch Exception _ nil))))
+
+(defn dispatched-output?
+  "True if `output` is a dispatched-output map: keyed by transition labels
+   (e.g. :success / :failure), each value an inner sub-schema. Recognises
+   both the lite-form (map values) and the Malli-form (vector values).
+
+   {:success {:n :int} :failure {:e :string}}            → true
+   {:success [:map [:n :int]] :failure [:map [:e :string]]} → true
+   {:n :int :x :string}                                   → false (flat)
+   {} or [:map ...]                                       → false"
+  [output]
+  (and (map? output) (seq output)
+       (every? (fn [v] (or (and (map? v) (seq v))
+                            (vector? v)))
+               (vals output))))
+
+(defn- dispatched-shape-block
+  "Renders the dispatched-output guidance block for the test/implementor
+   prompts when the cell's output is dispatched. `output` is the parsed
+   dispatched-output map."
+  [output]
+  (let [pairs (vec output)
+        first-pair (first pairs)
+        first-label (name (key first-pair))
+        first-keys (cond
+                     (map? (val first-pair)) (vec (keys (val first-pair)))
+                     :else [])
+        sample-key (or (first first-keys) :result)
+        labels (mapv (comp name key) pairs)]
+    (str "## Dispatched output — read carefully\n"
+         "This cell has a dispatched output schema. Mycelium dispatches by\n"
+         "looking at which keys appear in the handler's flat return map and\n"
+         "matching them against the per-transition sub-schemas declared in\n"
+         "`:output`. Possible transitions: "
+         (str/join " | " (map #(str "`" % "`") labels))
+         ".\n\n"
+         "**The handler returns a flat map matching ONE of the transition\n"
+         "sub-schemas — it never wraps the result under the transition\n"
+         "label.** Tests should assert against the flat shape, not against\n"
+         "a nested `{:" first-label " {…}}` form.\n\n"
+         "Example shape (assuming `:" first-label "` carries `" sample-key "`):\n"
+         "```clojure\n"
+         "(deftest test-" first-label "-path\n"
+         "  (let [result (handler {} {…})]\n"
+         "    (is (contains? result " sample-key "))))\n"
+         "\n"
+         "(deftest test-other-path\n"
+         "  (let [result (handler {} {…})]\n"
+         "    (is (contains? result :error))))    ;; or whatever the failure key is\n"
+         "```\n"
+         "Do NOT do `(:" first-label " result)` or `(get-in result [:"
+         first-label " ...])` — there is no such wrapper key.\n")))
+
 (defn- format-resources-block
   "Formats per-resource docstrings into a 'Resources' section.
    `requires` is the vector of resource keywords; `resource-docs` is a map
@@ -151,7 +221,8 @@
 (defn- build-test-prompt
   "Builds the prompt to ask the LLM to write tests for a cell."
   [{:keys [id doc schema requires resource-docs context]}]
-  (str "Write tests for the following Mycelium cell using clojure.test.\n\n"
+  (let [output (parse-schema-output schema)]
+    (str "Write tests for the following Mycelium cell using clojure.test.\n\n"
        "**Cell ID:** `" id "`\n"
        "**Requirements:** " doc "\n"
        "**Schema:** `" schema "`\n"
@@ -160,6 +231,8 @@
          (str "\n" context "\n"))
        (when (prompts/needs-math-precision? schema)
          (str "\n" prompts/math-precision-rules "\n"))
+       (when (dispatched-output? output)
+         (str "\n" (dispatched-shape-block output)))
        "\n## Calling convention — read carefully\n"
        "The handler signature is `(fn [resources data] ...)`.\n"
        "- `resources` is a map. The keys are the cell's `:requires` keywords.\n"
@@ -193,7 +266,7 @@
        "      (is (int? (:id result))))))\n"
        "```\n"
        "If the test needs `next.jdbc`, just use it as `next.jdbc/...` —\n"
-       "the test namespace requires it for you.\n"))
+       "the test namespace requires it for you.\n")))
 
 (defn- self-review-prompt
   "Builds the self-review prompt for generated tests."

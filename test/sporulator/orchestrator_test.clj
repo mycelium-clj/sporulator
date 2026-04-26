@@ -127,6 +127,52 @@
           resp)))))
 
 ;; =============================================================
+;; Dispatched-output detection (Phase 1 of contract-aware prompts)
+;; =============================================================
+
+(deftest dispatched-output-detector-test
+  (testing "lite-form dispatched output (map values)"
+    (is (orch/dispatched-output?
+          {:success {:validated-handle :string}
+           :failure {:error :string}})))
+
+  (testing "Malli-form dispatched output (vector values)"
+    (is (orch/dispatched-output?
+          {:success [:map [:n :int]]
+           :failure [:map [:e :string]]})))
+
+  (testing "single-transition output"
+    (is (orch/dispatched-output?
+          {:success {:n :int}})))
+
+  (testing "flat output is NOT dispatched"
+    (is (not (orch/dispatched-output? {:n :int :x :string})))
+    (is (not (orch/dispatched-output? {:status :keyword :total :double}))))
+
+  (testing "edge cases"
+    (is (not (orch/dispatched-output? nil)))
+    (is (not (orch/dispatched-output? {})))
+    (is (not (orch/dispatched-output? [:map [:k :v]])))
+    (is (not (orch/dispatched-output? "string")))
+    (is (not (orch/dispatched-output? {:k {}}))         "empty map values shouldn't count")))
+
+(deftest parse-schema-output-test
+  (testing "parses a normal brief schema string"
+    (is (= {:n :int}
+           (orch/parse-schema-output "{:input {:x :int} :output {:n :int}}"))))
+
+  (testing "parses a dispatched output schema"
+    (is (= {:success {:validated-handle :string}
+            :failure {:error :string}}
+           (orch/parse-schema-output
+             "{:input {:handle :string} :output {:success {:validated-handle :string} :failure {:error :string}}}"))))
+
+  (testing "blank or unparseable returns nil"
+    (is (nil? (orch/parse-schema-output nil)))
+    (is (nil? (orch/parse-schema-output "")))
+    (is (nil? (orch/parse-schema-output "}{garbage")))))
+
+;; =============================================================
 ;; generate-test-contract
 ;; =============================================================
 
