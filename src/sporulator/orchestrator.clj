@@ -1393,7 +1393,13 @@
         (check-orchestration-complete! run-id)))))
 
 (defn reject-impl!
-  "Rejects a cell's implementation with feedback. Re-implements."
+  "Rejects a cell's implementation with feedback and re-implements via the
+   agent loop. The previous implementation source (if any) is fed back as
+   :prev-source so the agent can edit incrementally rather than starting
+   from scratch; the user's feedback becomes the :change-summary. The
+   contract and the brief's schema drive the (ns ...) and (cell/defcell ...)
+   declarations through codegen — so namespace and schema declarations stay
+   consistent with the file path and the architect's contract."
   [run-id cell-id feedback]
   (let [run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
@@ -1402,39 +1408,63 @@
         store    (:store run)
         base-ns  (:base-ns run)
         on-event (get-in run [:callbacks :on-event])
-        on-chunk (get-in run [:callbacks :on-chunk])]
+        on-chunk (get-in run [:callbacks :on-chunk])
+        ;; Prior code: prefer the cell's current :impl-source, fall back
+        ;; to the latest store row (covers the case where the previous
+        ;; impl ended in :impl_error and never landed on the run state).
+        prev-src (or (:impl-source cell)
+                     (when store (:handler (store/get-latest-cell store cell-id))))
+        ;; Diff context (if any) — for cells flagged :doc-changed or
+        ;; :schema-changed during this run, append a structured summary
+        ;; of what moved in the contract.
+        cid-kw      (cell-id-keyword cell-id)
+        class       (get (:cell-class run) cid-kw)
+        diff-summary (when (#{:doc-changed :schema-changed} class)
+                       (manifest-diff/change-summary
+                         (get (:prev-cells-by-id run) cid-kw)
+                         (get (:new-cells-by-id run) cid-kw)))
+        change-summary (cond-> (str "User feedback on the previous "
+                                    "implementation:\n  " feedback)
+                          diff-summary (str "\n\n" diff-summary))]
     (when contract
       (update-cell-status! run-id cell-id :implementing)
+      (emit on-event "cell_status" "implementing"
+            :cell_id cell-id :run_id run-id)
       (future
         (try
-          (let [session (or (:session contract)
-                            (llm/create-session (str "impl:" cell-id) prompts/cell-prompt))
-                annotated (hashline/annotate-hashlines
-                            (or (:impl-source cell) ""))
-                msg     (str "The implementation needs changes:\n\n" feedback
-                             (when (seq annotated)
-                               (str "\n\n**Current implementation:**\n```\n"
-                                    annotated "\n```"))
-                             "\n\nPlease fix and return the corrected source "
-                             "including `(ns ...)` and `(cell/defcell ...)`.")
-                content (:content (llm/session-send-stream session client msg on-chunk))
-                source  (format-source
-                          (or (extract/extract-first-code-block content) content))]
-            ;; Eval + run tests
-            (let [eval-res (ev/eval-code source)]
-              (let [[test-output passed?]
-                    (if (not= :ok (:status eval-res))
-                      [(str "Eval error: " (:error eval-res)) false]
-                      (let [test-res (ev/run-cell-tests (:test-code contract))]
-                        [(or (:output test-res) "")
-                         (and (= :ok (:status test-res)) (:passed? test-res))]))]
-                (swap! runs update-in [run-id :cells cell-id]
-                       assoc :impl-source source :status :impl_ready)
-                (emit on-event "cell_status" "impl_ready"
+          (let [result (implement-from-contract client
+                         {:contract        contract
+                          :store           store
+                          :run-id          run-id
+                          :on-event        on-event
+                          :on-chunk        on-chunk
+                          :max-attempts    15
+                          :project-path    nil ;; don't write to disk yet
+                          :base-ns         base-ns
+                          :prev-source     prev-src
+                          :change-summary  change-summary})]
+            (if (= :ok (:status result))
+              (let [latest-cell (when store (store/get-latest-cell store cell-id))
+                    impl-source (format-source (or (:handler latest-cell) ""))]
+                (if (seq impl-source)
+                  (do
+                    (swap! runs update-in [run-id :cells cell-id]
+                           assoc :impl-source impl-source :status :impl_ready)
+                    (emit on-event "cell_status" "impl_ready"
+                          :cell_id cell-id
+                          :run_id run-id
+                          :source impl-source
+                          :test_output (or (:output result) "")))
+                  (do
+                    (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
+                    (emit on-event "cell_status" "impl_error"
+                          :cell_id cell-id :run_id run-id
+                          :error "Implementation produced no source code"))))
+              (do
+                (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
+                (emit on-event "cell_status" "impl_error"
                       :cell_id cell-id :run_id run-id
-                      :source source
-                      :test_output test-output
-                      :tests_passed passed?))))
+                      :error (or (:error result) "Implementation failed")))))
           (catch Exception e
             (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
             (emit on-event "cell_status" "impl_error"
