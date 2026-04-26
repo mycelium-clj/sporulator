@@ -140,6 +140,35 @@
 ;; End-to-end: helpers.clj + handler.clj
 ;; =============================================================
 
+(deftest stagnation-guard-warns-after-non-progress-streak-test
+  (testing "after >3 consecutive non-progress tool calls, the harness appends a sharp warning"
+    ;; Phase 4 validation 2026-04-26: prompt-only workflow discipline
+    ;; tamed the simple cells but PE/RLH still ran 9-15 evals before
+    ;; running out of budget. The stagnation guard fires structurally
+    ;; via the dispatcher so deepseek can't ignore it.
+    (let [result (run-with
+                   [(tc :read_file {:path "handler.clj"})
+                    (tc :read_file {:path "test.clj"})
+                    (tc :read_file {:path "helpers.clj"})
+                    (tc :list_files)            ;; 4th non-progress → warned
+                    (tc :write_file {:path "handler.clj" :content "(fn [_ d] {:n 1})"})
+                    (tc :read_file {:path "test.clj"})  ;; streak reset → no warning
+                    (tc :complete)])
+          msgs   (-> result :session :messages deref)
+          tool-results (filter #(= "tool" (:role %)) msgs)
+          contents (mapv :content tool-results)]
+      ;; Ordered tool results align 1:1 with the tool calls above.
+      (is (not (str/includes? (nth contents 0) "STAGNATION GUARD"))
+          "1st non-progress should not warn")
+      (is (not (str/includes? (nth contents 1) "STAGNATION GUARD"))
+          "2nd non-progress should not warn")
+      (is (not (str/includes? (nth contents 2) "STAGNATION GUARD"))
+          "3rd non-progress should not warn (threshold)")
+      (is (str/includes? (nth contents 3) "STAGNATION GUARD")
+          "4th non-progress should warn")
+      (is (not (str/includes? (nth contents 5) "STAGNATION GUARD"))
+          "after a write_file, the streak resets — next read should not warn"))))
+
 (deftest system-prompt-workflow-discipline-test
   (testing "system-prompt nudges agents toward write+test rhythm"
     ;; Phase 4 validation 2026-04-26: deepseek-reasoner consistently

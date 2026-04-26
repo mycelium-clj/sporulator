@@ -610,9 +610,38 @@ You're done when complete succeeds.")
             :give-up-reason (or (:reason args) "No reason given"))
           (str "Gave up: " (or (:reason args) "no reason"))))))
 
+(def ^:private progress-tools
+  "Tools that count as 'making progress' — committing code or verifying
+   the result. Calling one of these resets the consecutive-non-progress
+   counter that tames eval/read/inspect spirals."
+  #{:write_file :edit_file :run_tests :complete :give_up})
+
+(def ^:private non-progress-warning-threshold
+  "After this many consecutive non-progress tool calls, the harness
+   appends a sharp 'commit code' nudge to the tool result. Phase 4
+   validation: deepseek-reasoner reliably stagnated past 3 in a row."
+  3)
+
+(defn- non-progress-warning
+  "The text appended to a tool result when the agent has just executed
+   `n` consecutive non-progress tools (n > threshold). Tells the agent
+   to commit code instead of continuing to browse."
+  [n]
+  (str "\n\n⚠ STAGNATION GUARD: this is your " n
+       "th consecutive non-write tool call. Stop browsing and commit "
+       "your best attempt via write_file (handler.clj or helpers.clj), "
+       "then run_tests. The exact error from run_tests is more useful "
+       "than further reads/evals/inspects — and burning the turn budget "
+       "on exploration is the canonical stagnation pattern."))
+
 (defn- dispatch-tool-call
   "Runs one tool call against the agent state, appends the tool result to the
-   LLM session, and returns the new state."
+   LLM session, and returns the new state.
+
+   Tracks consecutive non-progress tool calls in `:non-progress-streak`
+   so the harness can append a stagnation warning after the threshold —
+   the prompt-only nudge (system-prompt 'Workflow discipline' block)
+   isn't enough to break deepseek-reasoner's harder-cell eval spirals."
   [state {:keys [id name arguments]}]
   (let [tool-name (tools/normalize-tool-name name)
         session   (:session state)]
@@ -620,10 +649,17 @@ You're done when complete succeeds.")
       (do (llm/session-append-tool-result! session id
             (str "ERROR — unknown tool '" (clojure.core/name tool-name) "'."))
           state)
-      (let [{:keys [state result]}
-            (handle-dispatch-tool state {:name tool-name :args arguments})]
-        (llm/session-append-tool-result! session id result)
-        state))))
+      (let [{new-state :state result :result}
+            (handle-dispatch-tool state {:name tool-name :args arguments})
+            progress?    (contains? progress-tools tool-name)
+            prev-streak  (or (:non-progress-streak state) 0)
+            new-streak   (if progress? 0 (inc prev-streak))
+            warned?      (> new-streak non-progress-warning-threshold)
+            final-result (if warned?
+                           (str result (non-progress-warning new-streak))
+                           result)]
+        (llm/session-append-tool-result! session id final-result)
+        (assoc new-state :non-progress-streak new-streak)))))
 
 (defn- process-turn
   "One LLM round-trip:
