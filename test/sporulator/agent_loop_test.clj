@@ -520,6 +520,56 @@
         (is (str/includes? p "test.clj is pre-populated"))
         (is (not (str/includes? p "already has an implementation")))))))
 
+(deftest dispatched-output-block-included-test
+  (testing "when :schema-parsed has dispatched output, the prompt includes the convention block"
+    (let [first-prompt (atom nil)
+          dispatched-opts
+          (assoc base-opts
+            :brief {:id :order/classify-total
+                    :doc "Classify"
+                    :schema "{:input {:total :double} :output {:high {:level :keyword} :low {:level :keyword}}}"
+                    :requires []}
+            :schema-parsed {:input  [:map [:total :double]]
+                            :output {:high {:level :keyword}
+                                     :low  {:level :keyword}}}
+            :test-code double-test-code  ;; harmless stub so the loop has something to run
+            :turn-budget 4)
+          spy (let [counter (atom 0)]
+                (fn [session _client & rest-args]
+                  (let [user-msg (when (string? (first rest-args)) (first rest-args))]
+                    (when user-msg
+                      (when (zero? @counter) (reset! first-prompt user-msg))
+                      (swap! (:messages session) conj {:role "user" :content user-msg}))
+                    (swap! counter inc)
+                    (let [out (tc :give_up {:reason "test stub"})]
+                      (swap! (:messages session) conj (assistant-msg out))
+                      out))))]
+      (with-llm-mock spy
+        (agent-loop/run! dispatched-opts))
+      (let [p @first-prompt]
+        (is (some? p))
+        (is (str/includes? p "Dispatched output"))
+        (is (str/includes? p "Possible transitions: `high` | `low`"))
+        (is (str/includes? p "Never wrap the result under the transition label"))))))
+
+(deftest dispatched-output-block-omitted-for-flat-schema-test
+  (testing "flat output schema → no dispatched-output block in the prompt"
+    (let [first-prompt (atom nil)
+          spy (let [counter (atom 0)]
+                (fn [session _client & rest-args]
+                  (let [user-msg (when (string? (first rest-args)) (first rest-args))]
+                    (when user-msg
+                      (when (zero? @counter) (reset! first-prompt user-msg))
+                      (swap! (:messages session) conj {:role "user" :content user-msg}))
+                    (swap! counter inc)
+                    (let [out (tc :give_up {:reason "test stub"})]
+                      (swap! (:messages session) conj (assistant-msg out))
+                      out))))]
+      (with-llm-mock spy
+        (agent-loop/run! (assoc base-opts :turn-budget 4)))
+      (let [p @first-prompt]
+        (is (not (str/includes? p "Dispatched output")))))))
+
 (deftest no-phase-rejection-test
   (testing "no tool is rejected as 'wrong phase' — all tools are always available"
     (let [result (run-with

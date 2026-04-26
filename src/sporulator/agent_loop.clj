@@ -225,22 +225,64 @@ complete succeeds.")
 ;; Prompts
 ;; =============================================================
 
+(defn- dispatched-output?
+  "True if `output` is a dispatched-output map (lite-form map values or
+   Malli-form vector values), keyed by transition labels. Mirrors
+   `sporulator.orchestrator/dispatched-output?` — duplicated here to
+   avoid a require cycle (orchestrator already requires agent-loop)."
+  [output]
+  (and (map? output) (seq output)
+       (every? (fn [v] (or (and (map? v) (seq v))
+                            (vector? v)))
+               (vals output))))
+
+(defn- dispatched-handler-block
+  "Implementor-side guidance for cells with a dispatched output schema."
+  [output]
+  (let [labels (mapv (comp name key) output)
+        first-label (first labels)
+        first-keys (let [v (val (first output))]
+                     (cond
+                       (map? v)    (vec (keys v))
+                       (vector? v) []
+                       :else       []))
+        sample-key (or (first first-keys) :result)]
+    (str "## Dispatched output — read carefully\n"
+         "This cell's `:output` schema is dispatched; mycelium routes\n"
+         "downstream based on which keys appear in your handler's flat\n"
+         "return map. Possible transitions: "
+         (str/join " | " (map #(str "`" % "`") labels))
+         ".\n\n"
+         "Your handler returns a flat map matching ONE of the per-transition\n"
+         "sub-schemas in `:output`. Pick the shape based on what your work\n"
+         "produced. **Never wrap the result under the transition label.**\n\n"
+         "Right shape (assuming `:" first-label "` carries `" sample-key "`):\n"
+         "  `{" sample-key " ...}`     ← flat\n"
+         "Wrong shape:\n"
+         "  `{:" first-label " {" sample-key " ...}}`   ← do NOT do this\n")))
+
 (defn- render-initial-prompt
   [state]
   (let [brief        (:brief state)
         cell-id      (:cell-id state)
         schema       (:schema brief)
+        schema-parsed (:schema-parsed state)
         task         (:task state)
         requires     (:requires brief)
         edit-mode?   (or (seq (get-in state [:files "handler.clj"]))
                          (seq (get-in state [:files "helpers.clj"])))
-        change-sum   (:change-summary state)]
+        change-sum   (:change-summary state)
+        output       (:output schema-parsed)
+        dispatched-block (when (dispatched-output? output)
+                           (dispatched-handler-block output))]
     (str "Implement cell `" cell-id "`.\n\n"
          "**Task:** " (or task "Implement the cell to pass all tests.") "\n\n"
          "**Schema:**\n" (or schema "{}") "\n\n"
          "**Resources:** "
          (if (seq requires) (str/join ", " (map name requires)) "none")
          "\n\n"
+         (when dispatched-block
+           (str dispatched-block "\n"))
          (if edit-mode?
            (str "This cell already has an implementation that previously "
                 "passed tests. handler.clj and helpers.clj are pre-loaded "
