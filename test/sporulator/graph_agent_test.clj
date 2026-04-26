@@ -140,8 +140,10 @@
           result (ga/save-response-manifest! *store* response)]
       (is (some? result))
       (is (= 1 (:version result)))
-      ;; Verify in store
-      (let [m (store/get-latest-manifest *store* ":my-wf")]
+      ;; Verify in store — manifest-ids are stored canonically without
+      ;; the leading colon so the UI (which strips the colon during EDN
+      ;; → JS conversion) and the Clojure side both hit the same row.
+      (let [m (store/get-latest-manifest *store* "my-wf")]
         (is (some? m))
         (is (= 1 (:version m))))))
 

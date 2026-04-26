@@ -13,6 +13,16 @@
    mismatches between connected cells when they actually break."
   (:require [clojure.string :as str]))
 
+(defn normalize-manifest-id
+  "Strips the leading colon from a manifest-id string. Manifest IDs are
+   stored canonically without the colon; the EDN/Clojure side often sees
+   them as `:foo/bar` keywords (which str produces with colon) while
+   the JS/UI side delivers the bare form. Anchor everything on the bare
+   form at the store boundary."
+  [id]
+  (let [s (str id)]
+    (cond-> s (str/starts-with? s ":") (subs 1))))
+
 (defn cells-by-id
   "Re-keys a manifest's :cells map from step-name to cell-id.
    Returns {} for nil or empty manifests."

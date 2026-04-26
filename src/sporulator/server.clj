@@ -765,8 +765,11 @@
 
       ;; Diff between the latest manifest and the latest green snapshot
       (and (= method :get) (= uri "/api/manifest/diff"))
-      (if-let [id (query-param request "id")]
-        (let [m-row (store/get-latest-manifest store id)
+      (if-let [raw-id (query-param request "id")]
+        (let [;; Normalise the manifest-id so callers can pass either form
+              ;; (":foo/bar" or "foo/bar") and lookups all hit the same row.
+              id (manifest-diff/normalize-manifest-id raw-id)
+              m-row (store/get-latest-manifest store id)
               parsed-cur (when m-row (mv/parse-manifest (:body m-row)))
               cur-manifest (when (and parsed-cur (not (:error parsed-cur))) parsed-cur)
               snap (store/get-latest-green-snapshot store id)

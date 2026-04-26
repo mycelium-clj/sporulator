@@ -1,7 +1,8 @@
 (ns sporulator.store
   "SQLite persistence for cells, manifests, test results, orchestration runs,
    and test contracts. Uses next.jdbc with immutable versioning."
-  (:require [next.jdbc :as jdbc]
+  (:require [clojure.string :as str]
+            [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]))
 
 ;; =============================================================
@@ -489,6 +490,13 @@
 ;; Green snapshots — last successful manifest implementation
 ;; =============================================================
 
+(defn- bare-manifest-id
+  "Strips the leading colon from a manifest id so the store keeps a single
+   canonical key per manifest regardless of caller form."
+  [id]
+  (let [s (str id)]
+    (cond-> s (str/starts-with? s ":") (subs 1))))
+
 (defn save-green-snapshot!
   "Records that this manifest version was successfully implemented end-to-end.
    The body is the canonical EDN string. Future diffs compare the current
@@ -498,7 +506,7 @@
   (jdbc/execute! (ds store)
     ["INSERT INTO green_snapshots (manifest_id, manifest_version, body, run_id)
       VALUES (?, ?, ?, ?)"
-     manifest-id manifest-version body run-id])
+     (bare-manifest-id manifest-id) manifest-version body run-id])
   nil)
 
 (defn get-latest-green-snapshot
@@ -510,7 +518,7 @@
       WHERE manifest_id = ?
       ORDER BY id DESC
       LIMIT 1"
-     manifest-id]
+     (bare-manifest-id manifest-id)]
     {:builder-fn rs/as-unqualified-kebab-maps}))
 
 ;; =============================================================

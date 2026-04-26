@@ -392,7 +392,7 @@
        :run-id "run-1"})
     (let [s (store/get-latest-green-snapshot *store* ":g/x")]
       (is (some? s))
-      (is (= ":g/x" (:manifest-id s)))
+      (is (= "g/x" (:manifest-id s)) "stored canonically without leading colon")
       (is (= 1 (:manifest-version s)))
       (is (= "run-1" (:run-id s)))))
   (testing "second snapshot supersedes the first"
@@ -409,8 +409,8 @@
     {:manifest-id ":g/a" :manifest-version 1 :body "" :run-id ""})
   (store/save-green-snapshot! *store*
     {:manifest-id ":g/b" :manifest-version 1 :body "" :run-id ""})
-  (is (= ":g/a" (:manifest-id (store/get-latest-green-snapshot *store* ":g/a"))))
-  (is (= ":g/b" (:manifest-id (store/get-latest-green-snapshot *store* ":g/b")))))
+  (is (= "g/a" (:manifest-id (store/get-latest-green-snapshot *store* ":g/a"))))
+  (is (= "g/b" (:manifest-id (store/get-latest-green-snapshot *store* ":g/b")))))
 
 ;; =============================================================
 ;; Cell deprecation

@@ -574,7 +574,10 @@
            :as   _opts}]
   (let [run-id  (str "run-" (System/nanoTime))
         on-event (or on-event (fn [_]))
-        on-chunk (or on-chunk (fn [_]))]
+        on-chunk (or on-chunk (fn [_]))
+        ;; Canonical manifest-id form (no leading colon) for snapshots
+        ;; and run records.
+        manifest-id (manifest-diff/normalize-manifest-id manifest-id)]
 
     ;; Create run in store
     (when store
@@ -929,31 +932,72 @@
                  (get-in @runs [run-id :cells]))))
 
 (defn- check-orchestration-complete!
-  "Checks if all cells are done and emits orchestration_complete if so."
+  "Checks if all cells are done and emits orchestration_complete if so.
+   On full success, records a new green snapshot so subsequent runs can
+   diff against this manifest version."
   [run-id]
   (let [run    (get @runs run-id)
         cells  (:cells run)
         total  (count cells)
         done   (count (filter #(= :done (:status (val %))) cells))]
     (when (= done total)
-      (let [on-event (get-in run [:callbacks :on-event])
-            cell-ids (keys cells)]
-        (when (:store run)
-          (store/update-run-tree! (:store run) run-id "completed"
+      (let [on-event    (get-in run [:callbacks :on-event])
+            cell-ids    (keys cells)
+            store       (:store run)
+            manifest-id (:manifest-id run)
+            manifest    (:manifest run)]
+        (when store
+          (store/update-run-tree! store run-id "completed"
             (json/write-str {:passed (vec cell-ids) :failed []})))
+        ;; Record the new green baseline. Diff-aware re-runs against this
+        ;; manifest will now see the freshly-implemented cells as
+        ;; :unchanged.
+        (when (and store (seq manifest-id) manifest)
+          (let [m-row (store/get-latest-manifest store manifest-id)]
+            (store/save-green-snapshot! store
+              {:manifest-id      manifest-id
+               :manifest-version (or (:version m-row) 1)
+               :body             (or (:body m-row) (pr-str manifest))
+               :run-id           run-id})))
         (emit on-event "complete" "done"
               :run_id run-id :passed total :failed 0)))))
 
 (defn start-orchestration!
   "Starts interactive orchestration: creates run, writes manifest to disk,
    generates tests for all cells in parallel. Emits test_ready per cell.
-   Does NOT block — returns the run-id immediately."
+   Does NOT block — returns the run-id immediately.
+
+   Diff-aware: leaves whose contract is unchanged from the latest green
+   snapshot are dropped from the active set and emitted as cell_carry_over
+   events. Removed cells are deprecated + their files deleted."
   [client {:keys [leaves manifest base-ns store project-path
                   on-event on-chunk manifest-id]
            :or   {base-ns "app" manifest-id ""}}]
-  (let [run-id   (str "run-" (System/nanoTime))
-        on-event (or on-event (fn [_]))
-        on-chunk (or on-chunk (fn [_]))
+  (let [run-id      (str "run-" (System/nanoTime))
+        on-event    (or on-event (fn [_]))
+        on-chunk    (or on-chunk (fn [_]))
+        manifest-id (manifest-diff/normalize-manifest-id manifest-id)
+
+        ;; ── Diff against the previous green snapshot ──────────────
+        prev-snapshot (when (and store (seq manifest-id))
+                        (store/get-latest-green-snapshot store manifest-id))
+        prev-manifest (when prev-snapshot
+                        (let [parsed (mv/parse-manifest (:body prev-snapshot))]
+                          (when-not (:error parsed) parsed)))
+        diff-result   (manifest-diff/diff prev-manifest manifest)
+        cell-class    (build-cell-class-index diff-result)
+        prev-cells-by-id (manifest-diff/cells-by-id prev-manifest)
+        new-cells-by-id  (manifest-diff/cells-by-id manifest)
+        actionable?      (fn [cell-id]
+                           (#{:added :schema-changed :doc-changed}
+                            (get cell-class (cell-id-keyword cell-id))))
+
+        ;; Filter leaves to only those whose contracts changed.
+        active-leaves (filterv (fn [leaf]
+                                 (actionable? (or (:cell-id leaf)
+                                                  (:cell_id leaf))))
+                               leaves)
+        leaves        active-leaves
 
         ;; Build reverse mapping for graph context
         id->cell-name (when manifest
@@ -1012,19 +1056,45 @@
         (or manifest-id (str (:id manifest)))
         (pr-str manifest)))
 
-    ;; Store run state
-    (swap! runs assoc run-id
-      {:cells        cells-init
-       :base-ns      base-ns
-       :manifest     manifest
-       :client       client
-       :store        store
-       :project-path project-path
-       :callbacks    {:on-event on-event :on-chunk on-chunk}})
+    ;; Carry-over cells: unchanged from the last green run. Emit an event
+    ;; so the UI shows them as already done, and seed them as :done in run
+    ;; state so check-orchestration-complete! counts them toward total.
+    (let [carry-over-init
+          (into {} (for [cid (:unchanged diff-result)]
+                     [(str cid) {:status :done :carry-over? true}]))
+          cells-init (merge cells-init carry-over-init)]
 
-    (emit on-event "orchestration" "started"
-          :run_id run-id
-          :cell_ids (mapv :id briefs))
+      ;; Removed cells: deprecate in store + delete file from disk.
+      (doseq [cid (:removed diff-result)]
+        (when store
+          (store/deprecate-cell! store (bare-cell-id cid)))
+        (when (and project-path base-ns)
+          (try (source-gen/delete-cell! project-path base-ns (bare-cell-id cid))
+               (catch Exception _ nil)))
+        (emit on-event "cell_remove" "done" :cell_id cid))
+
+      (doseq [cid (:unchanged diff-result)]
+        (emit on-event "cell_carry_over" "skipped" :cell_id cid))
+
+      ;; Store run state
+      (swap! runs assoc run-id
+        {:cells           cells-init
+         :base-ns         base-ns
+         :manifest        manifest
+         :manifest-id     manifest-id
+         :client          client
+         :store           store
+         :project-path    project-path
+         :diff            diff-result
+         :cell-class      cell-class
+         :prev-cells-by-id prev-cells-by-id
+         :new-cells-by-id  new-cells-by-id
+         :prev-run-id     (:run-id prev-snapshot)
+         :callbacks       {:on-event on-event :on-chunk on-chunk}})
+
+      (emit on-event "orchestration" "started"
+            :run_id run-id
+            :cell_ids (mapv :id briefs)))
 
     ;; Generate tests for all cells in parallel
     (doseq [brief briefs]
@@ -1055,7 +1125,10 @@
     run-id))
 
 (defn approve-tests!
-  "Approves a cell's tests. Writes test file to disk, starts implementation."
+  "Approves a cell's tests. Writes test file to disk, starts implementation.
+   For cells whose contract changed since the last green snapshot, the
+   prior implementation source and a change-summary are passed into the
+   implementor so it edits in place rather than starting from scratch."
   [run-id cell-id]
   (let [run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
@@ -1064,7 +1137,18 @@
         client   (:client run)
         base-ns  (:base-ns run)
         on-event (get-in run [:callbacks :on-event])
-        on-chunk (get-in run [:callbacks :on-chunk])]
+        on-chunk (get-in run [:callbacks :on-chunk])
+        ;; Diff context for edit-mode: when this cell's contract is
+        ;; :schema-changed or :doc-changed, hand the implementor the prior
+        ;; source plus a description of what's different.
+        cid-kw   (cell-id-keyword cell-id)
+        class    (get (:cell-class run) cid-kw)
+        edit?    (#{:doc-changed :schema-changed} class)
+        prev-src (when edit? (prior-cell-source store cid-kw))
+        summary  (when edit?
+                   (manifest-diff/change-summary
+                     (get (:prev-cells-by-id run) cid-kw)
+                     (get (:new-cells-by-id run) cid-kw)))]
     (when contract
       ;; Update store
       (when store
@@ -1082,14 +1166,16 @@
       (future
         (try
           (let [result (implement-from-contract client
-                         {:contract     contract
-                          :store        store
-                          :run-id       run-id
-                          :on-event     on-event
-                          :on-chunk     on-chunk
-                          :max-attempts 15
-                          :project-path nil ;; don't write to disk yet
-                          :base-ns      base-ns})]
+                         {:contract        contract
+                          :store           store
+                          :run-id          run-id
+                          :on-event        on-event
+                          :on-chunk        on-chunk
+                          :max-attempts    15
+                          :project-path    nil ;; don't write to disk yet
+                          :base-ns         base-ns
+                          :prev-source     prev-src
+                          :change-summary  summary})]
             (if (= :ok (:status result))
               ;; Implementation succeeded — get source from store (where implement-from-contract saved it)
               (let [latest-cell (when store (store/get-latest-cell store cell-id))

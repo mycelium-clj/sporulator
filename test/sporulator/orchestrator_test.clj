@@ -282,7 +282,7 @@
   "Helper: drives orchestrate! with the tax cell mock through one full
    test+impl round, returning the result and the mock call counter."
   [{:keys [manifest manifest-id leaves prompt-counter]
-    :or {manifest tax-manifest manifest-id ":order/tax-flow"
+    :or {manifest tax-manifest manifest-id "order/tax-flow"
          leaves [tax-leaf] prompt-counter (atom 0)}}]
   (let [result
         (with-llm-mock
@@ -314,7 +314,7 @@
     (let [{:keys [result]} (run-tax-orchestration {})]
       (is (= "ok" (get result "status")))
       (is (= [:order/compute-tax] (vec (:added (:diff result)))))
-      (let [snap (store/get-latest-green-snapshot *store* ":order/tax-flow")]
+      (let [snap (store/get-latest-green-snapshot *store* "order/tax-flow")]
         (is (some? snap))
         (is (str/includes? (:body snap) ":order/compute-tax"))))))
 

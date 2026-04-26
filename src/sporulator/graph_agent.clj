@@ -4,6 +4,7 @@
             [sporulator.extract :as extract]
             [sporulator.feedback :refer [feedback-loop]]
             [sporulator.llm :as llm]
+            [sporulator.manifest-diff :as manifest-diff]
             [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
@@ -139,7 +140,9 @@
    Returns {:version n} on success, or nil if no manifest found."
   [store response]
   (when-let [manifest (extract-manifest response)]
-    (let [manifest-id (str (:id manifest))
+    (let [;; Canonicalise the manifest-id by stripping the leading colon.
+          ;; Snapshots, the diff endpoint, and the UI all use the bare form.
+          manifest-id (manifest-diff/normalize-manifest-id (:id manifest))
           version (store/save-manifest! store
                     {:id   manifest-id
                      :body (pr-str manifest)
