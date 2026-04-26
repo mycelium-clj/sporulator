@@ -140,6 +140,38 @@
 ;; End-to-end: helpers.clj + handler.clj
 ;; =============================================================
 
+(deftest helpers-rejects-ns-form-test
+  (testing "writing helpers.clj with a top-level (ns ...) returns an error"
+    ;; helpers.clj is a flat sequence of (defn ...)/(def ...) forms;
+    ;; codegen splices them into the assembled cell source above the
+    ;; (cell/defcell ...). An (ns ...) declaration in helpers.clj
+    ;; conflicts with the assembled file's own ns and confused agents
+    ;; into multi-turn fixup spirals during Phase 4 validation. Reject
+    ;; up front with a clear error so the agent recovers immediately.
+    (let [bad-helpers (str "(ns app.cells.x.helpers\n"
+                           "  (:require [next.jdbc :as jdbc]))\n"
+                           "(defn doubled [x] (* x 2))")
+          good-handler "(fn [_ data] {:n (doubled (:n data))})"
+          result (run-with
+                   [(tc :write_file {:path "helpers.clj" :content bad-helpers})
+                    (tc :write_file {:path "helpers.clj" :content "(defn doubled [x] (* x 2))"})
+                    (tc :write_file {:path "handler.clj" :content good-handler})
+                    (tc :run_tests)
+                    (tc :complete)])
+          session (:session result)
+          msgs    (-> session :messages deref)
+          first-tool-result (->> msgs
+                                 (filter #(= "tool" (:role %)))
+                                 first
+                                 :content)]
+      (is (= :ok (:status result))
+          "agent recovers after the rejection on attempt 1")
+      (is (some #(re-find #"helpers\.clj" %) [first-tool-result])
+          "the rejection mentions helpers.clj")
+      (is (or (str/includes? (or first-tool-result "") "(ns")
+              (str/includes? (or first-tool-result "") "ns"))
+          "the rejection explains the (ns ...) issue"))))
+
 (deftest helpers-then-handler-test
   (testing "agent writes a helper, then a handler that calls it, then runs"
     (let [result (run-with

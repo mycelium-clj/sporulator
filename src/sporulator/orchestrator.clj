@@ -218,6 +218,34 @@
                (str "- `" r "` (no docstring; treat as the real runtime resource)"))))
          "\n")))
 
+(defn- requires-db?
+  "True if `requires` includes a :db (or 'db'-named) resource — used to
+   gate JDBC-specific test guidance."
+  [requires]
+  (boolean
+    (some (fn [r] (= "db" (name (keyword (name r))))) requires)))
+
+(defn- jdbc-test-shape-block
+  "Test-gen guidance for cells that read back from a JDBC datasource.
+   `next.jdbc/execute!` defaults to qualified-keyword keys (rows look
+   like `{:guestbook/id 1}`, not `{:id 1}`). Without this hint the
+   test-gen LLM writes `(is (= \"alice\" (:handle row)))` against
+   unqualified keys — that's nil — and produces unsatisfiable tests
+   that send the implementor into a 15-turn stagnation chasing a fix
+   the handler can never deliver. (Phase 4 validation 2026-04-26.)"
+  []
+  (str "## JDBC qualified-key default — read carefully\n"
+       "When you read rows back via `next.jdbc/execute!` (e.g. to verify\n"
+       "an INSERT landed) the rows come back with **namespaced keyword**\n"
+       "keys derived from the table name. A `guestbook` table yields\n"
+       "rows like `{:guestbook/id 1, :guestbook/handle \"alice\"}` — the\n"
+       "unqualified keys `:id` / `:handle` are `nil`. Either:\n"
+       "- assert against the qualified keys: `(:guestbook/handle row)`, or\n"
+       "- pass `{:builder-fn rs/as-unqualified-maps}` to `execute!` and\n"
+       "  use `[next.jdbc.result-set :as rs]` (already in the test ns).\n"
+       "Pick one and stay consistent. Do NOT assert against unqualified\n"
+       "keys on rows returned by the default builder.\n"))
+
 (defn- build-test-prompt
   "Builds the prompt to ask the LLM to write tests for a cell."
   [{:keys [id doc schema requires resource-docs context]}]
@@ -233,7 +261,20 @@
          (str "\n" prompts/math-precision-rules "\n"))
        (when (dispatched-output? output)
          (str "\n" (dispatched-shape-block output)))
-       "\n## Calling convention — read carefully\n"
+       (when (requires-db? requires)
+         (str "\n" (jdbc-test-shape-block)))
+       "\n## Error-path assertions — avoid verbatim strings\n"
+       "When the cell signals failure via an `:error` field (or similar),\n"
+       "do NOT assert on an exact error string unless the brief above\n"
+       "literally specifies that wording. The implementor has no way to\n"
+       "guess your invented message, so a hardcoded `(= \"…\" (:error r))`\n"
+       "becomes unsatisfiable and the impl loop stagnates.\n"
+       "Default to one of:\n"
+       "- `(is (string? (:error result)))`\n"
+       "- `(is (clojure.string/includes? (:error result) \"keyword from the brief\"))`\n"
+       "- `(is (some? (:error result)))`\n"
+       "Only use `(= \"verbatim\" (:error result))` when the brief locks\n"
+       "the wording.\n"
        "The handler signature is `(fn [resources data] ...)`.\n"
        "- `resources` is a map. The keys are the cell's `:requires` keywords.\n"
        "  Their values are the **real runtime objects** (a JDBC DataSource\n"
@@ -600,13 +641,6 @@
           {}
           [:added :removed :schema-changed :doc-changed :unchanged]))
 
-(defn- prior-cell-source
-  "Returns the latest non-deprecated assembled source for a cell-id, or nil."
-  [store cell-id]
-  (when store
-    (when-let [c (store/get-latest-cell store (bare-cell-id cell-id))]
-      (:handler c))))
-
 (defn- prior-test-code
   "Returns the test_code from the prior run for a cell-id, or nil."
   [store run-id cell-id]
@@ -845,7 +879,9 @@
                             (let [cid-kw   (cell-id-keyword (:cell-id contract))
                                   class    (get cell-class cid-kw)
                                   edit?    (#{:doc-changed :schema-changed} class)
-                                  prev-src (when edit? (prior-cell-source store cid-kw))
+                                  ;; Fresh-mode: see approve-tests! comment.
+                                  ;; Edit-mode anchored the agent on broken
+                                  ;; prior patterns; fresh regenerated cleanly.
                                   summary  (when edit?
                                              (manifest-diff/change-summary
                                                (get prev-cells-by-id cid-kw)
@@ -859,7 +895,7 @@
                                  :max-attempts    max-attempts
                                  :project-path    project-path
                                  :base-ns         base-ns
-                                 :prev-source     prev-src
+                                 :prev-source     nil
                                  :change-summary  summary}))
                             (catch Exception e
                               {:status  :error
@@ -1093,7 +1129,8 @@
 
         ;; Build briefs from leaves
         briefs (mapv (fn [leaf]
-                       (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
+                       (let [cell-id (bare-cell-id
+                                       (or (:cell-id leaf) (:cell_id leaf)))
                              doc (or (:doc leaf) "")
                              input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
                              output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
@@ -1203,7 +1240,8 @@
    prior implementation source and a change-summary are passed into the
    implementor so it edits in place rather than starting from scratch."
   [run-id cell-id]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         store    (:store run)
@@ -1211,13 +1249,16 @@
         base-ns  (:base-ns run)
         on-event (get-in run [:callbacks :on-event])
         on-chunk (get-in run [:callbacks :on-chunk])
-        ;; Diff context for edit-mode: when this cell's contract is
-        ;; :schema-changed or :doc-changed, hand the implementor the prior
-        ;; source plus a description of what's different.
+        ;; When this cell's contract is :schema-changed or :doc-changed,
+        ;; emit a structured change-summary so the implementor knows what
+        ;; the new contract demands. We deliberately do NOT pass the prior
+        ;; source: in Phase 4 validation runs the agent reliably anchored
+        ;; on broken patterns from earlier (lite-form schemas, ns drift,
+        ;; nested success/failure returns) and stagnated within the turn
+        ;; budget. Fresh-mode regenerated the same cells in 10–19 calls.
         cid-kw   (cell-id-keyword cell-id)
         class    (get (:cell-class run) cid-kw)
         edit?    (#{:doc-changed :schema-changed} class)
-        prev-src (when edit? (prior-cell-source store cid-kw))
         summary  (when edit?
                    (manifest-diff/change-summary
                      (get (:prev-cells-by-id run) cid-kw)
@@ -1247,7 +1288,7 @@
                           :max-attempts    15
                           :project-path    nil ;; don't write to disk yet
                           :base-ns         base-ns
-                          :prev-source     prev-src
+                          :prev-source     nil ;; fresh-mode (see comment above)
                           :change-summary  summary})]
             (if (= :ok (:status result))
               ;; Implementation succeeded — get source from store (where implement-from-contract saved it)
@@ -1282,7 +1323,8 @@
 (defn reject-tests!
   "Rejects a cell's tests with feedback. Re-generates tests."
   [run-id cell-id feedback]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         client   (:client run)
@@ -1338,7 +1380,8 @@
 (defn save-tests!
   "Saves user-edited test code. Updates store, writes to disk, starts implementation."
   [run-id cell-id test-code]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         store    (:store run)]
@@ -1364,7 +1407,8 @@
 (defn approve-impl!
   "Approves a cell's implementation. Formats, writes to disk, saves to store."
   [run-id cell-id]
-  (let [run         (get @runs run-id)
+  (let [cell-id     (bare-cell-id cell-id)
+        run         (get @runs run-id)
         cell        (get-in run [:cells cell-id])
         source      (format-source (or (:impl-source cell) ""))
         store       (:store run)
@@ -1401,7 +1445,8 @@
    declarations through codegen — so namespace and schema declarations stay
    consistent with the file path and the architect's contract."
   [run-id cell-id feedback]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         client   (:client run)
@@ -1409,14 +1454,14 @@
         base-ns  (:base-ns run)
         on-event (get-in run [:callbacks :on-event])
         on-chunk (get-in run [:callbacks :on-chunk])
-        ;; Prior code: prefer the cell's current :impl-source, fall back
-        ;; to the latest store row (covers the case where the previous
-        ;; impl ended in :impl_error and never landed on the run state).
-        prev-src (or (:impl-source cell)
-                     (when store (:handler (store/get-latest-cell store cell-id))))
         ;; Diff context (if any) — for cells flagged :doc-changed or
         ;; :schema-changed during this run, append a structured summary
-        ;; of what moved in the contract.
+        ;; of what moved in the contract. We deliberately do NOT pass
+        ;; the prior source: the agent reliably anchors on whatever
+        ;; pattern is in handler.clj and stagnates when that pattern
+        ;; conflicts with the new contract (Phase 4 validation
+        ;; 2026-04-26). Fresh-mode regenerates from scratch using the
+        ;; user feedback and the change-summary as guidance.
         cid-kw      (cell-id-keyword cell-id)
         class       (get (:cell-class run) cid-kw)
         diff-summary (when (#{:doc-changed :schema-changed} class)
@@ -1441,7 +1486,7 @@
                           :max-attempts    15
                           :project-path    nil ;; don't write to disk yet
                           :base-ns         base-ns
-                          :prev-source     prev-src
+                          :prev-source     nil ;; fresh-mode (see comment above)
                           :change-summary  change-summary})]
             (if (= :ok (:status result))
               (let [latest-cell (when store (store/get-latest-cell store cell-id))
@@ -1474,7 +1519,8 @@
 (defn save-impl!
   "Saves user-edited implementation. Evals, runs tests. If pass: writes to disk."
   [run-id cell-id source]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         store    (:store run)

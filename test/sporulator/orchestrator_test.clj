@@ -156,6 +156,56 @@
     (is (not (orch/dispatched-output? "string")))
     (is (not (orch/dispatched-output? {:k {}}))         "empty map values shouldn't count")))
 
+(deftest build-test-prompt-error-string-block-test
+  (testing "test-gen prompt warns against asserting on exact error strings"
+    ;; When the brief doesn't pin specific wording, test-gen LLMs
+    ;; sometimes invent verbatim error messages and assert on them with
+    ;; equality. The implementor then has no way to know what string to
+    ;; produce and thrashes (Phase 4 validation 2026-04-26 — validate-
+    ;; message stagnated chasing "Message must be non-empty and at most
+    ;; 500 characters." that the brief never specified).
+    (let [prompt (#'orch/build-test-prompt
+                   {:id "x/y"
+                    :doc "Validates input. Returns :error on failure."
+                    :schema "{:input {:k :string} :output {:success {:n :int} :failure {:error :string}}}"
+                    :requires []
+                    :resource-docs nil
+                    :context nil})]
+      (is (or (str/includes? prompt "exact error string")
+              (str/includes? prompt "verbatim")
+              (str/includes? prompt "string?"))
+          "must guide error-path tests away from hardcoded equality"))))
+
+(deftest build-test-prompt-jdbc-block-test
+  (testing "cells requiring :db get next.jdbc qualified-key guidance"
+    ;; next.jdbc/execute! returns rows with NAMESPACED-keyword keys by
+    ;; default (e.g. {:guestbook/id 1}). Without warning the test-gen
+    ;; LLM writes assertions like (:id row) which return nil → tests
+    ;; become unsatisfiable and the implementor stagnates.
+    (let [prompt (#'orch/build-test-prompt
+                   {:id "guestbook/persist-entry"
+                    :doc "Inserts a row."
+                    :schema "{:input {:k :string} :output {:id :int}}"
+                    :requires [:db]
+                    :resource-docs nil
+                    :context nil})]
+      (is (str/includes? prompt "next.jdbc/execute!")
+          "JDBC block must mention next.jdbc/execute!")
+      (is (or (str/includes? prompt "qualified")
+              (str/includes? prompt "as-unqualified-maps"))
+          "JDBC block must explain qualified-key default or builder-fn workaround")))
+
+  (testing "cells without :db do NOT get the JDBC block"
+    (let [prompt (#'orch/build-test-prompt
+                   {:id "x/y"
+                    :doc "..."
+                    :schema "{:input {:n :int} :output {:n :int}}"
+                    :requires []
+                    :resource-docs nil
+                    :context nil})]
+      (is (not (str/includes? prompt "as-unqualified-maps"))
+          "non-db cells should not be given JDBC builder-fn guidance"))))
+
 (deftest parse-schema-output-test
   (testing "parses a normal brief schema string"
     (is (= {:n :int}

@@ -102,6 +102,20 @@ complete succeeds.")
       (try (binding [*read-eval* false] (vec (read-string src)))
            (catch Exception _ nil)))))
 
+(defn- helpers-buffer-error
+  "Returns an error string if `content` is invalid for helpers.clj — i.e.
+   contains a top-level (ns ...) form that would clash with the assembled
+   cell's own namespace. Returns nil when the buffer is well-formed."
+  [content]
+  (when-let [forms (parse-helpers-buffer content)]
+    (when (some (fn [f] (and (seq? f) (= 'ns (first f)))) forms)
+      (str "helpers.clj must be a flat list of (defn ...)/(def ...) forms — "
+           "it must NOT contain a top-level (ns ...) declaration. The cell's "
+           "ns and :require list are generated automatically from the brief; "
+           "put any extra requires beside the helpers as a top-level "
+           "(require '[...]) at use site, or hand the helper its dep "
+           "explicitly."))))
+
 (defn- format-with-line-numbers
   "Renders content with `   N\\tline` prefixes (cat -n style)."
   [content]
@@ -402,10 +416,12 @@ complete succeeds.")
     (not (file-paths path))
     (err state (str "Unknown file: '" path "'."))
     :else
-    (let [new-state (-> state
-                        (assoc-in [:files path] content)
-                        (after-source-write path))]
-      (ok new-state (str "wrote " path " (" (count content) " chars)")))))
+    (if-let [hint (and (= "helpers.clj" path) (helpers-buffer-error content))]
+      (err state hint)
+      (let [new-state (-> state
+                          (assoc-in [:files path] content)
+                          (after-source-write path))]
+        (ok new-state (str "wrote " path " (" (count content) " chars)"))))))
 
 (defn- handle-file-edit
   [state {:keys [path old_string new_string replace_all]}]
@@ -429,12 +445,14 @@ complete succeeds.")
         :else
         (let [new-content (if replace_all
                             (str/replace content old_string new_string)
-                            (str/replace-first content old_string new_string))
-              new-state   (-> state
-                              (assoc-in [:files path] new-content)
-                              (after-source-write path))]
-          (ok new-state (str "edited " path
-                             (when replace_all (str " (" n " replacements)")))))))))
+                            (str/replace-first content old_string new_string))]
+          (if-let [hint (and (= "helpers.clj" path) (helpers-buffer-error new-content))]
+            (err state hint)
+            (let [new-state (-> state
+                                (assoc-in [:files path] new-content)
+                                (after-source-write path))]
+              (ok new-state (str "edited " path
+                                 (when replace_all (str " (" n " replacements)")))))))))))
 
 (defn- handle-file-list
   [state]
