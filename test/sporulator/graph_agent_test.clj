@@ -167,7 +167,7 @@
                             (swap! call-count inc)
                             (when on-chunk (on-chunk resp))
                             (swap! (:messages session) conj {:role "assistant" :content resp})
-                            resp))]
+                            {:content resp :tool-calls nil :finish-reason "stop"}))]
             (ga/design-workflow nil "decomp-1"
               "Build an order processing system"
               (fn [_]) :store *store*))]

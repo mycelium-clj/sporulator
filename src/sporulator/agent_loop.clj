@@ -1,41 +1,80 @@
 (ns sporulator.agent-loop
   "Interactive tool-use dispatch agent for cell implementation.
-   Manages the DISPATCH → REVIEW phase machine, renders prompts,
-   parses tool calls, dispatches execution, and assembles final results.
-   Replaces the monolithic implement-from-contract loop."
+   The agent works in a small virtual filesystem of three named buffers
+   (handler.clj, helpers.clj, test.clj) and drives DISPATCH → REVIEW
+   transitions via native LLM tool_calls. The session itself carries the
+   conversation history; agent state only tracks domain data."
   (:refer-clojure :exclude [run!])
   (:require [clojure.string :as str]
             [sporulator.codegen :as codegen]
             [sporulator.code-graph :as cg]
             [sporulator.eval :as ev]
-            [sporulator.extract :as extract]
             [sporulator.llm :as llm]
             [sporulator.mcp-bridge :as mcp]
-            [sporulator.prompts :as prompts]
             [sporulator.source-gen :as source-gen]
             [sporulator.store :as store]
             [sporulator.tool-registry :as tools]))
 
-(def system-prompt-template
-  "You are implementing a Mycelium cell in Clojure via TDD. You work step-by-step,
-emitting exactly ONE tool call per response as a fenced JSON block.
+(def system-prompt
+  "You are implementing a Mycelium cell in Clojure.
 
-## Protocol
-On every turn, emit:
-```tool-call
-{\"name\": \"<tool>\", \"args\": {...}}
-```
+## The contract (immutable)
+The cell brief is the architect's contract. You must satisfy it:
+- :doc      — what the cell does
+- :schema   — input/output Malli schema
+- :requires — resources injected at runtime
 
-## Phases
-- DISPATCH: Explore context, write tests, write handler, run tests.
-- REVIEW: When tests pass, review the result. Approve, revise, or give_up.
+Use get_spec to read the contract. You cannot change it.
 
-## Rules
-- NEVER write (ns ...) or (cell/defcell ...) — the harness assembles those.
-- Write ONLY the handler body: (fn [resources data] ...)
-- DO NOT read files or run shell commands — use the provided tools.
-- The REPL evaluates your code; you inspect results via eval().
-- Use eval() to experiment before committing to write_handler.")
+## Your workspace
+You work in three editable files:
+- handler.clj — must contain a single (fn [resources data] ...) form
+- helpers.clj — top-level defn / def forms used by the handler
+- test.clj    — tests (deftest forms); pre-populated with the test contract
+
+test.clj starts with a generated test contract. You can refine it as you
+learn more about the problem (add cases, fix wrong expectations) — but the
+final implementation must still satisfy the architect's :schema and :doc.
+
+## Calling convention — read carefully
+The handler signature is `(fn [resources data] ...)`.
+- `resources` is a map. The keys are the cell's `:requires` keywords.
+  Their values are the **real runtime objects** (a JDBC DataSource for `:db`,
+  an HTTP client for `:http`, etc.) — NOT mock maps that fake framework
+  functions as keyed entries. To use a database resource, call its real API
+  directly, e.g. `(next.jdbc/execute! db [...])` — do not write
+  `((:execute! db) ...)` or similar.
+- `data` is a flat Clojure map whose keys match the cell's `:input` schema
+  *directly*. The schema `{:handle :string}` means the handler receives
+  `{:handle \"alice\"}` — NOT `{:input {:handle \"alice\"}}`. Never destructure
+  via `(:input data)`.
+
+## Files
+- read_file / write_file / edit_file / list_files — read and edit source
+- write_file overwrites entirely
+- edit_file replaces one exact substring (set replace_all=true for all)
+- handler.clj contains ONLY the (fn [resources data] ...) form. Do NOT
+  write `(ns ...)` or `(cell/defcell ...)` — the harness assembles those.
+
+## Verification + introspection
+- run_tests — assemble + evaluate + run tests in test.clj
+- eval — try a Clojure expression in the REPL
+- lint — clj-kondo on handler.clj
+- get_callers / get_callees / graph_impact / graph_path — call-graph queries
+  over YOUR functions in this cell
+- list_functions / list_ns / inspect_ns — REPL introspection
+
+## Finishing
+- complete — declare done. The harness re-runs tests as a final check; if
+  they pass, the cell is finalized. If they fail, you keep working.
+- give_up — bail out with a reason if the task isn't achievable.
+
+Work in whatever order makes sense. Iterate freely. You're done when
+complete succeeds.")
+
+;; =============================================================
+;; Helpers — buffer parsing and file-shaped utilities
+;; =============================================================
 
 (defn- ->keyword
   [id]
@@ -45,44 +84,119 @@ On every turn, emit:
     (string? id) (keyword id)
     :else (keyword (str id))))
 
+(defn- parse-handler-buffer
+  "Parses handler.clj content as a single Clojure form. Returns the form,
+   or nil if the buffer is empty/blank/unparseable."
+  [content]
+  (when-not (str/blank? content)
+    (try (binding [*read-eval* false] (read-string content))
+         (catch Exception _ nil))))
+
+(defn- parse-helpers-buffer
+  "Parses helpers.clj content as a flat sequence of top-level forms.
+   Returns a vector of forms, or nil if unparseable. Empty content → []."
+  [content]
+  (if (str/blank? content)
+    []
+    (let [src (str "[" content "]")]
+      (try (binding [*read-eval* false] (vec (read-string src)))
+           (catch Exception _ nil)))))
+
+(defn- format-with-line-numbers
+  "Renders content with `   N\\tline` prefixes (cat -n style)."
+  [content]
+  (if (str/blank? content)
+    "(empty)"
+    (->> (str/split-lines content)
+         (map-indexed (fn [i line] (format "%5d\t%s" (inc i) line)))
+         (str/join "\n"))))
+
+(defn- count-occurrences
+  "Counts non-overlapping occurrences of sub in s."
+  [^String s ^String sub]
+  (if (str/blank? sub)
+    0
+    (loop [n 0 from 0]
+      (let [idx (.indexOf s sub from)]
+        (if (neg? idx)
+          n
+          (recur (inc n) (+ idx (count sub))))))))
+
+(defn- rebuild-graph!
+  "Re-parses handler.clj and helpers.clj from state's files and rebuilds the
+   cell-graph. Tolerates parse failures (skips silently)."
+  [state]
+  (let [files   (:files state)
+        handler (parse-handler-buffer (get files "handler.clj"))
+        helpers (parse-helpers-buffer (get files "helpers.clj"))]
+    (when (and handler (some? helpers))
+      (cg/rebuild-cell-graph! (:cell-graph state) handler helpers))))
+
+(defn- after-source-write
+  "Marks tests stale and rebuilds the call-graph if a source file changed."
+  [state path]
+  (let [s (assoc state :last-tests-green? false)]
+    (when (#{"handler.clj" "helpers.clj"} path)
+      (rebuild-graph! s))
+    s))
+
+;; =============================================================
+;; Session state
+;; =============================================================
+
+(def ^:private file-paths #{"handler.clj" "helpers.clj" "test.clj"})
+
 (defn init-session
-  "Creates the initial session state from orchestration context."
+  "Creates the initial session state from orchestration context.
+
+   Edit-mode opts (used when regenerating an existing cell):
+     :initial-handler — pre-populate handler.clj with the prior green source
+                        (the bare `(fn [resources data] ...)` form as a string)
+     :initial-helpers — pre-populate helpers.clj with prior helper defns
+     :change-summary  — string describing how the contract has changed since
+                        the previous green implementation; surfaced in the
+                        initial prompt so the agent knows what to revise"
   [{:keys [client cell-id cell-ns brief test-code schema-parsed
-           graph mcp-ctx turn-budget on-event on-chunk
-           store run-id project-path base-ns task]
+           turn-budget on-event on-chunk
+           store run-id project-path base-ns task
+           initial-handler initial-helpers change-summary]
     :or   {turn-budget 15
            on-event    (fn [_])
            on-chunk    (fn [_])}}]
   (let [cell-id-kw (->keyword (or cell-id (:id brief)))
-        session    (llm/create-session (str "agent:" cell-id-kw) system-prompt-template)]
-    {:phase              :dispatch
-     :turn               0
-     :turn-budget        turn-budget
-     :session            session
-     :cell-id            cell-id-kw
-     :cell-ns            (or cell-ns "")
-     :brief              brief
-     :test-code          test-code
-     :test-ns-name       (when test-code (second (re-find #"\(ns\s+(\S+)" test-code)))
-     :schema-parsed      schema-parsed
-     :graph              graph
-     :mcp-ctx            mcp-ctx
-     :green-handler      nil
-     :green-tests        nil
-     :current-handler    nil
-     :current-tests      test-code
-     :helpers            nil
-     :tool-history       []
-     :last-tests-green?  false
-     :repair-attempts    0
-     :client             client
-     :on-event           on-event
-     :on-chunk           on-chunk
-     :store              store
-     :run-id             run-id
-     :project-path       project-path
-     :base-ns            base-ns
-     :task               task}))
+        session    (llm/create-session (str "agent:" cell-id-kw) system-prompt)
+        files      {"handler.clj" (or initial-handler "")
+                    "helpers.clj" (or initial-helpers "")
+                    "test.clj"    (or test-code "")}
+        state      {:phase             :working
+                    :turn              0
+                    :turn-budget       turn-budget
+                    :session           session
+                    :cell-id           cell-id-kw
+                    :cell-ns           (or cell-ns "")
+                    :brief             brief
+                    :test-code         test-code
+                    :test-ns-name      (when test-code (second (re-find #"\(ns\s+(\S+)" test-code)))
+                    :schema-parsed     schema-parsed
+                    :cell-graph        (atom #{})
+                    :files             files
+                    :green-files       nil
+                    :last-tests-green? false
+                    :last-turn-shape   :initial
+                    :change-summary    change-summary
+                    :client            client
+                    :on-event          on-event
+                    :on-chunk          on-chunk
+                    :store             store
+                    :run-id            run-id
+                    :project-path      project-path
+                    :base-ns           base-ns
+                    :task              task}]
+    ;; If we pre-loaded source, prime the call graph from it so the
+    ;; graph tools work on turn 1.
+    (when (or (seq (or initial-handler "")) (seq (or initial-helpers "")))
+      (rebuild-graph! state))
+    state))
 
 (defn- emit
   [state phase status & {:as extra}]
@@ -93,461 +207,425 @@ On every turn, emit:
                                base extra)]
       (f converted))))
 
-(defn- add-to-history
-  "Appends a tool call + result pair to the conversation history."
-  [state {:keys [name args] :as call} result]
-  (update state :tool-history conj {:call call :result result}))
-
 (defn- mcp-ctx
-  "Returns the MCP context, enriched with live session state."
+  "Builds the context map mcp-bridge expects from the file-shaped agent state."
   [state]
-  (assoc (:mcp-ctx state)
-         :current-handler (:current-handler state)
-         :current-tests   (:current-tests state)
-         :green-handler   (:green-handler state)
-         :green-tests     (:green-tests state)))
+  (let [files       (:files state)
+        green-files (:green-files state)]
+    {:brief           (:brief state)
+     :task            (:task state)
+     :test-code       (:test-code state)
+     :current-handler (get files "handler.clj")
+     :current-tests   (get files "test.clj")
+     :green-handler   (get green-files "handler.clj")
+     :green-tests     (get green-files "test.clj")
+     :helpers         (or (parse-helpers-buffer (get files "helpers.clj")) [])}))
 
-(defn- render-dispatch-prompt
+;; =============================================================
+;; Prompts
+;; =============================================================
+
+(defn- render-initial-prompt
   [state]
-  (let [brief    (:brief state)
-        cell-id  (:cell-id state)
-        schema   (:schema brief)
-        task     (:task state)
-        requires (:requires brief)
-        history  (:tool-history state)]
-    (str "You are implementing cell `" cell-id "`.\n\n"
+  (let [brief        (:brief state)
+        cell-id      (:cell-id state)
+        schema       (:schema brief)
+        task         (:task state)
+        requires     (:requires brief)
+        edit-mode?   (or (seq (get-in state [:files "handler.clj"]))
+                         (seq (get-in state [:files "helpers.clj"])))
+        change-sum   (:change-summary state)]
+    (str "Implement cell `" cell-id "`.\n\n"
          "**Task:** " (or task "Implement the cell to pass all tests.") "\n\n"
          "**Schema:**\n" (or schema "{}") "\n\n"
          "**Resources:** "
          (if (seq requires) (str/join ", " (map name requires)) "none")
-         "\n\n---\n\n"
-         "Available tools:\n"
-         (tools/render-tool-catalog)
-         "\n\n---\n\n"
-         (when (seq history)
-           (str "--- Conversation so far ---\n"
-                (str/join "\n\n"
-                  (map-indexed
-                    (fn [i {:keys [call result]}]
-                      (str "Turn " (inc i) ":\n"
-                           "Tool: " (name (:name call)) "\n"
-                           "Result: " result))
-                    history))
-                "\n\n---\n\n"))
-         "Your next tool call:")))
+         "\n\n"
+         (if edit-mode?
+           (str "This cell already has an implementation that previously "
+                "passed tests. handler.clj and helpers.clj are pre-loaded "
+                "with that source. test.clj has the (possibly new) test "
+                "contract.\n\n"
+                (when change-sum
+                  (str change-sum "\n\n"))
+                "Read handler.clj and helpers.clj to see what's there. "
+                "Decide what still applies under the new contract and what "
+                "needs revising. Reuse what fits; replace what doesn't. "
+                "Run the tests to verify, then call complete.")
+           (str "test.clj is pre-populated with the test contract. Refine it "
+                "if you spot issues, write helpers.clj and handler.clj, run "
+                "tests, and call complete when you're satisfied.")))))
 
-(defn- render-review-prompt
-  [state]
-  (let [cell-id        (:cell-id state)
-        cell-ns        (:cell-ns state)
-        brief          (:brief state)
-        schema         (:schema brief)
-        handler        (:green-handler state)
-        tests          (:green-tests state)
-        test-ns        (:test-ns-name state)]
-    (str "REVIEW PHASE — tests just went green.\n\n"
-         "Target: " cell-id "\n"
-         "Cell NS: " cell-ns "\n\n"
-         "SPEC:\n" (or schema "{}") "\n\n"
-         "Final handler:\n```clojure\n"
-         (or handler "(not recorded)")
-         "\n```\n\n"
-         "Final test file:\n```clojure\n"
-         (or tests "(not recorded)")
-         "\n```\n\n"
-         "Available tools: approve(), revise({reason}), give_up({reason})\n\n"
-         "Your move: approve(), revise({reason}), or give_up({reason}).\n\n"
-         "Default to approve. Revise only when you spot a concrete spec-vs-tests\n"
-         "mismatch. Do NOT revise for cosmetic reasons.")))
+;; =============================================================
+;; Test assembly + eval
+;; =============================================================
 
-(defn- tool-result
-  "Formats a tool execution result for conversation history."
-  [success? payload]
-  (if success?
-    (str "ok — " payload)
-    (str "ERROR — " payload)))
+(defn- wrap-test-code
+  [test-code cell-ns cell-id]
+  (if (or (nil? test-code) (str/blank? test-code))
+    test-code
+    (if (re-find #"^[\(\s]*\(ns\s" test-code)
+      test-code
+      (let [ns-name (str (or cell-ns (str/replace (str cell-id) #"^:" "")) "-test")]
+        (str "(ns " ns-name "\n"
+             "  (:require [clojure.test :refer [deftest is testing]]))\n\n"
+             test-code)))))
 
 (defn- assemble-and-eval
-  "Assembles the full cell source from current state, evals it + tests.
-   Returns {:status :ok :passed? true|false :output str} or {:status :error}"
+  "Reads handler.clj + helpers.clj + test.clj from state's files, parses,
+   assembles, and runs tests. Returns {:status :ok :passed? bool :output str}
+   or {:status :error :output reason}."
   [state]
-  (let [cell-id        (:cell-id state)
-        cell-ns        (:cell-ns state)
-        brief          (:brief state)
-        schema-parsed  (:schema-parsed state)
-        handler        (:current-handler state)
-        test-code      (:current-tests state)
-        helpers        (:helpers state)]
-    (if-not handler
-      {:status :error :output "No handler written yet. Use write_handler first."}
-      (let [;; Assemble cell source
-            source (codegen/assemble-cell-source
-                     {:cell-ns        cell-ns
-                      :cell-id        cell-id
-                      :doc            (or (:doc brief) "")
-                      :schema         schema-parsed
-                      :requires       (mapv keyword (or (:requires brief) []))
-                      :extra-requires []
-                      :helpers        (or helpers [])
-                      :fn-body        handler})
-            ;; Fix test require so it doesn't try to load from disk
-            test-src-fixed (if cell-ns
-                             (str/replace test-code
-                               (str "[" cell-ns "]")
-                               (str "[" cell-ns " :as _cell-ns]"))
-                             test-code)
-            combined (str source "\n\n" test-src-fixed)
-            eval-res (ev/eval-code combined)]
-        (if (not= :ok (:status eval-res))
-          {:status :error :output (str "Eval error: " (:error eval-res))}
-          (let [test-ns-name (:test-ns-name state)
-                test-ns      (when test-ns-name (find-ns (symbol test-ns-name)))
-                test-res     (if test-ns
-                               (ev/run-cell-tests test-code)
-                               {:status :error
-                                :output (str "Test namespace not found: " test-ns-name)})]
-            (if (not= :ok (:status test-res))
-              {:status :error :output (:output test-res)}
-              {:status   :ok
-               :passed?  (:passed? test-res)
-               :output   (str (:output eval-res) "\n" (:output test-res))
-               :summary  (:summary test-res)})))))))
+  (let [cell-id       (:cell-id state)
+        cell-ns       (:cell-ns state)
+        brief         (:brief state)
+        schema-parsed (:schema-parsed state)
+        files         (:files state)
+        handler-src   (get files "handler.clj")
+        helpers-src   (get files "helpers.clj")
+        test-code     (wrap-test-code (get files "test.clj") cell-ns cell-id)]
+    (cond
+      (str/blank? handler-src)
+      {:status :error :output "handler.clj is empty. Use write_file to create the handler."}
+
+      (str/blank? test-code)
+      {:status :error :output "test.clj is empty — no tests to run."}
+
+      :else
+      (let [handler (parse-handler-buffer handler-src)
+            helpers (parse-helpers-buffer helpers-src)]
+        (cond
+          (nil? handler)
+          {:status :error :output "Could not parse handler.clj — check for syntax errors."}
+
+          (nil? helpers)
+          {:status :error :output "Could not parse helpers.clj — check for syntax errors."}
+
+          (not (and (seq? handler) (= 'fn (first handler))))
+          {:status :error :output "handler.clj must contain a single (fn [resources data] ...) form."}
+
+          :else
+          (let [source (codegen/assemble-cell-source
+                         {:cell-ns        cell-ns
+                          :cell-id        cell-id
+                          :doc            (or (:doc brief) "")
+                          :schema         schema-parsed
+                          :requires       (mapv keyword (or (:requires brief) []))
+                          :extra-requires []
+                          :helpers        helpers
+                          :fn-body        handler})
+                test-src-fixed (if cell-ns
+                                 (str/replace test-code
+                                   (str "[" cell-ns "]")
+                                   (str "[" cell-ns " :as _cell-ns]"))
+                                 test-code)
+                combined (str source "\n\n" test-src-fixed)
+                eval-res (ev/eval-code combined)]
+            (if (not= :ok (:status eval-res))
+              {:status :error :output (str "Eval error: " (:error eval-res))}
+              (let [test-ns-name (second (re-find #"\(ns\s+(\S+)" test-code))
+                    test-ns      (when test-ns-name (find-ns (symbol test-ns-name)))
+                    test-res     (if test-ns
+                                   (ev/run-cell-tests test-code)
+                                   {:status :error
+                                    :output (str "Test namespace not found: " test-ns-name)})]
+                (if (not= :ok (:status test-res))
+                  {:status :error :output (:output test-res)}
+                  {:status   :ok
+                   :passed?  (:passed? test-res)
+                   :output   (str (:output eval-res) "\n" (:output test-res))
+                   :summary  (:summary test-res)})))))))))
+
+;; =============================================================
+;; Tool dispatch
+;; =============================================================
+
+(defn- ok  [state msg] {:state state :result (str "ok — " msg)})
+(defn- err [state msg] {:state state :result (str "ERROR — " msg)})
+
+(defn- handle-file-read
+  [state path]
+  (cond
+    (not path) (err state "Missing required arg: path")
+    (not (file-paths path))
+    (err state (str "Unknown file: '" path "'. Available: handler.clj, helpers.clj, test.clj"))
+    :else
+    (ok state (format-with-line-numbers (get-in state [:files path])))))
+
+(defn- handle-file-write
+  [state path content]
+  (cond
+    (not path)        (err state "Missing required arg: path")
+    (nil? content)    (err state "Missing required arg: content")
+    (not (file-paths path))
+    (err state (str "Unknown file: '" path "'."))
+    :else
+    (let [new-state (-> state
+                        (assoc-in [:files path] content)
+                        (after-source-write path))]
+      (ok new-state (str "wrote " path " (" (count content) " chars)")))))
+
+(defn- handle-file-edit
+  [state {:keys [path old_string new_string replace_all]}]
+  (cond
+    (not path)            (err state "Missing required arg: path")
+    (not old_string)      (err state "Missing required arg: old_string")
+    (nil? new_string)     (err state "Missing required arg: new_string")
+    (not (file-paths path))
+    (err state (str "Unknown file: '" path "'."))
+    :else
+    (let [content (get-in state [:files path])
+          n       (count-occurrences content old_string)]
+      (cond
+        (zero? n)
+        (err state (str "old_string not found in " path "."))
+
+        (and (not replace_all) (> n 1))
+        (err state (str "old_string matches " n " times in " path
+                        "; pass replace_all=true or include more context to make it unique."))
+
+        :else
+        (let [new-content (if replace_all
+                            (str/replace content old_string new_string)
+                            (str/replace-first content old_string new_string))
+              new-state   (-> state
+                              (assoc-in [:files path] new-content)
+                              (after-source-write path))]
+          (ok new-state (str "edited " path
+                             (when replace_all (str " (" n " replacements)")))))))))
+
+(defn- handle-file-list
+  [state]
+  (let [rows (for [path (sort (keys (:files state)))
+                   :let [content (get-in state [:files path])
+                         lines   (if (str/blank? content)
+                                   0
+                                   (inc (count (re-seq #"\n" content))))
+                         chars   (count content)]]
+               (format "  %-12s  %d lines  %d chars" path lines chars))]
+    (ok state (str "Files:\n" (str/join "\n" rows)))))
 
 (defn- handle-dispatch-tool
-  [state {:keys [name args] :as call}]
-  (let [g    (:graph state)
-        ctx   (mcp-ctx state)]
+  [state {:keys [name args]}]
+  (let [g   @(:cell-graph state)
+        ctx (mcp-ctx state)]
     (case name
-      :get_spec
-      (add-to-history state call (tool-result true (mcp/get-spec ctx)))
+      :get_spec        (ok state (mcp/get-spec ctx))
+      :get_task        (ok state (mcp/get-task ctx))
+      :list_functions  (ok state (mcp/list-functions ctx))
+      :list_ns         (ok state (mcp/list-loaded-ns ctx))
 
-      :get_task
-      (add-to-history state call (tool-result true (mcp/get-task ctx)))
-
-      :get_context
-      (add-to-history state call (tool-result true (mcp/get-context ctx)))
-
-      :list_siblings
-      (add-to-history state call (tool-result true (mcp/list-siblings ctx)))
-
-      :get_sibling
-      (let [sib-name (:name args)]
-        (if sib-name
-          (add-to-history state call (tool-result true (mcp/get-sibling ctx sib-name)))
-          (add-to-history state call (tool-result false "Missing required arg: name"))))
+      :inspect_ns
+      (if-let [ns-name (:ns args)]
+        (ok state (mcp/inspect-ns ctx ns-name))
+        (err state "Missing required arg: ns"))
 
       :get_callers
-      (let [target (if-let [n (:name args)]
-                     (->keyword n)
-                     (:cell-id state))]
-        (if g
-          (add-to-history state call
-            (tool-result true
-              (let [callers (cg/callers g target)]
-                (if (seq callers)
-                  (str "Callers of " target ": " (str/join ", " callers))
-                  (str "No callers of " target " found.")))))
-          (add-to-history state call (tool-result false "No code graph available."))))
+      (let [target  (if-let [n (:name args)] (->keyword n) :handler)
+            callers (cg/callers g target)]
+        (ok state (if (seq callers)
+                    (str "Callers of " target ": " (str/join ", " callers))
+                    (str "No callers of " target " found within this cell."))))
 
       :get_callees
-      (let [target (if-let [n (:name args)]
-                     (->keyword n)
-                     (:cell-id state))]
-        (if g
-          (add-to-history state call
-            (tool-result true
-              (let [callees (cg/callees g target)]
-                (if (seq callees)
-                  (str "Called by " target ": " (str/join ", " callees))
-                  (str "No callees from " target " found.")))))
-          (add-to-history state call (tool-result false "No code graph available."))))
+      (let [target  (if-let [n (:name args)] (->keyword n) :handler)
+            callees (cg/callees g target)]
+        (ok state (if (seq callees)
+                    (str "Called by " target ": " (str/join ", " callees))
+                    (str "No callees from " target " found within this cell."))))
 
       :graph_impact
-      (let [target (:target args)]
-        (if (and g (or target (:cell-id state)))
-          (let [t (or (some-> target ->keyword) (:cell-id state))
-                impacted (cg/impact g t)]
-            (add-to-history state call
-              (tool-result true
-                (if (seq impacted)
-                  (str "Impact of " t ": " (str/join ", " impacted))
-                  (str "No callers affected by " t ".")))))
-          (add-to-history state call (tool-result false "No code graph or target."))))
+      (if-let [target (some-> (:target args) ->keyword)]
+        (let [impacted (cg/impact g target)]
+          (ok state (if (seq impacted)
+                      (str "Impact of changing " target ": " (str/join ", " impacted))
+                      (str "No functions affected by " target " within this cell."))))
+        (err state "Missing required arg: target"))
 
       :graph_path
       (let [from (some-> (:from args) ->keyword)
             to   (some-> (:to args) ->keyword)]
-        (if (and g from to)
+        (cond
+          (or (nil? from) (nil? to))
+          (err state "Missing required args: from and to.")
+          :else
           (if-let [p (cg/path g from to)]
-            (add-to-history state call
-              (tool-result true (str "Path " from " -> " to ": " (str/join " -> " p))))
-            (add-to-history state call
-              (tool-result true (str "No path from " from " to " to "."))))
-          (add-to-history state call
-            (tool-result false "Missing required args: from and to, or no graph."))))
-
-      :list_ns
-      (add-to-history state call (tool-result true (mcp/list-loaded-ns ctx)))
-
-      :inspect_ns
-      (let [ns-name (:ns args)]
-        (if ns-name
-          (add-to-history state call (tool-result true (mcp/inspect-ns ctx ns-name)))
-          (add-to-history state call (tool-result false "Missing required arg: ns"))))
+            (ok state (str "Path " from " -> " to ": " (str/join " -> " p)))
+            (ok state (str "No call path from " from " to " to " within this cell.")))))
 
       :eval
-      (let [code (:code args)]
-        (if code
-          (let [res (ev/eval-code code)]
-            (if (= :ok (:status res))
-              (add-to-history state call
-                (tool-result true (str (pr-str (:result res))
-                                       (when (seq (:output res))
-                                         (str "\n" (:output res))))))
-              (add-to-history state call
-                (tool-result false (:error res)))))
-          (add-to-history state call (tool-result false "Missing required arg: code"))))
+      (if-let [code (:code args)]
+        (let [res (ev/eval-code code)]
+          (if (= :ok (:status res))
+            (ok state (str (pr-str (:result res))
+                           (when (seq (:output res)) (str "\n" (:output res)))))
+            (err state (:error res))))
+        (err state "Missing required arg: code"))
 
-      :define
-      (let [code (:code args)]
-        (if code
-          (let [res (ev/eval-code code)]
-            (if (= :ok (:status res))
-              (do (swap! (:helpers state) (fnil conj []) (read-string code))
-                  (add-to-history state call
-                    (tool-result true (str "Defined: " (pr-str (:result res))))))
-              (add-to-history state call
-                (tool-result false (:error res)))))
-          (add-to-history state call (tool-result false "Missing required arg: code"))))
-
-      :write_handler
-      (let [content (:content args)]
-        (if content
-          (let [;; Extract fn body from content — may be raw code or a wrapped fn
-                forms (try (binding [*read-eval* false]
-                             (read-string content))
-                           (catch Exception _ nil))
-                fn-body (if (and (seq? forms) (= 'fn (first forms)))
-                          forms
-                          (extract/extract-fn-body content))]
-            (if fn-body
-              (-> state
-                  (assoc :current-handler fn-body
-                         :last-tests-green? false)
-                  (add-to-history call (tool-result true "wrote handler")))
-              (add-to-history state call
-                (tool-result false "Could not extract (fn [resources data] ...) form from content."))))
-          (add-to-history state call (tool-result false "Missing required arg: content"))))
-
-      :write_test
-      (let [content (:content args)]
-        (if content
-          (let [body (or (extract/extract-first-code-block content) content)]
-            (-> state
-                (assoc :current-tests body
-                       :last-tests-green? false)
-                (add-to-history call (tool-result true (str "wrote test code (" (count body) " chars)")))))
-          (add-to-history state call (tool-result false "Missing required arg: content"))))
-
-      :patch_handler
-      (let [search  (:search args)
-            replace (:replace args)
-            handler (:current-handler state)]
-        (cond
-          (not search)
-          (add-to-history state call (tool-result false "Missing required arg: search"))
-          (nil? replace)
-          (add-to-history state call (tool-result false "Missing required arg: replace"))
-          (not handler)
-          (add-to-history state call (tool-result false "No handler to patch."))
-          :else
-          (let [handler-str (pr-str handler)
-                idx (str/index-of handler-str search)]
-            (if (nil? idx)
-              (add-to-history state call
-                (tool-result false (str "Search string not found in handler. Search must be unique and exact.")))
-              (let [new-str (str/replace-first handler-str search replace)
-                    new-handler (try (binding [*read-eval* false]
-                                       (read-string new-str))
-                                     (catch Exception _ nil))]
-                (if new-handler
-                  (-> state
-                      (assoc :current-handler new-handler
-                             :last-tests-green? false)
-                      (add-to-history call (tool-result true "patched handler")))
-                  (add-to-history state call
-                    (tool-result false "Patched handler is not a valid Clojure form."))))))))
-
-      :patch_test
-      (let [search  (:search args)
-            replace (:replace args)
-            tests   (:current-tests state)]
-        (cond
-          (not search)
-          (add-to-history state call (tool-result false "Missing required arg: search"))
-          (nil? replace)
-          (add-to-history state call (tool-result false "Missing required arg: replace"))
-          (not tests)
-          (add-to-history state call (tool-result false "No tests to patch."))
-          :else
-          (let [idx (str/index-of tests search)]
-            (if (nil? idx)
-              (add-to-history state call
-                (tool-result false (str "Search string not found in tests. Search must be unique and exact.")))
-              (let [new-tests (str/replace-first tests search replace)]
-                (-> state
-                    (assoc :current-tests new-tests
-                           :last-tests-green? false)
-                    (add-to-history call (tool-result true "patched tests"))))))))
+      :read_file   (handle-file-read  state (:path args))
+      :write_file  (handle-file-write state (:path args) (:content args))
+      :edit_file   (handle-file-edit  state args)
+      :list_files  (handle-file-list  state)
 
       :run_tests
-      (if-not (:current-handler state)
-        (add-to-history state call (tool-result false "No handler written. Use write_handler first."))
-        (let [result (assemble-and-eval state)]
-          (if (not= :ok (:status result))
-            (add-to-history state call (tool-result false (:output result)))
-            (if (:passed? result)
-              (-> state
-                  (assoc :green-handler (:current-handler state)
-                         :green-tests   (:current-tests state)
-                         :last-tests-green? true
-                         :phase :review)
-                  (add-to-history call
-                    (tool-result true (str "ALL TESTS PASSED\n"
-                                           (or (:output result) "")))))
-              (-> state
-                  (assoc :last-tests-green? false)
-                  (add-to-history call
-                    (tool-result false (or (:output result) "Tests failed."))))))))
+      (let [result (assemble-and-eval state)]
+        (cond
+          (not= :ok (:status result))
+          (err state (:output result))
+
+          (:passed? result)
+          (let [new-state (assoc state
+                            :green-files       (:files state)
+                            :last-tests-green? true)]
+            (ok new-state
+                (str "ALL TESTS PASSED.\n"
+                     (or (:output result) "")
+                     "\n\nWhen you're satisfied, call complete to finalize. "
+                     "You can also keep iterating — refactor, add tests, etc.")))
+
+          :else
+          (err (assoc state :last-tests-green? false)
+               (or (:output result) "Tests failed."))))
 
       :lint
-      (if-let [handler (:current-handler state)]
-        (let [;; Assemble for lint context
-              source-str (pr-str handler)
-              lint-res   (ev/lint-code source-str)]
-          (if (seq (:errors lint-res))
-            (add-to-history state call
-              (tool-result false
-                (str "Lint errors:\n" (str/join "\n"
-                                        (map #(str "- Line " (:line %) ": " (:message %))
-                                             (:errors lint-res))))))
-            (add-to-history state call (tool-result true "No lint errors."))))
-        (add-to-history state call (tool-result false "No handler to lint.")))
+      (let [handler-src (get-in state [:files "handler.clj"])]
+        (cond
+          (str/blank? handler-src)
+          (err state "handler.clj is empty.")
+          :else
+          (let [lint-res (ev/lint-code handler-src)]
+            (if (seq (:errors lint-res))
+              (err state (str "Lint errors:\n"
+                              (str/join "\n"
+                                (map #(str "- Line " (:line %) ": " (:message %))
+                                     (:errors lint-res)))))
+              (ok state "No lint errors.")))))
 
       :check_schema
-      (add-to-history state call
-        (tool-result true "Schema validation: no runtime schema checking configured."))
+      (ok state "Schema validation: no runtime schema checking configured.")
 
-      :done
-      (if (:last-tests-green? state)
-        (assoc state :phase :review)
-        (add-to-history state call
-          (tool-result false "Tests are not green yet. Run run_tests first.")))
+      :complete
+      (let [result (if (:last-tests-green? state)
+                     {:status :ok :passed? true :output "(using last green run)"}
+                     (assemble-and-eval state))]
+        (cond
+          (not= :ok (:status result))
+          (err state (str "complete blocked — " (:output result)
+                          "\nFix the failure and run_tests again, or give_up."))
+
+          (:passed? result)
+          (ok (assoc state
+                :green-files       (or (:green-files state) (:files state))
+                :last-tests-green? true
+                :phase             :done
+                :status            :ok)
+              "complete: tests green, finalizing.")
+
+          :else
+          (err (assoc state :last-tests-green? false)
+               (str "complete blocked — tests not green:\n"
+                    (or (:output result) "")
+                    "\nFix the failure and run_tests again, or give_up."))))
 
       :give_up
-      (assoc state
-             :phase :done
-             :status :gave_up
-             :give-up-reason (or (:reason args) "No reason given"))
+      (ok (assoc state
+            :phase :done
+            :status :gave_up
+            :give-up-reason (or (:reason args) "No reason given"))
+          (str "Gave up: " (or (:reason args) "no reason"))))))
 
-      ;; Unknown tool
-      (add-to-history state call
-        (tool-result false
-          (str "Unknown tool: " (name name)
-               ". Valid tools for dispatch: "
-               (str/join ", " (map name (keys tools/dispatch-phase-tools)))))))))
-
-(defn- handle-review-tool
-  [state {:keys [name args] :as call}]
-  (case name
-    :approve
-    (assoc state :phase :done :status :ok)
-
-    :revise
-    (let [reason (:reason args)]
-      (-> state
-          (assoc :phase :dispatch
-                 :last-tests-green? false)
-          (add-to-history call
-            (tool-result true
-              (str "Revising implementation. Reason: " (or reason "unspecified")
-                   ". Back to DISPATCH phase.")))))
-
-    :give_up
-    (assoc state :phase :done :status :gave_up
-           :give-up-reason (or (:reason args) "No reason given"))
-
-    ;; Unknown tool
-    (add-to-history state call
-      (tool-result false
-        (str "Unknown tool: " (name name)
-             ". Valid tools for review: approve, revise, give_up")))))
+(defn- dispatch-tool-call
+  "Runs one tool call against the agent state, appends the tool result to the
+   LLM session, and returns the new state."
+  [state {:keys [id name arguments]}]
+  (let [tool-name (tools/normalize-tool-name name)
+        session   (:session state)]
+    (if-not (tools/known-tool? tool-name)
+      (do (llm/session-append-tool-result! session id
+            (str "ERROR — unknown tool '" (clojure.core/name tool-name) "'."))
+          state)
+      (let [{:keys [state result]}
+            (handle-dispatch-tool state {:name tool-name :args arguments})]
+        (llm/session-append-tool-result! session id result)
+        state))))
 
 (defn- process-turn
-  "Processes one turn: render prompt → LLM → parse → execute → update state."
+  "One LLM round-trip:
+     :initial → send the initial user prompt
+     :tools   → continue (tool results were appended last turn)
+     :no-tool → nudge with a user message"
   [state]
-  (let [prompt   (if (= :review (:phase state))
-                   (render-review-prompt state)
-                   (render-dispatch-prompt state))
-        client   (:client state)
+  (let [client   (:client state)
         on-chunk (:on-chunk state)
-        response (llm/session-send-stream (:session state) client prompt on-chunk)
-        call     (tools/parse-tool-call response)]
-    (cond
-      (nil? call)
-      (-> state
-          (update :turn inc)
-          (add-to-history {:name "__no_call__" :args {}}
-            "No tool-call fence found. Emit exactly ONE fenced JSON block per turn:\n```tool-call\n{\"name\": \"<tool>\", \"args\": {...}}\n```"))
+        session  (:session state)
+        tools    (tools/working-tools)
+        shape    (:last-turn-shape state)
+        resp     (case shape
+                   :initial
+                   (llm/session-send-stream session client
+                     (render-initial-prompt state) on-chunk
+                     :tools tools :tool-choice "auto")
 
-      (:parse-error call)
-      (-> state
-          (update :turn inc)
-          (add-to-history call
-            (str "Parse error: " (:parse-error call))))
+                   :tools
+                   (llm/session-continue-stream session client on-chunk
+                     :tools tools :tool-choice "auto")
 
-      (not (tools/tool-allowed-in-phase? (:name call) (:phase state)))
-      (-> state
-          (update :turn inc)
-          (add-to-history call
-            (str "Tool '" (name (:name call)) "' not available in "
-                 (name (:phase state)) " phase.")))
-
-      (= :review (:phase state))
-      (-> (handle-review-tool state call)
+                   :no-tool
+                   (llm/session-send-stream session client
+                     "Please emit a tool call to make progress."
+                     on-chunk :tools tools :tool-choice "auto"))
+        tool-calls (:tool-calls resp)]
+    (if (seq tool-calls)
+      (-> (reduce dispatch-tool-call state tool-calls)
+          (assoc :last-turn-shape :tools)
           (update :turn inc))
-
-      :else
-      (-> (handle-dispatch-tool state call)
+      (-> state
+          (assoc :last-turn-shape :no-tool)
           (update :turn inc)))))
 
+;; =============================================================
+;; Finalize
+;; =============================================================
+
+(defn- assemble-final-source
+  "Builds the cell source string from green-files at finalize time."
+  [state]
+  (let [brief         (:brief state)
+        cell-ns       (:cell-ns state)
+        cell-id       (:cell-id state)
+        schema-parsed (:schema-parsed state)
+        green-files   (:green-files state)
+        handler       (parse-handler-buffer (get green-files "handler.clj"))
+        helpers       (or (parse-helpers-buffer (get green-files "helpers.clj")) [])]
+    (codegen/assemble-cell-source
+      {:cell-ns        cell-ns
+       :cell-id        cell-id
+       :doc            (or (:doc brief) "")
+       :schema         schema-parsed
+       :requires       (mapv keyword (or (:requires brief) []))
+       :extra-requires []
+       :helpers        helpers
+       :fn-body        handler})))
+
 (defn- finalize
-  "Assembles the final result map from the completed state."
   [state]
   (let [cell-id      (:cell-id state)
-        cell-ns      (:cell-ns state)
         brief        (:brief state)
-        handler      (:green-handler state)
-        schema-parsed (:schema-parsed state)
         store        (:store state)
-        run-id       (:run-id state)
         project-path (:project-path state)
-        base-ns      (:base-ns state)
-        on-event     (:on-event state)]
+        base-ns      (:base-ns state)]
     (case (:status state)
       :ok
-      (let [source (codegen/assemble-cell-source
-                     {:cell-ns        cell-ns
-                      :cell-id        cell-id
-                      :doc            (or (:doc brief) "")
-                      :schema         schema-parsed
-                      :requires       (mapv keyword (or (:requires brief) []))
-                      :extra-requires []
-                      :helpers        (or (:helpers state) [])
-                      :fn-body        handler})]
+      (let [source (assemble-final-source state)
+            handler-form (parse-handler-buffer
+                           (get-in state [:green-files "handler.clj"]))
+            ;; Strip the leading colon — the rest of the system stores IDs
+            ;; as bare strings (e.g. "guestbook/collect", not ":guestbook/collect").
+            store-id (let [s (str cell-id)]
+                       (cond-> s (str/starts-with? s ":") (subs 1)))]
         (when store
           (store/save-cell! store
-            {:id         cell-id
+            {:id         store-id
              :handler    source
              :schema     (or (:schema brief) "")
              :doc        (or (:doc brief) "")
@@ -559,36 +637,35 @@ On every turn, emit:
         {:status  :ok
          :cell-id cell-id
          :code    source
-         :raw     (pr-str handler)
+         :raw     (pr-str handler-form)
          :session (:session state)})
 
       :gave_up
-      (emit state "cell_implement" "gave_up" :cell-id cell-id
-            :reason (:give-up-reason state))
-      {:status       :error
-       :cell-id      cell-id
-       :error        (str "Agent gave up: " (:give-up-reason state))
-       :session      (:session state)}
+      (do (emit state "cell_implement" "gave_up" :cell-id cell-id
+                :reason (:give-up-reason state))
+          {:status  :error
+           :cell-id cell-id
+           :error   (str "Agent gave up: " (:give-up-reason state))
+           :session (:session state)})
 
       :stagnated
-      (emit state "cell_implement" "stagnated" :cell-id cell-id)
-      {:status       :error
-       :cell-id      cell-id
-       :error        (str "Turn budget exhausted in dispatch phase after "
-                          (:turn state) " turns")
-       :session      (:session state)}
+      (do (emit state "cell_implement" "stagnated" :cell-id cell-id)
+          {:status  :error
+           :cell-id cell-id
+           :error   (str "Turn budget exhausted after " (:turn state)
+                         " turns without complete or give_up.")
+           :session (:session state)})
 
-      ;; default: error
-      {:status       :error
-       :cell-id      cell-id
-       :error        (str "Agent ended with status: " (:status state) " after "
-                          (:turn state) " turns")
-       :session      (:session state)})))
+      {:status  :error
+       :cell-id cell-id
+       :error   (str "Agent ended with status: " (:status state) " after "
+                     (:turn state) " turns")
+       :session (:session state)})))
 
 (defn run!
-  "Main entry point: runs the dispatch loop for a cell.
+  "Main entry point: runs the agent loop for one cell.
    Returns {:status :ok :cell-id :code :session}
-        or {:status :error :cell-id :error :session}"
+        or {:status :error :cell-id :error :session}."
   [opts]
   (let [state (atom (init-session opts))]
     (emit @state "cell_implement" "started" :cell-id (:cell-id @state))
@@ -599,13 +676,8 @@ On every turn, emit:
           (finalize s)
 
           (>= (:turn s) (:turn-budget s))
-          (if (= :review (:phase s))
-            ;; Auto-approve on budget exhaustion in review
-            (do (swap! state assoc :phase :done :status :ok)
-                (finalize @state))
-            ;; Stagnated in dispatch
-            (do (swap! state assoc :phase :done :status :stagnated)
-                (finalize @state)))
+          (do (swap! state assoc :phase :done :status :stagnated)
+              (finalize @state))
 
           :else
           (do (swap! state process-turn)
@@ -613,19 +685,13 @@ On every turn, emit:
 
 (defn reflect-on-stagnation
   "Sends a single-turn diagnostic prompt when stagnated.
-   Returns a string with the LLM's analysis of why the cell wasn't implemented."
-  [client {:keys [cell-id brief test-code tool-history session]}]
-  (let [hist-lines (map-indexed
-                     (fn [i {:keys [call result]}]
-                       (str "Turn " (inc i) ": " (name (:name call)) " → " result))
-                     tool-history)
-        hist-str   (str/join "\n" hist-lines)
-        prompt     (str "You attempted to implement cell `" cell-id "` but "
-                        "exhausted the turn budget without getting tests to pass.\n\n"
-                        "Cell spec:\n" (:doc brief) "\n"
-                        "Schema: " (:schema brief) "\n\n"
-                        "Your tool call history:\n" hist-str "\n\n"
-                        "Diagnose why the cell wasn't implemented. Was it too complex? "
-                        "Was the test contract wrong? Was there a missing dependency? "
-                        "Be specific and actionable.")]
-    (llm/session-send-stream session client prompt (fn [_]))))
+   Returns the LLM's analysis of why the cell wasn't implemented."
+  [client {:keys [cell-id brief session]}]
+  (let [prompt (str "You attempted to implement cell `" cell-id "` but "
+                    "exhausted the turn budget without getting tests to pass.\n\n"
+                    "Cell spec:\n" (:doc brief) "\n"
+                    "Schema: " (:schema brief) "\n\n"
+                    "Diagnose why the cell wasn't implemented. Was it too "
+                    "complex? Was the test contract wrong? Was there a missing "
+                    "dependency? Be specific and actionable.")]
+    (:content (llm/session-send-stream session client prompt (fn [_])))))

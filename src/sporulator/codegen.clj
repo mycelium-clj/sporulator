@@ -62,6 +62,8 @@
        "  (:require [clojure.test :refer [deftest is testing]]\n"
        "            [mycelium.cell :as cell]\n"
        "            [malli.core :as m]\n"
+       "            [next.jdbc :as jdbc]\n"
+       "            [next.jdbc.sql :as jdbc-sql]\n"
        "            [" cell-ns "]))\n\n"
        "(def cell-spec (cell/get-cell! " (pr-str cell-id) "))\n"
        "(def handler (:handler cell-spec))\n"

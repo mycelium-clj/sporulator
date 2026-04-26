@@ -7,15 +7,14 @@
             [clojure.string :as str]
             [sporulator.agent-loop :as agent-loop]
             [sporulator.cell-agent :as cell-agent]
-            [sporulator.code-graph :as cg]
             [sporulator.codegen :as codegen]
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
             [sporulator.feedback :refer [feedback-loop]]
             [sporulator.llm :as llm]
             [sporulator.hashline :as hashline]
+            [sporulator.manifest-diff :as manifest-diff]
             [sporulator.manifest-validate :as mv]
-            [sporulator.mcp-bridge :as mcp]
             [sporulator.prompts :as prompts]
             [sporulator.source-gen :as source-gen]
             [sporulator.store :as store]))
@@ -132,30 +131,69 @@
 
 ;; ── Test contract generation ───────────────────────────────────
 
+(defn- format-resources-block
+  "Formats per-resource docstrings into a 'Resources' section.
+   `requires` is the vector of resource keywords; `resource-docs` is a map
+   from resource keyword to its docstring (extracted from system.edn)."
+  [requires resource-docs]
+  (when (seq requires)
+    (str "**Resources** (passed as the first arg of the handler):\n"
+         (str/join "\n"
+           (for [r requires
+                 :let [k    (keyword (name r))
+                       doc  (get resource-docs k
+                                  (get resource-docs r))]]
+             (if doc
+               (str "- `" r "` — " doc)
+               (str "- `" r "` (no docstring; treat as the real runtime resource)"))))
+         "\n")))
+
 (defn- build-test-prompt
   "Builds the prompt to ask the LLM to write tests for a cell."
-  [{:keys [id doc schema requires context]}]
+  [{:keys [id doc schema requires resource-docs context]}]
   (str "Write tests for the following Mycelium cell using clojure.test.\n\n"
        "**Cell ID:** `" id "`\n"
        "**Requirements:** " doc "\n"
        "**Schema:** `" schema "`\n"
-       (when (seq requires)
-         (str "**Resources:** " (str/join ", " requires) "\n"))
+       (format-resources-block requires resource-docs)
        (when context
          (str "\n" context "\n"))
        (when (prompts/needs-math-precision? schema)
          (str "\n" prompts/math-precision-rules "\n"))
-       "\nReturn ONLY the `deftest` forms. Do NOT include the `(ns ...)` declaration "
-       "or any requires — those are added automatically.\n"
-       "The handler is available as `handler` and resources as `{}`.\n"
-       "Use `(handler {} {:input-key value})` to call the cell.\n\n"
-       "Example test structure:\n"
+       "\n## Calling convention — read carefully\n"
+       "The handler signature is `(fn [resources data] ...)`.\n"
+       "- `resources` is a map. The keys are the cell's `:requires` keywords.\n"
+       "  Their values are the **real runtime objects** (a JDBC DataSource\n"
+       "  for `:db`, an HTTP client for `:http`, etc.) — NOT mock maps that\n"
+       "  pretend to expose framework functions as keyed entries. Do NOT\n"
+       "  fake them as `{:execute-one! (fn ...)}` or `{:get (fn ...)}`.\n"
+       "  If you need to test a `:db` interaction, use a real in-memory\n"
+       "  SQLite DataSource:\n"
+       "    `(next.jdbc/get-datasource {:dbtype \"sqlite\" :dbname (str \"/tmp/test-\" (System/nanoTime) \".sqlite\")})`,\n"
+       "  create the table the cell needs, exercise the handler against it.\n"
+       "- `data` is a flat Clojure map whose keys match the cell's `:input`\n"
+       "  schema *directly*. The schema `{:handle :string}` means the\n"
+       "  handler receives `{:handle \"alice\"}` — NOT `{:input {:handle \"alice\"}}`.\n"
+       "  Never wrap the data under an `:input` or `:output` key.\n\n"
+       "Return ONLY the `deftest` forms. Do NOT include `(ns ...)` or `:require` —\n"
+       "those are added automatically.\n\n"
+       "Example shape (no resources):\n"
        "```clojure\n"
        "(deftest test-basic-case\n"
        "  (let [result (handler {} {:key \"value\"})]\n"
-       "    (is (contains? result :expected-key))\n"
        "    (is (= expected-value (:expected-key result)))))\n"
-       "```\n"))
+       "```\n\n"
+       "Example shape (with `:db` resource):\n"
+       "```clojure\n"
+       "(deftest test-db-interaction\n"
+       "  (let [tmp (str \"/tmp/test-\" (System/nanoTime) \".sqlite\")\n"
+       "        ds  (next.jdbc/get-datasource {:dbtype \"sqlite\" :dbname tmp})]\n"
+       "    (next.jdbc/execute! ds [\"CREATE TABLE foo (id INTEGER PRIMARY KEY, x TEXT)\"])\n"
+       "    (let [result (handler {:db ds} {:x \"hi\"})]\n"
+       "      (is (int? (:id result))))))\n"
+       "```\n"
+       "If the test needs `next.jdbc`, just use it as `next.jdbc/...` —\n"
+       "the test namespace requires it for you.\n"))
 
 (defn- self-review-prompt
   "Builds the self-review prompt for generated tests."
@@ -192,14 +230,14 @@
 
     ;; Generate test body (strip code fences if present)
     (let [test-prompt (build-test-prompt brief)
-          raw-test    (llm/session-send-stream session client test-prompt on-chunk)
+          raw-test    (:content (llm/session-send-stream session client test-prompt on-chunk))
           test-body   (or (extract/extract-first-code-block raw-test) raw-test)]
 
       (emit on-event "cell_test" "written" :cell-id cell-id)
 
       ;; Self-review
       (let [review-prompt (self-review-prompt brief test-body)
-            review-resp   (llm/session-send-stream session client review-prompt on-chunk)
+            review-resp   (:content (llm/session-send-stream session client review-prompt on-chunk))
             ;; If corrections returned, use those instead
             final-body    (if (str/includes? review-resp "ALL TESTS VERIFIED")
                             test-body
@@ -407,6 +445,9 @@
    The agent loop uses tool-call dispatch (DISPATCH -> REVIEW phases) instead
    of the old monolithic eval-feedback retry loop.
 
+   Each cell is isolated — it gets its own call graph built dynamically
+   from code it writes.  It does NOT see other cells or the workflow graph.
+
    Options:
      :contract     — test contract map
      :store        — store instance
@@ -416,11 +457,10 @@
      :max-attempts — max fix attempts (default 3) — forwarded as turn-budget
      :project-path — project root directory for writing source files
      :base-ns      — base namespace for source files
-     :graph        — code graph facts set (from manifest)
-     :mcp-ctx      — mcp-bridge context map
      :task         — overall orchestration task description"
   [client {:keys [contract store run-id on-event on-chunk max-attempts
-                  project-path base-ns graph mcp-ctx task]
+                  project-path base-ns task
+                  prev-source change-summary]
            :or   {max-attempts 3}}]
   (let [{:keys [cell-id brief test-code cell-ns]} contract
         cell-id-kw (let [s (str cell-id)]
@@ -447,27 +487,73 @@
                           {:input  (fix-keys (:input raw))
                            :output (fix-keys (:output raw))})
                         (catch Exception _ {:input [:map] :output [:map]}))]
-    (agent-loop/run!
-      {:client        client
-       :cell-id       cell-id-kw
-       :cell-ns       cell-ns
-       :brief         brief
-       :test-code     test-code
-       :schema-parsed schema-parsed
-       :graph         graph
-       :mcp-ctx       mcp-ctx
-       :turn-budget   max-attempts
-       :on-event      on-event
-       :on-chunk      on-chunk
-       :store         store
-       :run-id        run-id
-       :project-path  project-path
-       :base-ns       base-ns
-       :task          task})))
+    (let [prev-parts (when prev-source (extract/extract-cell-source-parts prev-source))]
+      (agent-loop/run!
+        {:client          client
+         :cell-id         cell-id-kw
+         :cell-ns         cell-ns
+         :brief           brief
+         :test-code       test-code
+         :schema-parsed   schema-parsed
+         :turn-budget     max-attempts
+         :on-event        on-event
+         :on-chunk        on-chunk
+         :store           store
+         :run-id          run-id
+         :project-path    project-path
+         :base-ns         base-ns
+         :task            task
+         :initial-handler (:handler prev-parts)
+         :initial-helpers (:helpers prev-parts)
+         :change-summary  change-summary}))))
 ;; ── Main orchestration ─────────────────────────────────────────
 
+(defn- bare-cell-id
+  "Strips the leading colon from a cell-id string. ':guestbook/x' → 'guestbook/x'."
+  [cell-id]
+  (let [s (str cell-id)]
+    (cond-> s (str/starts-with? s ":") (subs 1))))
+
+(defn- cell-id-keyword
+  "Normalises a cell-id (string or keyword) to a keyword for diff comparisons."
+  [cell-id]
+  (if (keyword? cell-id) cell-id (keyword (bare-cell-id cell-id))))
+
+(defn- build-cell-class-index
+  "Given a manifest-diff result, returns {cell-id-keyword → :added/:removed/...}."
+  [diff-result]
+  (reduce (fn [m k]
+            (reduce #(assoc %1 %2 k) m (get diff-result k)))
+          {}
+          [:added :removed :schema-changed :doc-changed :unchanged]))
+
+(defn- prior-cell-source
+  "Returns the latest non-deprecated assembled source for a cell-id, or nil."
+  [store cell-id]
+  (when store
+    (when-let [c (store/get-latest-cell store (bare-cell-id cell-id))]
+      (:handler c))))
+
+(defn- prior-test-code
+  "Returns the test_code from the prior run for a cell-id, or nil."
+  [store run-id cell-id]
+  (when (and store run-id)
+    (let [bare (bare-cell-id cell-id)
+          ;; Test contracts are stored with the leading-colon form.
+          contract (or (store/get-test-contract store run-id (str ":" bare))
+                       (store/get-test-contract store run-id bare))]
+      (:test-code contract))))
+
+(defn- carry-over-result
+  "Builds a synthetic :ok result for a carried-over cell so downstream
+   reporting treats it identically to a freshly-implemented cell."
+  [cell-id]
+  {:status :ok :cell-id (cell-id-keyword cell-id) :carried-over? true})
+
 (defn orchestrate!
-  "Runs the full TDD orchestration for a set of leaf cells.
+  "Runs the full TDD orchestration for a set of leaf cells, diff-aware:
+   compares the supplied manifest against the latest green snapshot for
+   `manifest-id` and only regenerates cells whose contract changed.
 
    Options:
      :leaves        — vector of leaf cell maps (cell-id, doc, schemas, etc.)
@@ -485,7 +571,7 @@
                   spec-hash project-path]
            :or   {auto-approve? false max-attempts 3
                   manifest-id "" spec-hash ""}
-           :as   opts}]
+           :as   _opts}]
   (let [run-id  (str "run-" (System/nanoTime))
         on-event (or on-event (fn [_]))
         on-chunk (or on-chunk (fn [_]))]
@@ -500,58 +586,127 @@
 
     (emit on-event "manifest" "started" :run-id run-id)
 
-    ;; Build reverse mapping: cell-id → cell-name (for graph context lookup)
-    (let [id->cell-name (when manifest
-                          (into {} (map (fn [[cell-name cell-def]]
-                                         [(:id cell-def) cell-name]))
-                                (:cells manifest)))
+    ;; ── Diff against the previous green snapshot ──────────────────
+    (let [prev-snapshot   (when (and store (seq manifest-id))
+                            (store/get-latest-green-snapshot store manifest-id))
+          prev-manifest   (when prev-snapshot
+                            (let [parsed (mv/parse-manifest (:body prev-snapshot))]
+                              (when-not (:error parsed) parsed)))
+          diff-result     (manifest-diff/diff prev-manifest manifest)
+          cell-class      (build-cell-class-index diff-result)
+          prev-cells-by-id (manifest-diff/cells-by-id prev-manifest)
+          new-cells-by-id  (manifest-diff/cells-by-id manifest)
+          actionable?      (fn [cell-id]
+                             (let [k (cell-id-keyword cell-id)]
+                               (#{:added :schema-changed :doc-changed} (get cell-class k))))]
 
-          ;; Build code graph from manifest for agent-loop context tools
-          graph (when manifest (cg/build-cell-graph manifest))
+      ;; Emit carry-over events for unchanged cells
+      (doseq [cid (:unchanged diff-result)]
+        (emit on-event "cell_carry_over" "skipped" :cell-id cid))
 
-          ;; Load resource docs from system.edn
-          resource-docs (when project-path
-                          (extract-resource-docs
-                            (read-system-edn (str project-path "/resources/system.edn"))))
+      ;; Handle removed cells: deprecate in store + delete file
+      (doseq [cid (:removed diff-result)]
+        (when store (store/deprecate-cell! store (bare-cell-id cid)))
+        (when (and project-path base-ns)
+          (try
+            (source-gen/delete-cell! project-path base-ns (bare-cell-id cid))
+            (catch Exception _ nil)))
+        (emit on-event "cell_remove" "done" :cell-id cid))
 
-          ;; Build briefs from leaves (accept both kebab and underscore keys from JSON)
-          briefs (mapv (fn [leaf]
-                         (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
-                               doc (or (:doc leaf) "")
-                               input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
-                               output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
-                               requires (or (:requires leaf) [])
-                               ;; Build graph context from manifest
-                               cell-name (when id->cell-name
-                                           (get id->cell-name (keyword cell-id)
-                                                (get id->cell-name cell-id)))
-                               context (when (and manifest cell-name)
-                                         (let [ctx (mv/build-graph-context manifest cell-name)]
-                                           (mv/format-graph-context ctx)))]
-                           {:id            cell-id
-                            :doc           doc
-                            :schema        (str "{:input " input-schema " :output " output-schema "}")
-                            :requires      requires
-                            :resource-docs resource-docs
-                            :context       context}))
-                       leaves)]
+      ;; Build reverse mapping: cell-id → cell-name (for graph context lookup)
+      (let [id->cell-name (when manifest
+                            (into {} (map (fn [[cell-name cell-def]]
+                                            [(:id cell-def) cell-name]))
+                                  (:cells manifest)))
 
-      ;; Phase 1: Generate test contracts
+            ;; Load resource docs from system.edn
+            resource-docs (when project-path
+                            (extract-resource-docs
+                              (read-system-edn (str project-path "/resources/system.edn"))))
+
+            ;; Filter leaves to only those that need regeneration. Carry-over
+            ;; and removed cells are handled above; we don't waste LLM calls
+            ;; on them.
+            actionable-leaves (filterv (fn [leaf]
+                                         (actionable? (or (:cell-id leaf)
+                                                          (:cell_id leaf))))
+                                       leaves)
+
+            ;; Build briefs from actionable leaves
+            briefs (mapv (fn [leaf]
+                           (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
+                                 doc (or (:doc leaf) "")
+                                 input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
+                                 output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
+                                 requires (or (:requires leaf) [])
+                                 cell-name (when id->cell-name
+                                             (get id->cell-name (keyword cell-id)
+                                                  (get id->cell-name cell-id)))
+                                 context (when (and manifest cell-name)
+                                           (let [ctx (mv/build-graph-context manifest cell-name)]
+                                             (mv/format-graph-context ctx)))]
+                             {:id            cell-id
+                              :doc           doc
+                              :schema        (str "{:input " input-schema " :output " output-schema "}")
+                              :requires      requires
+                              :resource-docs resource-docs
+                              :context       context}))
+                         actionable-leaves)]
+
+      ;; Phase 1: Generate test contracts.
+      ;; For :doc-changed cells we reuse the prior run's test contract since
+      ;; the schema and resources haven't moved — only the doc.
       (emit on-event "cell_test" "started" :message "Generating test contracts")
-      (let [contracts (mapv (fn [brief]
-                              (try
-                                (generate-test-contract client
-                                  {:brief    brief
-                                   :base-ns  base-ns
-                                   :store    store
-                                   :run-id   run-id
-                                   :on-event on-event
-                                   :on-chunk on-chunk})
-                                (catch Exception e
-                                  {:cell-id (:id brief)
-                                   :error   (.getMessage e)})))
-                            briefs)
-            ;; Split into good and failed
+      (let [prev-run-id (:run-id prev-snapshot)
+            contracts
+            (mapv (fn [brief]
+                    (let [class (get cell-class (cell-id-keyword (:id brief)))]
+                      (try
+                        (if (and (= class :doc-changed) prev-run-id)
+                          (let [test-code (prior-test-code store prev-run-id (:id brief))]
+                            (if (seq test-code)
+                              (let [stored-cell-id (str (cell-id-keyword (:id brief)))
+                                    contract {:cell-id   stored-cell-id
+                                              :test-code test-code
+                                              :test-body test-code
+                                              :run-id    run-id
+                                              :brief     brief
+                                              :cell-ns   (cell-ns-name base-ns (:id brief))
+                                              :reused?   true}]
+                                ;; Persist a row for this run-id so future
+                                ;; green snapshots can locate the contract
+                                ;; via this run-id without falling back to
+                                ;; fresh generation.
+                                (when store
+                                  (store/save-test-contract! store
+                                    {:run-id    run-id
+                                     :cell-id   stored-cell-id
+                                     :test-code test-code
+                                     :test-body test-code
+                                     :status    "approved"})
+                                  (emit on-event "test_review" "reused"
+                                        :cell-id stored-cell-id
+                                        :message "doc-only change; reused prior test contract"))
+                                contract)
+                              ;; No prior contract found; fall back to fresh.
+                              (generate-test-contract client
+                                {:brief    brief
+                                 :base-ns  base-ns
+                                 :store    store
+                                 :run-id   run-id
+                                 :on-event on-event
+                                 :on-chunk on-chunk})))
+                          (generate-test-contract client
+                            {:brief    brief
+                             :base-ns  base-ns
+                             :store    store
+                             :run-id   run-id
+                             :on-event on-event
+                             :on-chunk on-chunk}))
+                        (catch Exception e
+                          {:cell-id (:id brief)
+                           :error   (.getMessage e)}))))
+                  briefs)
             good-contracts (filterv :test-code contracts)
             failed         (filterv :error contracts)]
 
@@ -602,50 +757,46 @@
                            ;; No review callback — auto-approve
                            good-contracts))]
 
-          ;; Phase 3: Implement approved contracts in parallel
+          ;; Phase 3: Implement approved contracts in parallel.
+          ;; Edit-mode opts (prev-source + change-summary) are computed
+          ;; per-cell from the diff classification.
           (emit on-event "cell_implement" "started"
                 :message (str "Implementing " (count approved) " cells"))
-          (let [;; Build sibling context for each cell
-                sibling-infos (into {}
-                                (map (fn [c]
-                                       (let [b (first (filter #(= (:id %) (:cell-id c)) briefs))]
-                                         [(:cell-id c)
-                                          {:spec    b
-                                           :handler nil
-                                           :tests   (:test-code c)}]))
-                                     approved))
-                impl-futures
+          (let [impl-futures
                 (mapv (fn [contract]
                         (future
                           (try
-                            (let [cell-kw (let [s (str (:cell-id contract))]
-                                            (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
-                                  mcp-ctx (mcp/build-context
-                                            {:cell-id      cell-kw
-                                             :cell-ns      (:cell-ns contract)
-                                             :brief        (first (filter #(= (:id %) (:cell-id contract)) briefs))
-                                             :test-code    (:test-code contract)
-                                             :graph        graph
-                                             :siblings     (remove #(= (:id %) cell-kw) briefs)
-                                             :sibling-data sibling-infos})]
+                            (let [cid-kw   (cell-id-keyword (:cell-id contract))
+                                  class    (get cell-class cid-kw)
+                                  edit?    (#{:doc-changed :schema-changed} class)
+                                  prev-src (when edit? (prior-cell-source store cid-kw))
+                                  summary  (when edit?
+                                             (manifest-diff/change-summary
+                                               (get prev-cells-by-id cid-kw)
+                                               (get new-cells-by-id cid-kw)))]
                               (implement-from-contract client
-                                {:contract     contract
-                                 :store        store
-                                 :run-id       run-id
-                                 :on-event     on-event
-                                 :on-chunk     on-chunk
-                                 :max-attempts max-attempts
-                                 :project-path project-path
-                                 :base-ns      base-ns
-                                 :graph        graph
-                                 :mcp-ctx      mcp-ctx}))
+                                {:contract        contract
+                                 :store           store
+                                 :run-id          run-id
+                                 :on-event        on-event
+                                 :on-chunk        on-chunk
+                                 :max-attempts    max-attempts
+                                 :project-path    project-path
+                                 :base-ns         base-ns
+                                 :prev-source     prev-src
+                                 :change-summary  summary}))
                             (catch Exception e
                               {:status  :error
                                :cell-id (:cell-id contract)
                                :error   (.getMessage e)}))))
                       approved)
                 impl-results (mapv deref impl-futures)
-                passed  (filterv #(= :ok (:status %)) impl-results)
+                ;; Synthesize :ok results for cells that were carried over
+                ;; — they didn't run through the implementor but downstream
+                ;; reporting and the green snapshot still need to count them.
+                carry-over-results (mapv carry-over-result (:unchanged diff-result))
+                all-results (into impl-results carry-over-results)
+                passed  (filterv #(= :ok (:status %)) all-results)
                 failed-impl (filterv #(not= :ok (:status %)) impl-results)]
 
             ;; Phase 4: Post-implementation workflow compilation check
@@ -660,6 +811,17 @@
                 (catch Exception e
                   (emit on-event "compile" "failed"
                         :error (.getMessage e)))))
+
+            ;; On full success, record a new green snapshot so subsequent
+            ;; runs can diff against this manifest version.
+            (when (and store (seq manifest-id) manifest
+                       (empty? failed) (empty? failed-impl))
+              (let [m-row (store/get-latest-manifest store manifest-id)]
+                (store/save-green-snapshot! store
+                  {:manifest-id      manifest-id
+                   :manifest-version (or (:version m-row) 1)
+                   :body             (or (:body m-row) (pr-str manifest))
+                   :run-id           run-id})))
 
             ;; Update run status and tree
             (let [final-status (if (and (empty? failed) (empty? failed-impl))
@@ -679,7 +841,8 @@
                "passed"      (mapv :cell-id passed)
                "failed"      (into (mapv :cell-id failed)
                                    (mapv :cell-id failed-impl))
-               :results      impl-results})))))))
+               :results      all-results
+               :diff         diff-result}))))))))
 
 ;; ── Resume ─────────────────────────────────────────────────────
 
@@ -849,12 +1012,11 @@
         (or manifest-id (str (:id manifest)))
         (pr-str manifest)))
 
-    ;; Store run state with graph
+    ;; Store run state
     (swap! runs assoc run-id
       {:cells        cells-init
        :base-ns      base-ns
        :manifest     manifest
-       :graph        (when manifest (cg/build-cell-graph manifest))
        :client       client
        :store        store
        :project-path project-path
@@ -901,7 +1063,6 @@
         store    (:store run)
         client   (:client run)
         base-ns  (:base-ns run)
-        graph    (:graph run)
         on-event (get-in run [:callbacks :on-event])
         on-chunk (get-in run [:callbacks :on-chunk])]
     (when contract
@@ -920,32 +1081,7 @@
             :cell_id cell-id :run_id run-id)
       (future
         (try
-          (let [;; Build sibling data from all cells in the run
-                all-cells    (get-in @runs [run-id :cells])
-                sibling-infos (into {}
-                                (keep (fn [[cid cdata]]
-                                        (when (not= cid cell-id)
-                                          (let [cc (:contract cdata)
-                                                brief (:brief cdata)]
-                                            [cid {:spec    brief
-                                                  :handler (when cc (:handler cc))
-                                                  :tests   (when cc (:test-code cc))}]))))
-                                    all-cells)
-                ;; Build mcp context
-                cell-kw (let [s (str cell-id)]
-                          (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
-                mcp-ctx (mcp/build-context
-                          {:cell-id      cell-kw
-                           :cell-ns      (:cell-ns contract)
-                           :brief        (or (:brief cell) {})
-                           :test-code    (:test-code contract)
-                           :graph        graph
-                           :siblings     (keep (fn [[cid cdata]]
-                                                (when (not= cid cell-id)
-                                                  (:brief cdata)))
-                                              all-cells)
-                           :sibling-data sibling-infos})
-                result (implement-from-contract client
+          (let [result (implement-from-contract client
                          {:contract     contract
                           :store        store
                           :run-id       run-id
@@ -953,9 +1089,7 @@
                           :on-chunk     on-chunk
                           :max-attempts 15
                           :project-path nil ;; don't write to disk yet
-                          :base-ns      base-ns
-                          :graph        graph
-                          :mcp-ctx      mcp-ctx})]
+                          :base-ns      base-ns})]
             (if (= :ok (:status result))
               ;; Implementation succeeded — get source from store (where implement-from-contract saved it)
               (let [latest-cell (when store (store/get-latest-cell store cell-id))
@@ -1009,7 +1143,7 @@
                              "\n\n**Current test code:**\n```\n"
                              annotated
                              "\n```\n\nReturn ONLY the corrected `deftest` forms.")
-                content (llm/session-send-stream session client msg on-chunk)
+                content (:content (llm/session-send-stream session client msg on-chunk))
                 body    (or (extract/extract-first-code-block content) content)
                 cell-ns  (cell-ns-name base-ns cell-id)
                 test-ns  (test-ns-name base-ns cell-id)
@@ -1124,7 +1258,7 @@
                                     annotated "\n```"))
                              "\n\nPlease fix and return the corrected source "
                              "including `(ns ...)` and `(cell/defcell ...)`.")
-                content (llm/session-send-stream session client msg on-chunk)
+                content (:content (llm/session-send-stream session client msg on-chunk))
                 source  (format-source
                           (or (extract/extract-first-code-block content) content))]
             ;; Eval + run tests

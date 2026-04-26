@@ -4,7 +4,6 @@
             [sporulator.agent-loop :as agent-loop]
             [sporulator.extract :as extract]
             [sporulator.llm :as llm]
-            [sporulator.mcp-bridge :as mcp]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
 
@@ -93,44 +92,51 @@
   [client brief on-chunk]
   (let [session (create-cell-session (:id brief))
         prompt  (build-cell-prompt brief)
-        content (llm/session-send-stream session client prompt on-chunk)]
-    (assoc (build-result (:id brief) content)
+        resp    (llm/session-send-stream session client prompt on-chunk)]
+    (assoc (build-result (:id brief) (:content resp))
            :session session)))
 
 (defn implement-with-feedback
   "Generates a cell using the interactive agent loop.
-   The agent loop uses tool-call dispatch (DISPATCH -> REVIEW phases)
-   for exploration and incremental implementation.
 
    on-chunk    — called with each token fragment
    on-feedback — called with {:event-type :attempt :code :output :message}
-   code-graph  — code graph facts set (from build-cell-graph)
-   mcp-ctx     — mcp-bridge context map
+
+   Optional kwargs that flow through to agent-loop/run!:
+     :test-code     — locked test contract source for this cell
+     :cell-ns       — namespace name for the assembled cell source
+     :schema-parsed — parsed Malli {:input ... :output ...}
+     :base-ns       — base namespace prefix (for source-gen on disk)
+     :project-path  — project root for source-gen
+     :store         — sporulator store
+     :run-id        — orchestration run id
 
    Returns {:status :ok :cell-id :code :raw :session}
-        or {:status :error :error msg}"
+         or {:status :error :error msg}"
   [client brief on-chunk
-   & {:keys [on-feedback max-attempts code-graph mcp-ctx]
-      :or   {max-attempts 3}}]
+   & {:keys [on-feedback max-attempts test-code cell-ns schema-parsed
+             base-ns project-path store run-id]
+      :or   {max-attempts 25}}]
   (let [cell-kw  (->keyword (:id brief))
         feedback (or on-feedback (fn [_]))
         result   (agent-loop/run!
-                   {:client      client
-                    :cell-id     cell-kw
-                    :brief       brief
-                    :graph       code-graph
-                    :mcp-ctx     (or mcp-ctx
-                                   (mcp/build-context
-                                     {:cell-id   cell-kw
-                                      :brief     brief
-                                      :graph     code-graph}))
-                    :turn-budget max-attempts
-                    :on-chunk    on-chunk
-                    :on-event    (fn [event]
-                                  (feedback {:event-type (get event "status" "event")
-                                             :message    (get event "message" "")
-                                             :code       (get event "code" "")
-                                             :output     (get event "output" "")}))})]
+                   {:client        client
+                    :cell-id       cell-kw
+                    :cell-ns       cell-ns
+                    :brief         brief
+                    :test-code     test-code
+                    :schema-parsed schema-parsed
+                    :base-ns       base-ns
+                    :project-path  project-path
+                    :store         store
+                    :run-id        run-id
+                    :turn-budget   max-attempts
+                    :on-chunk      on-chunk
+                    :on-event      (fn [event]
+                                    (feedback {:event-type (get event "status" "event")
+                                               :message    (get event "message" "")
+                                               :code       (get event "code" "")
+                                               :output     (get event "output" "")}))})]
     (if (= :ok (:status result))
       {:status  :ok
        :cell-id (:id brief)

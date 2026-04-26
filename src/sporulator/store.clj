@@ -83,8 +83,23 @@
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE)"
                  "CREATE INDEX IF NOT EXISTS idx_chat_messages_session
-                    ON chat_messages(session_id)"]]
+                    ON chat_messages(session_id)"
+                 "CREATE TABLE IF NOT EXISTS green_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manifest_id TEXT NOT NULL,
+                    manifest_version INTEGER NOT NULL,
+                    body TEXT NOT NULL,
+                    run_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+                 "CREATE INDEX IF NOT EXISTS idx_green_snapshots_manifest
+                    ON green_snapshots(manifest_id, id DESC)"]]
       (jdbc/execute! ds [ddl]))
+    ;; Schema migrations for tables that already exist from older versions.
+    ;; ALTER TABLE on a column that already exists raises; swallow that case
+    ;; so re-opening an existing database is a no-op.
+    (try
+      (jdbc/execute! ds ["ALTER TABLE cells ADD COLUMN deprecated_at TEXT"])
+      (catch Exception _ nil))
     {:datasource ds}))
 
 (defn close
@@ -469,3 +484,55 @@
   (jdbc/execute! (ds store)
     ["DELETE FROM chat_messages WHERE session_id = ?" session-id])
   nil)
+
+;; =============================================================
+;; Green snapshots — last successful manifest implementation
+;; =============================================================
+
+(defn save-green-snapshot!
+  "Records that this manifest version was successfully implemented end-to-end.
+   The body is the canonical EDN string. Future diffs compare the current
+   manifest against the latest green snapshot to compute what to regenerate."
+  [store {:keys [manifest-id manifest-version body run-id]
+          :or   {run-id ""}}]
+  (jdbc/execute! (ds store)
+    ["INSERT INTO green_snapshots (manifest_id, manifest_version, body, run_id)
+      VALUES (?, ?, ?, ?)"
+     manifest-id manifest-version body run-id])
+  nil)
+
+(defn get-latest-green-snapshot
+  "Returns the most recent green snapshot for a manifest, or nil if none exists."
+  [store manifest-id]
+  (jdbc/execute-one! (ds store)
+    ["SELECT id, manifest_id, manifest_version, body, run_id, created_at
+      FROM green_snapshots
+      WHERE manifest_id = ?
+      ORDER BY id DESC
+      LIMIT 1"
+     manifest-id]
+    {:builder-fn rs/as-unqualified-kebab-maps}))
+
+;; =============================================================
+;; Cell deprecation
+;; =============================================================
+
+(defn deprecate-cell!
+  "Marks a cell id as deprecated by stamping deprecated_at on every existing
+   version. The rows stay queryable; new orchestration runs treat the id as
+   removed when computing diffs."
+  [store cell-id]
+  (jdbc/execute! (ds store)
+    ["UPDATE cells SET deprecated_at = datetime('now') WHERE id = ?" cell-id])
+  nil)
+
+(defn cell-deprecated?
+  "True if the cell's latest version is marked deprecated."
+  [store cell-id]
+  (let [row (jdbc/execute-one! (ds store)
+              ["SELECT deprecated_at FROM cells
+                WHERE id = ?
+                ORDER BY version DESC
+                LIMIT 1" cell-id]
+              {:builder-fn rs/as-unqualified-kebab-maps})]
+    (some? (:deprecated-at row))))

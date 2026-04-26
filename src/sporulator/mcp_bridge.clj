@@ -1,27 +1,22 @@
 (ns sporulator.mcp-bridge
   "Context-exploration tools for the model.
-   Pure data accessors that bridge between the REPL state and the tool
-   catalog without exposing raw filesystem operations.
-   All functions take a context map and return formatted strings."
+   Pure data accessors that bridge local cell state to the tool
+   catalog.  Each cell is isolated — it only sees its own spec,
+   handlers, helpers, and call graph."
   (:require [clojure.string :as str]
             [sporulator.code-graph :as cg]))
 
 (defn build-context
-  "Builds the MCP context map from orchestration data."
-  [{:keys [cell-id cell-ns brief test-code schema-parsed
-           graph task siblings sibling-data]
-    :or   {siblings     []
-           sibling-data {}}}]
+  "Builds the MCP context map from local cell data.
+   No graph, siblings, or sibling-data — cells are isolated."
+  [{:keys [cell-id cell-ns brief test-code schema-parsed task]}]
   {:cell-id       cell-id
    :cell-ns       cell-ns
    :brief         brief
    :test-code     test-code
    :test-ns-name  (when test-code (second (re-find #"\(ns\s+(\S+)" test-code)))
    :schema-parsed schema-parsed
-   :graph         graph
-   :task          task
-   :siblings      siblings
-   :sibling-data  sibling-data})
+   :task          task})
 
 (defn- format-spec [brief]
   (str "Cell ID: " (:id brief) "\n"
@@ -50,55 +45,22 @@
   [ctx]
   (or (:task ctx) "No task description available."))
 
-(defn get-context
-  "Returns workflow position context: predecessors, successors, graph context."
+(defn list-functions
+  "Lists all helper functions defined in this cell so far.
+   Returns the handler name plus each defined helper with its arity."
   [ctx]
-  (let [brief    (:brief ctx)
-        graph    (:graph ctx)
-        cell-id  (:cell-id ctx)
-        context  (:context brief)]
-    (str (when context
-           (str "Workflow context:\n" context "\n\n"))
-         (when graph
-           (let [callers (cg/callers graph cell-id)
-                 callees (cg/callees graph cell-id)
-                 prod-keys (cg/produces-keys graph cell-id)
-                 cons-keys (cg/consumes-keys graph cell-id)
-                 resources (cg/resource-requires graph cell-id)]
-             (str "Graph context:\n"
-                  "  Called by: " (if (seq callers) (str/join ", " callers) "none (entry point)") "\n"
-                  "  Calls: " (if (seq callees) (str/join ", " callees) "none (leaf node)") "\n"
-                  "  Consumes keys: " (if (seq cons-keys) (str/join ", " cons-keys) "none") "\n"
-                  "  Produces keys: " (if (seq prod-keys) (str/join ", " prod-keys) "none") "\n"
-                  "  Resources: " (if (seq resources) (str/join ", " resources) "none")))))))
-
-(defn list-siblings
-  "Lists other cells being implemented in this run."
-  [ctx]
-  (let [siblings (:siblings ctx)]
-    (if (seq siblings)
-      (str/join "\n"
-        (map (fn [s]
-               (str "- " (:cell-id s) ": " (or (:doc s) "(no doc)")))
-             siblings))
-      "No sibling cells in this run.")))
-
-(defn get-sibling
-  "Returns spec + handler + tests for a sibling cell by name.
-   name can be a keyword, string, or symbol."
-  [ctx name]
-  (let [sibling-data (:sibling-data ctx)
-        cell-id      (if (keyword? name)
-                       name
-                       (keyword (str name)))
-        data         (get sibling-data cell-id)]
-    (if-not data
-      (str "No sibling found for: " cell-id
-           ". Available: " (str/join ", " (keys sibling-data)))
-      (str "Sibling: " cell-id "\n"
-           "Spec:\n" (format-spec (:spec data)) "\n\n"
-           "Handler:\n" (or (:handler data) "(not yet implemented)") "\n\n"
-           "Tests:\n" (or (:tests data) "(not yet generated)")))))
+  (let [helpers (get ctx :helpers [])
+        handler-name "<handler>"]
+    (if (seq helpers)
+      (str "Defined in this cell:\n"
+           "  " handler-name " (handler)\n"
+           (str/join "\n"
+             (map (fn [h]
+                    (when (and (seq? h) (= 'defn (first h)))
+                      (str "  " (second h) " " (pr-str (nth h 2 "args")))))
+                  helpers)))
+      (str "No helper functions defined yet. The handler (" handler-name ") "
+           "is always present once write_handler is called."))))
 
 (defn list-loaded-ns
   "Lists namespace names loaded in the REPL.

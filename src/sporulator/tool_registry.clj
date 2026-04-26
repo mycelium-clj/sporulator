@@ -1,202 +1,174 @@
 (ns sporulator.tool-registry
-  "Tool catalog, parsing, and dispatch for the agent loop.
-   Defines the tool-to-LLM interface: catalog metadata, rendering for
-   prompts, parsing tool-call fences from LLM responses, and routing
-   execution to handler functions."
-  (:require [clojure.data.json :as json]
-            [clojure.string :as str]))
+  "Tool catalog for the agent loop. Tools are declared as OpenAI tool_use
+   JSONSchema function definitions so the model can call them via the
+   native tool-use protocol."
+  (:require [clojure.string :as str]))
 
-(def ^:private tool-call-fence-re
-  #"(?i)```tool-call\n(.*?)\n```")
+(defn- tool-fn
+  [name description properties required]
+  {:type "function"
+   :function {:name        (clojure.core/name name)
+              :description description
+              :parameters  {:type       "object"
+                            :properties (or properties {})
+                            :required   (mapv clojure.core/name (or required []))}}})
 
-(def dispatch-phase-tools
-  "Tools available during the DISPATCH phase."
-  #{:get_spec :get_task :get_context :list_siblings :get_sibling
-    :get_callers :get_callees :graph_impact :graph_path
-    :list_ns :inspect_ns
-    :eval :define :write_handler :write_test
-    :patch_handler :patch_test
-    :run_tests :lint :check_schema
-    :give_up :done})
+(def tool-schemas
+  "Maps tool keyword to its OpenAI tool_use function definition."
+  {:get_spec
+   (tool-fn :get_spec
+     "Get the current cell's specification: doc, schema, required resources.
+      The spec is the immutable contract this cell must satisfy."
+     {} [])
 
-(def review-phase-tools
-  "Tools available during the REVIEW phase."
-  #{:approve :revise :give_up})
+   :get_task
+   (tool-fn :get_task
+     "Get the overall orchestration task description."
+     {} [])
 
-(def catalog
-  "Full tool catalog with metadata for prompt rendering."
-  [{:name        :get_spec
-    :description "Get the current cell's specification: doc, schema, required resources"
-    :args        {}
-    :category    :context}
-   {:name        :get_task
-    :description "Get the overall orchestration task description"
-    :args        {}
-    :category    :context}
-   {:name        :get_context
-    :description "Get workflow position: predecessors, successors, consumed/produced keys"
-    :args        {}
-    :category    :context}
-   {:name        :list_siblings
-    :description "List other cells being implemented in this run"
-    :args        {}
-    :category    :context}
-   {:name        :get_sibling
-    :description "Get spec, handler, and tests for a sibling cell by name"
-    :args        {:name :string}
-    :category    :context}
-   {:name        :get_callers
-    :description "Get cells/functions that call the given cell (defaults to current)"
-    :args        {:name :optional}
-    :category    :graph}
-   {:name        :get_callees
-    :description "Get cells/functions called by the given cell (defaults to current)"
-    :args        {:name :optional}
-    :category    :graph}
-   {:name        :graph_impact
-    :description "Get all transitive callers affected by changing the target"
-    :args        {:target :string}
-    :category    :graph}
-   {:name        :graph_path
-    :description "Find the shortest call path from one cell to another"
-    :args        {:from :string :to :string}
-    :category    :graph}
-   {:name        :list_ns
-    :description "List all non-system namespaces loaded in the REPL"
-    :args        {}
-    :category    :inspect}
-   {:name        :inspect_ns
-    :description "List public vars in a loaded namespace"
-    :args        {:ns :string}
-    :category    :inspect}
-   {:name        :eval
-    :description "Evaluate a Clojure expression in the REPL and return the result"
-    :args        {:code :string}
-    :category    :edit}
-   {:name        :define
-    :description "Define a top-level var in the cell's namespace (defn, def, etc.)"
-    :args        {:code :string}
-    :category    :edit}
-   {:name        :write_handler
-    :description "Write/overwrite the cell handler body (fn [resources data] ...)"
-    :args        {:content :string}
-    :category    :edit}
-   {:name        :write_test
-    :description "Write/overwrite the test code for this cell"
-    :args        {:content :string}
-    :category    :edit}
-   {:name        :patch_handler
-    :description "Surgically replace a string in the current handler"
-    :args        {:search :string :replace :string}
-    :category    :edit}
-   {:name        :patch_test
-    :description "Surgically replace a string in the current test code"
-    :args        {:search :string :replace :string}
-    :category    :edit}
-   {:name        :run_tests
-    :description "Assemble source, evaluate, and run tests. Green -> REVIEW phase."
-    :args        {}
-    :category    :exec}
-   {:name        :lint
-    :description "Run clj-kondo on the current handler code"
-    :args        {}
-    :category    :exec}
-   {:name        :check_schema
-    :description "Validate the cell's handler against its declared schema"
-    :args        {}
-    :category    :validate}
-   {:name        :done
-    :description "Done with dispatch — transition to review (only valid if tests are green)"
-    :args        {}
-    :category    :control}
-   {:name        :approve
-    :description "Approve the current implementation (tests are green)"
-    :args        {}
-    :category    :control}
-   {:name        :revise
-    :description "Revise the implementation with a reason (goes back to DISPATCH)"
-    :args        {:reason :string}
-    :category    :control}
-   {:name        :give_up
-    :description "Give up on this cell with a reason"
-    :args        {:reason :string}
-    :category    :control}])
+   :list_functions
+   (tool-fn :list_functions
+     "List all helper functions and the handler defined in this cell."
+     {} [])
 
-(def tool-by-name
-  "Indexed catalog: keyword tool name -> tool definition."
-  (into {} (map (juxt :name identity)) catalog))
+   :get_callers
+   (tool-fn :get_callers
+     "Get functions within this cell that call the given function (defaults to handler)."
+     {:name {:type "string"
+             :description "Function name; omit to default to the handler."}}
+     [])
 
-(defn render-tool-catalog
-  "Renders the tool catalog as a prompt string, grouped by category."
+   :get_callees
+   (tool-fn :get_callees
+     "Get functions within this cell called by the given function (defaults to handler)."
+     {:name {:type "string"
+             :description "Function name; omit to default to the handler."}}
+     [])
+
+   :graph_impact
+   (tool-fn :graph_impact
+     "Get all functions in this cell transitively affected by changing the target."
+     {:target {:type "string" :description "Function name to analyse."}}
+     [:target])
+
+   :graph_path
+   (tool-fn :graph_path
+     "Find the shortest call path between two functions in this cell."
+     {:from {:type "string" :description "Caller name."}
+      :to   {:type "string" :description "Callee name."}}
+     [:from :to])
+
+   :list_ns
+   (tool-fn :list_ns
+     "List all non-system namespaces loaded in the REPL."
+     {} [])
+
+   :inspect_ns
+   (tool-fn :inspect_ns
+     "List public vars in a loaded namespace."
+     {:ns {:type "string" :description "Namespace name."}}
+     [:ns])
+
+   :eval
+   (tool-fn :eval
+     "Evaluate a Clojure expression in the REPL and return the result."
+     {:code {:type "string" :description "A single Clojure form to evaluate."}}
+     [:code])
+
+   :read_file
+   (tool-fn :read_file
+     "Read the contents of one of the cell's source files. Returns the file
+      with line numbers prefixed (1\\tline). Available files: handler.clj,
+      helpers.clj, test.clj."
+     {:path {:type "string"
+             :enum ["handler.clj" "helpers.clj" "test.clj"]
+             :description "Which file to read."}}
+     [:path])
+
+   :write_file
+   (tool-fn :write_file
+     "Overwrite a source file with the provided content. handler.clj must
+      contain a single (fn [resources data] ...) form. helpers.clj contains
+      top-level defn/def forms. test.clj contains deftest forms."
+     {:path    {:type "string"
+                :enum ["handler.clj" "helpers.clj" "test.clj"]
+                :description "Which file to write."}
+      :content {:type "string"
+                :description "The new file contents (replaces everything)."}}
+     [:path :content])
+
+   :edit_file
+   (tool-fn :edit_file
+     "Edit a source file by replacing an exact substring. old_string must
+      appear exactly once in the file unless replace_all is true."
+     {:path        {:type "string"
+                    :enum ["handler.clj" "helpers.clj" "test.clj"]
+                    :description "Which file to edit."}
+      :old_string  {:type "string"
+                    :description "Exact substring to find. Must be unique."}
+      :new_string  {:type "string"
+                    :description "Replacement text."}
+      :replace_all {:type "boolean"
+                    :description "Replace every occurrence (default false)."}}
+     [:path :old_string :new_string])
+
+   :list_files
+   (tool-fn :list_files
+     "List the cell's source files with their sizes."
+     {} [])
+
+   :run_tests
+   (tool-fn :run_tests
+     "Assemble the cell from helpers.clj + handler.clj, evaluate, and run the
+      tests in test.clj. Returns pass/fail with output. Tests passing here is
+      a prerequisite for complete."
+     {} [])
+
+   :lint
+   (tool-fn :lint
+     "Run clj-kondo on handler.clj."
+     {} [])
+
+   :check_schema
+   (tool-fn :check_schema
+     "Validate the cell's handler against its declared schema."
+     {} [])
+
+   :complete
+   (tool-fn :complete
+     "Signal that the implementation is finished. The harness re-runs the
+      tests as a final check; if they pass, the cell is finalized. If they
+      fail, the failure is reported and you stay in the working loop."
+     {} [])
+
+   :give_up
+   (tool-fn :give_up
+     "Give up on this cell with a reason. Use this when the task is
+      genuinely impossible (bad contract, missing dependency, etc.)."
+     {:reason {:type "string" :description "Why we are stopping."}}
+     [:reason])})
+
+(def all-tools
+  "Set of every tool name the agent can call."
+  (set (keys tool-schemas)))
+
+(defn working-tools
+  "Returns the JSONSchema vector to advertise to the LLM. The agent has a
+   single working mode — all tools are always available."
   []
-  (let [by-category (group-by :category catalog)
-        cat-order   [:context :graph :inspect :edit :exec :validate :control]
-        cat-labels  {:context "CONTEXT" :graph "GRAPH" :inspect "INSPECT"
-                     :edit "EDIT/EXPLORE" :exec "EXECUTE" :validate "VALIDATE"
-                     :control "CONTROL"}]
-    (str/join "\n"
-      (for [cat cat-order
-            :let [tools (get by-category cat)]
-            :when (seq tools)]
-        (str (get cat-labels cat) ":\n"
-             (str/join "\n"
-               (for [t tools]
-                 (let [args (if (empty? (:args t))
-                              ""
-                              (str " " (str/join " "
-                                        (for [[k v] (:args t)]
-                                          (if (= v :optional)
-                                            (str "[" (name k) "]")
-                                            (name k))))))]
-                   (str "  " (name (:name t)) args
-                        " — " (:description t))))))))))
+  (vec (vals tool-schemas)))
 
-(defn parse-tool-call
-  "Extracts a tool call from an LLM response.
-   Parses the FIRST ```tool-call fenced JSON block.
-   Returns {:name keyword :args map} on success,
-           {:parse-error string} on JSON/structure error,
-           nil if no fence found."
-  [response]
-  (when-let [[_ json-str] (re-find tool-call-fence-re (or response ""))]
-    (let [trimmed (str/trim json-str)]
-      (try
-        (let [parsed (json/read-str trimmed :key-fn keyword)
-              name   (:name parsed)
-              args   (or (:args parsed) {})]
-          (cond
-            (nil? name)
-            {:parse-error (str "Tool call missing 'name' field. Received: " trimmed)}
-            (not (keyword? name))
-            {:parse-error (str "Tool 'name' must be a string, got: " (pr-str name))}
-            (not (map? args))
-            {:parse-error (str "Tool 'args' must be a map, got: " (pr-str args))}
-            :else
-            {:name (keyword (str/replace (name name) #"-" "_"))
-             :args args}))
-        (catch Exception e
-          {:parse-error (str "Invalid JSON in tool-call: " (.getMessage e)
-                             " — received: " trimmed)})))))
+(defn known-tool?
+  "True if `tool-name` is a tool this registry knows about."
+  [tool-name]
+  (contains? all-tools tool-name))
 
-(defn tool-allowed-in-phase?
-  "Checks if a tool name is valid for the current phase.
-   Returns true if allowed, false otherwise."
-  [tool-name phase]
-  (case phase
-    :dispatch (contains? dispatch-phase-tools tool-name)
-    :review   (contains? review-phase-tools tool-name)
-    false))
-
-(defn validate-tool-call
-  "Validates a parsed tool call against the catalog.
-   Returns nil if valid, or an error string."
-  [{:keys [name args]}]
-  (let [tool (get tool-by-name name)]
-    (cond
-      (nil? tool)
-      (str "Unknown tool: " (name name)
-           ". Available tools: " (str/join ", " (map name (keys tool-by-name))))
-      (and (not (map? args)))
-      (str "Args must be a map, got: " (pr-str args))
-      :else
-      nil)))
+(defn normalize-tool-name
+  "Canonicalises a tool name reported by the LLM (string or keyword) into a
+   keyword with hyphens normalised to underscores so it matches our schema keys."
+  [n]
+  (let [s (cond
+            (keyword? n) (name n)
+            (string?  n) n
+            :else        (str n))]
+    (keyword (str/replace s #"-" "_"))))
