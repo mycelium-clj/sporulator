@@ -156,6 +156,20 @@
     (is (not (orch/dispatched-output? "string")))
     (is (not (orch/dispatched-output? {:k {}}))         "empty map values shouldn't count")))
 
+(deftest turn-budget-for-test
+  (testing "cells without :requires stay at 15 turns"
+    (is (= 15 (#'orch/turn-budget-for {:requires []})))
+    (is (= 15 (#'orch/turn-budget-for {:requires nil})))
+    (is (= 15 (#'orch/turn-budget-for {}))))
+
+  (testing "cells with any :requires get 25 turns"
+    ;; DB-aware (and other resource-aware) cells need more turns to
+    ;; write helpers, write handler, debug resource interaction, and
+    ;; converge. Phase 4 validation: PE/RLH stagnated 15-turn budgets
+    ;; while pure cells converged in <20 calls.
+    (is (= 25 (#'orch/turn-budget-for {:requires [:db]})))
+    (is (= 25 (#'orch/turn-budget-for {:requires [:db :http]})))))
+
 (deftest build-test-prompt-error-string-block-test
   (testing "test-gen prompt warns against asserting on exact error strings"
     ;; When the brief doesn't pin specific wording, test-gen LLMs

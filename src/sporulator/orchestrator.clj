@@ -225,6 +225,16 @@
   (boolean
     (some (fn [r] (= "db" (name (keyword (name r))))) requires)))
 
+(defn- turn-budget-for
+  "Computes the agent-loop turn budget for a brief. Cells that pull in
+   external resources (`:db`, `:http`, etc.) reliably need more turns to
+   write helpers, write the handler, debug resource interaction, and
+   converge — Phase 4 validation runs stagnated all `:requires` cells at
+   15 turns while pure cells finished in <20 tool calls. Default 15;
+   bump to 25 when ANY resource is required."
+  [brief]
+  (if (seq (:requires brief)) 25 15))
+
 (defn- jdbc-test-shape-block
   "Test-gen guidance for cells that read back from a JDBC datasource.
    `next.jdbc/execute!` defaults to qualified-keyword keys (rows look
@@ -1285,7 +1295,7 @@
                           :run-id          run-id
                           :on-event        on-event
                           :on-chunk        on-chunk
-                          :max-attempts    15
+                          :max-attempts    (turn-budget-for (:brief contract))
                           :project-path    nil ;; don't write to disk yet
                           :base-ns         base-ns
                           :prev-source     nil ;; fresh-mode (see comment above)
@@ -1483,7 +1493,7 @@
                           :run-id          run-id
                           :on-event        on-event
                           :on-chunk        on-chunk
-                          :max-attempts    15
+                          :max-attempts    (turn-budget-for (:brief contract))
                           :project-path    nil ;; don't write to disk yet
                           :base-ns         base-ns
                           :prev-source     nil ;; fresh-mode (see comment above)

@@ -69,8 +69,24 @@ The handler signature is `(fn [resources data] ...)`.
   they pass, the cell is finalized. If they fail, you keep working.
 - give_up — bail out with a reason if the task isn't achievable.
 
-Work in whatever order makes sense. Iterate freely. You're done when
-complete succeeds.")
+## Workflow discipline — read carefully
+Default rhythm: **write_file → run_tests → fix what failed → repeat.**
+`run_tests` is the source of truth — it tells you exactly what's wrong.
+
+Use `eval` / `inspect_ns` / `list_functions` / `list_ns` ONLY when
+`run_tests` returns an error you genuinely can't decode (a confusing
+exception class, an opaque library quirk). They are NOT a Clojure REPL
+for browsing the environment, and they are NOT a substitute for trying
+something. The shortest path to converging is to commit code via
+write_file and let run_tests teach you.
+
+If you find yourself doing 3+ consecutive reads / evals / inspects
+without a write_file, stop: pick your best guess, write it, and run
+the tests. Multiple read/eval/inspect cycles without writing is the
+canonical stagnation pattern — agents that lose the budget reliably
+got there by exploring instead of trying.
+
+You're done when complete succeeds.")
 
 ;; =============================================================
 ;; Helpers — buffer parsing and file-shaped utilities

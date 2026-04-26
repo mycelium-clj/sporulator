@@ -140,6 +140,19 @@
 ;; End-to-end: helpers.clj + handler.clj
 ;; =============================================================
 
+(deftest system-prompt-workflow-discipline-test
+  (testing "system-prompt nudges agents toward write+test rhythm"
+    ;; Phase 4 validation 2026-04-26: deepseek-reasoner consistently
+    ;; burned its turn budget on eval/read_file/inspect_ns exploration
+    ;; instead of committing code via write_file + run_tests. The
+    ;; system prompt now warns explicitly against this pattern.
+    (let [p agent-loop/system-prompt]
+      (is (str/includes? p "Workflow discipline")
+          "must call out the workflow discipline section by name")
+      (is (or (str/includes? p "consecutive")
+              (str/includes? p "without a write_file"))
+          "must warn against repeated reads/evals without writes"))))
+
 (deftest helpers-rejects-ns-form-test
   (testing "writing helpers.clj with a top-level (ns ...) returns an error"
     ;; helpers.clj is a flat sequence of (defn ...)/(def ...) forms;
