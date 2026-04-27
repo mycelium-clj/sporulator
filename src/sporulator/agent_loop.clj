@@ -452,7 +452,23 @@ You're done when complete succeeds.")
                                    (str "[" cell-ns "]")
                                    (str "[" cell-ns " :as _cell-ns]"))
                                  test-code)
-                combined (str source "\n\n" test-src-fixed)
+                ;; Remove any pre-existing cell-ns / test-ns vars before
+                ;; re-eval'ing the assembled source. Otherwise stale
+                ;; deftest vars from PREVIOUS orchestration runs in this
+                ;; JVM still trip during run-tests — the agent then sees
+                ;; failures from tests no longer in test_body and can't
+                ;; reconcile them with the file it wrote. This is the
+                ;; bug that masqueraded as the agent failing on simple
+                ;; cells (Phase 4 validation 2026-04-26).
+                test-ns-name  (second (re-find #"\(ns\s+(\S+)" test-code))
+                clear-source  (str
+                                (when cell-ns
+                                  (str "(when (find-ns '" cell-ns
+                                       ") (remove-ns '" cell-ns "))\n"))
+                                (when test-ns-name
+                                  (str "(when (find-ns '" test-ns-name
+                                       ") (remove-ns '" test-ns-name "))\n")))
+                combined (str clear-source source "\n\n" test-src-fixed)
                 eval-res (ev/eval-code combined)]
             (if (not= :ok (:status eval-res))
               {:status :error :output (str "Eval error: " (:error eval-res))}
