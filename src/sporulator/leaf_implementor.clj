@@ -109,8 +109,41 @@ function must:
 
 Wrap your reply in ```clojure ... ``` fences.")
 
+(def ^:private jdbc-leaf-hints
+  "## JDBC patterns (your function takes a `next.jdbc` DataSource)
+**Insert returning the new id.** SQLite supports a RETURNING clause,
+so a single `execute-one!` gives you the inserted row back. Default
+builder returns namespaced keyword keys (e.g. `{:todos/id 1}`); pass
+`{:builder-fn rs/as-unqualified-maps}` if you want unqualified `:id`.
+Your test asserts on unqualified keys, so use the unqualified
+builder. Canonical shape:
+
+```
+(let [row (next.jdbc/execute-one!
+            db
+            [\"INSERT INTO t (a, b) VALUES (?, ?) RETURNING id\" a b]
+            {:builder-fn rs/as-unqualified-maps})]
+  {:id (:id row)})
+```
+
+**Failure path.** Wrap the JDBC call in `try` / `catch Exception` and
+return `{:error (.getMessage e)}`. NOT NULL violations, missing
+tables, etc. throw `SQLException`s.
+
+**Don't** roll your own `last_insert_rowid()` / `:return-keys true`
+pattern — the test reads back `:id` as an unqualified int and those
+shapes don't deliver one consistently. Use RETURNING + the builder-fn.")
+
+(defn- needs-jdbc-hints?
+  "Heuristic: does this leaf touch next.jdbc?
+   - params include a 'db'-named arg, OR
+   - test-body mentions next.jdbc/get-datasource."
+  [{:keys [params test-body]}]
+  (or (some #{"db" "ds" "datasource"} (map str (or params [])))
+      (and test-body (str/includes? test-body "next.jdbc"))))
+
 (defn- leaf-prompt
-  [{:keys [name doc params test-body]} helpers-source]
+  [{:keys [name doc params test-body] :as node} helpers-source]
   (str "## Function to implement\n\n"
        "Name: `" name "`\n"
        "Doc:  " doc "\n"
@@ -120,6 +153,8 @@ Wrap your reply in ```clojure ... ``` fences.")
               "```clojure\n" helpers-source "\n```\n\n"))
        "## Tests your function must pass\n\n"
        "```clojure\n" test-body "\n```\n\n"
+       (when (needs-jdbc-hints? node)
+         (str jdbc-leaf-hints "\n\n"))
        "Return ONLY the (defn " name " [...] ...) form."))
 
 (defn- extract-defn
