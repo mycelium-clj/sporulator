@@ -218,13 +218,6 @@
                (str "- `" r "` (no docstring; treat as the real runtime resource)"))))
          "\n")))
 
-(defn- requires-db?
-  "True if `requires` includes a :db (or 'db'-named) resource — used to
-   gate JDBC-specific test guidance."
-  [requires]
-  (boolean
-    (some (fn [r] (= "db" (name (keyword (name r))))) requires)))
-
 (defn- turn-budget-for
   "Computes the agent-loop turn budget for a brief. Cells that pull in
    external resources (`:db`, `:http`, etc.) reliably need more turns to
@@ -234,27 +227,6 @@
    bump to 25 when ANY resource is required."
   [brief]
   (if (seq (:requires brief)) 25 15))
-
-(defn- jdbc-test-shape-block
-  "Test-gen guidance for cells that read back from a JDBC datasource.
-   `next.jdbc/execute!` defaults to qualified-keyword keys (rows look
-   like `{:guestbook/id 1}`, not `{:id 1}`). Without this hint the
-   test-gen LLM writes `(is (= \"alice\" (:handle row)))` against
-   unqualified keys — that's nil — and produces unsatisfiable tests
-   that send the implementor into a 15-turn stagnation chasing a fix
-   the handler can never deliver. (Phase 4 validation 2026-04-26.)"
-  []
-  (str "## JDBC qualified-key default — read carefully\n"
-       "When you read rows back via `next.jdbc/execute!` (e.g. to verify\n"
-       "an INSERT landed) the rows come back with **namespaced keyword**\n"
-       "keys derived from the table name. A `guestbook` table yields\n"
-       "rows like `{:guestbook/id 1, :guestbook/handle \"alice\"}` — the\n"
-       "unqualified keys `:id` / `:handle` are `nil`. Either:\n"
-       "- assert against the qualified keys: `(:guestbook/handle row)`, or\n"
-       "- pass `{:builder-fn rs/as-unqualified-maps}` to `execute!` and\n"
-       "  use `[next.jdbc.result-set :as rs]` (already in the test ns).\n"
-       "Pick one and stay consistent. Do NOT assert against unqualified\n"
-       "keys on rows returned by the default builder.\n"))
 
 (defn- build-test-prompt
   "Builds the prompt to ask the LLM to write tests for a cell."
@@ -271,8 +243,6 @@
          (str "\n" prompts/math-precision-rules "\n"))
        (when (dispatched-output? output)
          (str "\n" (dispatched-shape-block output)))
-       (when (requires-db? requires)
-         (str "\n" (jdbc-test-shape-block)))
        "\n## Error-path assertions — avoid verbatim strings\n"
        "When the cell signals failure via an `:error` field (or similar),\n"
        "do NOT assert on an exact error string unless the brief above\n"

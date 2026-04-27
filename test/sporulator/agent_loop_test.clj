@@ -140,12 +140,12 @@
 ;; End-to-end: helpers.clj + handler.clj
 ;; =============================================================
 
-(deftest jdbc-handler-block-rendered-for-db-cells-test
-  (testing "the initial prompt for a :db-requiring cell includes JDBC handler patterns"
-    ;; Phase 4 fix I: persist-entry stagnated trying to find the right
-    ;; JDBC pattern for "insert returning id". The implementor prompt
-    ;; now ships ready-to-use patterns so the agent doesn't burn its
-    ;; budget exploring via eval.
+(deftest implementor-prompt-no-hardcoded-library-hints-test
+  ;; The cell-implementor prompt is now library-agnostic. Library
+  ;; conventions belong in the project's resources/system.edn under
+  ;; each resource's :mycelium/doc — that text rides in via the
+  ;; per-cell resource block, not via blanket hardcoded blocks.
+  (testing "no JDBC shape block in the initial prompt for a :db cell"
     (let [cell-state {:cell-id   :guestbook/persist-entry
                       :brief     {:doc "Inserts a row." :requires [:db]}
                       :schema-parsed {:input  [:map [:k :string]]
@@ -155,22 +155,10 @@
                       :task      nil
                       :change-summary nil}
           prompt     (#'agent-loop/render-initial-prompt cell-state)]
-      (is (str/includes? prompt "JDBC handler patterns")
-          "JDBC handler-shape block must render for :db cells")
-      (is (or (str/includes? prompt "RETURNING")
-              (str/includes? prompt "execute-one!"))
-          "must show the canonical insert-returning-id shape")))
-
-  (testing "non-db cells do NOT get the JDBC handler block"
-    (let [cell-state {:cell-id   :x/y
-                      :brief     {:doc "Pure cell" :requires []}
-                      :schema-parsed {:input  [:map [:n :int]]
-                                      :output [:map [:m :int]]}
-                      :files     {"handler.clj" "" "helpers.clj" "" "test.clj" ""}
-                      :task      nil
-                      :change-summary nil}
-          prompt     (#'agent-loop/render-initial-prompt cell-state)]
-      (is (not (str/includes? prompt "JDBC handler patterns"))))))
+      (is (not (str/includes? prompt "JDBC handler patterns"))
+          "no hardcoded JDBC block — convention text comes from system.edn")
+      (is (not (str/includes? prompt "as-unqualified-maps"))
+          "ditto — qualified-key guidance lives in the resource's :mycelium/doc"))))
 
 (deftest eval-clears-stale-helpers-test
   (testing "after rewriting helpers.clj to remove a fn, eval no longer resolves the removed fn"

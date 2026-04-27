@@ -310,44 +310,6 @@ You're done when complete succeeds.")
          "Wrong shape:\n"
          "  `{:" first-label " {" sample-key " ...}}`   ← do NOT do this\n")))
 
-(defn- requires-db-handler?
-  "True if `requires` includes a :db / 'db'-named resource — gates the
-   JDBC handler-shape hints in the initial prompt."
-  [requires]
-  (boolean
-    (some (fn [r] (= "db" (name (keyword (name r))))) requires)))
-
-(defn- jdbc-handler-shape-block
-  "Implementor-side guidance for cells whose handler reads or writes via
-   next.jdbc. Phase 4 validation 2026-04-26: persist-entry stagnated
-   not on workflow discipline (Fix H raised its write count) but on
-   uncertainty about how to extract the inserted id from JDBC's
-   response. Empirical exploration via `eval` burned the budget. The
-   patterns below let the agent pick a known-good shape directly."
-  []
-  (str "## JDBC handler patterns (`:db` resource is in scope)\n"
-       "The runtime hands you a real `next.jdbc` DataSource as `(:db resources)`.\n"
-       "Use `next.jdbc/...` (or any alias you `(:require ...)` in helpers.clj)\n"
-       "directly — do not wrap or mock it.\n\n"
-       "**Insert returning the new id:** SQLite supports a RETURNING clause,\n"
-       "so a single `execute-one!` call gives you the row back. Default builder\n"
-       "returns namespaced keyword keys (`{:guestbook/id 1}`); pass\n"
-       "`{:builder-fn rs/as-unqualified-maps}` if you'd rather work with\n"
-       "unqualified `:id` — pick one and stay consistent with however the\n"
-       "test reads rows back:\n"
-       "  ```\n"
-       "  (let [row (next.jdbc/execute-one!\n"
-       "              db [\"INSERT INTO t (a, b) VALUES (?, ?) RETURNING id\" a b]\n"
-       "              {:builder-fn next.jdbc.result-set/as-unqualified-maps})]\n"
-       "    {:id (:id row)})  ;; or wrap (try ... (catch Exception e {:error (.getMessage e)}))\n"
-       "  ```\n\n"
-       "**Failure path:** wrap the JDBC call in `try`/`catch Exception` and\n"
-       "return `{:error (.getMessage e)}` on the failure transition. NOT NULL\n"
-       "violations, UNIQUE conflicts, etc. throw `SQLException`s.\n\n"
-       "**Don't** hand-roll `last_insert_rowid()` lookups, alter the table,\n"
-       "or `(eval ...)` your way to the right call shape — pick one of the\n"
-       "two patterns above, write it, and let `run_tests` confirm.\n"))
-
 (defn- render-initial-prompt
   [state]
   (let [brief        (:brief state)
@@ -361,9 +323,7 @@ You're done when complete succeeds.")
         change-sum   (:change-summary state)
         output       (:output schema-parsed)
         dispatched-block (when (dispatched-output? output)
-                           (dispatched-handler-block output))
-        jdbc-block       (when (requires-db-handler? requires)
-                           (jdbc-handler-shape-block))]
+                           (dispatched-handler-block output))]
     (str "Implement cell `" cell-id "`.\n\n"
          "**Task:** " (or task "Implement the cell to pass all tests.") "\n\n"
          "**Schema:**\n" (or schema "{}") "\n\n"
@@ -372,8 +332,6 @@ You're done when complete succeeds.")
          "\n\n"
          (when dispatched-block
            (str dispatched-block "\n"))
-         (when jdbc-block
-           (str jdbc-block "\n"))
          (if edit-mode?
            (str "This cell already has an implementation that previously "
                 "passed tests. handler.clj and helpers.clj are pre-loaded "

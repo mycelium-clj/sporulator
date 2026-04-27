@@ -190,26 +190,13 @@
               (str/includes? prompt "string?"))
           "must guide error-path tests away from hardcoded equality"))))
 
-(deftest build-test-prompt-jdbc-block-test
-  (testing "cells requiring :db get next.jdbc qualified-key guidance"
-    ;; next.jdbc/execute! returns rows with NAMESPACED-keyword keys by
-    ;; default (e.g. {:guestbook/id 1}). Without warning the test-gen
-    ;; LLM writes assertions like (:id row) which return nil → tests
-    ;; become unsatisfiable and the implementor stagnates.
-    (let [prompt (#'orch/build-test-prompt
-                   {:id "guestbook/persist-entry"
-                    :doc "Inserts a row."
-                    :schema "{:input {:k :string} :output {:id :int}}"
-                    :requires [:db]
-                    :resource-docs nil
-                    :context nil})]
-      (is (str/includes? prompt "next.jdbc/execute!")
-          "JDBC block must mention next.jdbc/execute!")
-      (is (or (str/includes? prompt "qualified")
-              (str/includes? prompt "as-unqualified-maps"))
-          "JDBC block must explain qualified-key default or builder-fn workaround")))
-
-  (testing "cells without :db do NOT get the JDBC block"
+(deftest build-test-prompt-no-hardcoded-library-hints-test
+  ;; Test-gen prompt is now library-agnostic. Library-specific
+  ;; conventions (e.g. next.jdbc qualified-key default, JDBC INSERT
+  ;; patterns) live in the project's resources/system.edn under each
+  ;; resource's :mycelium/doc — they ride into the prompt via the
+  ;; per-cell resource block, not via blanket hardcoded blocks.
+  (testing "no jdbc-shaped hint when :requires is empty"
     (let [prompt (#'orch/build-test-prompt
                    {:id "x/y"
                     :doc "..."
@@ -217,8 +204,19 @@
                     :requires []
                     :resource-docs nil
                     :context nil})]
+      (is (not (str/includes? prompt "as-unqualified-maps")))
+      (is (not (str/includes? prompt "RETURNING id")))))
+
+  (testing "no jdbc-shaped hint even when :requires :db, when no resource doc"
+    (let [prompt (#'orch/build-test-prompt
+                   {:id "guestbook/persist-entry"
+                    :doc "Inserts a row."
+                    :schema "{:input {:k :string} :output {:id :int}}"
+                    :requires [:db]
+                    :resource-docs nil
+                    :context nil})]
       (is (not (str/includes? prompt "as-unqualified-maps"))
-          "non-db cells should not be given JDBC builder-fn guidance"))))
+          "the harness no longer hardcodes JDBC conventions"))))
 
 (deftest parse-schema-output-test
   (testing "parses a normal brief schema string"
