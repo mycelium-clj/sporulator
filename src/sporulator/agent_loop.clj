@@ -688,6 +688,13 @@ You're done when complete succeeds.")
               ;; the cell's own namespace, so it can call any helper by
               ;; name and exercise the handler via
               ;;   `((:handler (mycelium.cell/get-cell! :the/cell)) ... )`.
+              ;;
+              ;; Critical: clear cell-ns before re-evaluating. Otherwise
+              ;; defs from a PREVIOUS helpers/handler still resolve here
+              ;; and the agent gets false-positive signals from eval
+              ;; (e.g. `(foo)` returns 42 even after foo was removed
+              ;; from helpers.clj). Same root cause as the run_tests
+              ;; bug Q — different surface.
               cell-ns       (:cell-ns state)
               files         (:files state)
               handler-src   (get files "handler.clj")
@@ -699,7 +706,9 @@ You're done when complete succeeds.")
                                      (seq? handler-form)
                                      (= 'fn (first handler-form))
                                      (some? helpers-forms))
-                              (str (codegen/assemble-cell-source
+                              (str "(when (find-ns '" cell-ns
+                                   ") (remove-ns '" cell-ns "))\n"
+                                   (codegen/assemble-cell-source
                                      {:cell-ns        cell-ns
                                       :cell-id        (:cell-id state)
                                       :doc            (or (:doc (:brief state)) "")

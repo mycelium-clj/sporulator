@@ -378,7 +378,16 @@
                               :cell-id cell-id-kw
                               :doc     (or (:doc brief) "")
                               :schema  schema-parsed})
-                  combined (str stub-src "\n\n" tc)
+                  ;; Mirror the run_tests fix (Q): clear cell-ns and
+                  ;; test-ns before re-evaluating. Otherwise stale stub
+                  ;; vars and stale deftest vars from EARLIER sanity
+                  ;; checks (in the same JVM) leak into this check and
+                  ;; the run-cell-tests summary lies — `:test 2 :fail 1`
+                  ;; when only one test is in the new contract.
+                  clear    (str
+                             "(when (find-ns '" cell-ns ") (remove-ns '" cell-ns "))\n"
+                             "(when (find-ns '" test-ns ") (remove-ns '" test-ns "))\n")
+                  combined (str clear stub-src "\n\n" tc)
                   eval-res (ev/eval-code combined)]
               (cond
                 (not= :ok (:status eval-res))

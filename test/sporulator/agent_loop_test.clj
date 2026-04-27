@@ -172,6 +172,39 @@
           prompt     (#'agent-loop/render-initial-prompt cell-state)]
       (is (not (str/includes? prompt "JDBC handler patterns"))))))
 
+(deftest eval-clears-stale-helpers-test
+  (testing "after rewriting helpers.clj to remove a fn, eval no longer resolves the removed fn"
+    ;; Same root cause as Q (stale ns pollution), different surface.
+    ;; The agent uses eval to verify helpers in isolation; without
+    ;; this clear, eval can return a stale value from a fn that was
+    ;; removed in the latest write_file — a false-positive that
+    ;; misleads the model about whether its current code works.
+    (let [result (run-with
+                   [(tc :write_file
+                        {:path "helpers.clj"
+                         :content "(defn foo [] 42)"})
+                    (tc :write_file
+                        {:path "handler.clj"
+                         :content "(fn [_ d] {:n (foo)})"})
+                    (tc :eval {:code "(foo)"})        ;; should be 42
+                    (tc :write_file
+                        {:path "helpers.clj"
+                         :content "(defn bar [] 99)"})  ;; foo removed
+                    (tc :write_file
+                        {:path "handler.clj"
+                         :content "(fn [_ d] {:n (bar)})"})
+                    (tc :eval {:code "(foo)"})        ;; should now error
+                    (tc :give_up {:reason "demo"})])
+          msgs (-> result :session :messages deref)
+          contents (mapv :content (filter #(= "tool" (:role %)) msgs))]
+      ;; Indexes: 0=write helpers v1, 1=write handler v1, 2=eval (foo) → 42
+      ;;          3=write helpers v2, 4=write handler v2, 5=eval (foo) → error
+      (is (str/includes? (nth contents 2) "42")
+          "first eval should resolve foo and return 42")
+      (is (or (str/includes? (nth contents 5) "Unable to resolve")
+              (str/includes? (nth contents 5) "ERROR"))
+          "after foo is removed, eval (foo) must fail — no stale resolution"))))
+
 (deftest eval-runs-with-cell-helpers-in-scope-test
   (testing "after writing helpers + handler, eval can call helpers by name"
     ;; The system prompt encourages the agent to verify helpers via
