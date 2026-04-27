@@ -438,6 +438,14 @@
         leaves      (get-in msg [:payload :leaves])
         base-ns     (get-in msg [:payload :base_ns] "app")
         manifest-id (get-in msg [:payload :manifest_id])
+        ;; Implementor strategy. JSON arrives as a string; coerce to a
+        ;; keyword the orchestrator's case statement understands. Default
+        ;; is :flat (existing behaviour). Pass "bottom-up" to opt into
+        ;; the recursive-decomposer + parallel-leaf path.
+        strategy    (let [raw (get-in msg [:payload :strategy])]
+                      (case raw
+                        ("bottom-up" "bottom_up" :bottom-up) :bottom-up
+                        :flat))
         client      (or cell-client llm-client)
         manifest    (when (and store manifest-id)
                       (when-let [m (store/get-latest-manifest store manifest-id)]
@@ -451,6 +459,7 @@
                       :base-ns      base-ns
                       :store        store
                       :project-path project-path
+                      :strategy     strategy
                       :on-event     (fn [event]
                                       (send-ws! ch {:type "orchestrator_event"
                                                     :id sid
@@ -460,7 +469,8 @@
                                                     :id sid
                                                     :payload {:chunk chunk}}))})]
         (send-ws! ch {:type "orchestration_started" :id sid
-                      :payload {"run_id" run-id}})))))
+                      :payload {"run_id"   run-id
+                                "strategy" (name strategy)}})))))
 
 (defn- handle-approve-tests [_ctx ch msg]
   (let [sid     (get-in msg [:payload :session_id])
