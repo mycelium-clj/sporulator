@@ -30,11 +30,12 @@
    form. The stub's exception message echoes the doc + params so the
    agent's first read_file shows what each TODO is supposed to do."
   [{:keys [name doc params]}]
-  (str "(defn " name " [" (str/join " " params) "]\n"
-       "  ;; TODO: " doc "\n"
-       "  (throw (java.lang.UnsupportedOperationException.\n"
-       "           \"" name " not yet implemented — \" "
-                "\"" (str/replace doc "\"" "\\\"") "\")))"))
+  (let [msg (str name " not yet implemented — "
+                 (str/replace (or doc "") "\"" "\\\""))]
+    (str "(defn " name " [" (str/join " " params) "]\n"
+         "  ;; TODO: " doc "\n"
+         "  (throw (java.lang.UnsupportedOperationException.\n"
+         "           \"" msg "\")))")))
 
 (defn skeleton-helpers-source
   "Builds a `helpers.clj` source string with one stub `defn` per
