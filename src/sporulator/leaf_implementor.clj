@@ -147,6 +147,35 @@ Wrap your reply in ```clojure ... ``` fences.")
         leaf-ns      (str "tree-leaf." name)
         tests-source test-body
         session      (llm/create-session (str "leaf:" name) leaf-system-prompt)
+        emit-attempt-result
+        (fn [label result]
+          ;; Surface the actual outcome of each attempt — caller (UI,
+          ;; orchestrator, debugger) can inspect why a leaf failed
+          ;; without having to re-run it. Includes the exact compile
+          ;; error message or the first failing assertion's expected
+          ;; vs. actual.
+          (on-event
+            (cond-> {"phase"   "leaf_implement"
+                     "status"  (case (:status result)
+                                 :ok            "ok"
+                                 :compile-error "compile_error"
+                                 :test-failed   "test_failed"
+                                 "error")
+                     "leaf"    name
+                     "label"   label}
+              (:error result)    (assoc "error" (subs (str (:error result))
+                                                       0 (min 600 (count (str (:error result))))))
+              (:defn-src result) (assoc "defn-src"
+                                        (subs (:defn-src result)
+                                              0 (min 600 (count (:defn-src result)))))
+              (and (= :test-failed (:status result))
+                   (first (:failures result)))
+              (assoc "first-failure"
+                     (let [f (first (:failures result))]
+                       {"test"     (:test f)
+                        "expected" (pr-str (:expected f))
+                        "actual"   (pr-str (:actual f))
+                        "message"  (:message f)})))))
         try-once     (fn [user-msg label]
                        (on-event {"phase"  "leaf_implement"
                                   "status" "attempt"
@@ -154,36 +183,38 @@ Wrap your reply in ```clojure ... ``` fences.")
                                   "label"  label})
                        (let [resp     (llm/session-send session client user-msg
                                         :temperature 0.2)
-                             defn-src (extract-defn (:content resp) name)]
-                         (if-not defn-src
-                           {:status :error :error "LLM did not return a (defn ...) form"
-                            :raw    (:content resp)}
-                           (let [src (leaf-eval-source
-                                       {:leaf-ns        leaf-ns
-                                        :helpers-source helpers-source
-                                        :defn-source    defn-src
-                                        :tests-source   tests-source})
-                                 compile-r (compile-leaf src)]
-                             (cond
-                               (not= :ok (:status compile-r))
-                               {:status :compile-error
-                                :defn-src defn-src
-                                :error    (:error compile-r)}
+                             defn-src (extract-defn (:content resp) name)
+                             result (if-not defn-src
+                                      {:status :error :error "LLM did not return a (defn ...) form"
+                                       :raw    (:content resp)}
+                                      (let [src (leaf-eval-source
+                                                  {:leaf-ns        leaf-ns
+                                                   :helpers-source helpers-source
+                                                   :defn-source    defn-src
+                                                   :tests-source   tests-source})
+                                            compile-r (compile-leaf src)]
+                                        (cond
+                                          (not= :ok (:status compile-r))
+                                          {:status :compile-error
+                                           :defn-src defn-src
+                                           :error    (:error compile-r)}
 
-                               tests-source
-                               (let [t (maybe-run-tests src tests-source leaf-ns)]
-                                 (if (:passed? t)
-                                   {:status :ok :defn-src defn-src
-                                    :tested? true :passed? true
-                                    :summary (:summary t)}
-                                   {:status :test-failed
-                                    :defn-src defn-src
-                                    :failures (:failures t)
-                                    :compile-error (:compile-error t)}))
+                                          tests-source
+                                          (let [t (maybe-run-tests src tests-source leaf-ns)]
+                                            (if (:passed? t)
+                                              {:status :ok :defn-src defn-src
+                                               :tested? true :passed? true
+                                               :summary (:summary t)}
+                                              {:status :test-failed
+                                               :defn-src defn-src
+                                               :failures (:failures t)
+                                               :compile-error (:compile-error t)}))
 
-                               :else
-                               {:status :ok :defn-src defn-src
-                                :tested? false})))))
+                                          :else
+                                          {:status :ok :defn-src defn-src
+                                           :tested? false})))]
+                         (emit-attempt-result label result)
+                         result))
         attempt1 (try-once (leaf-prompt node helpers-source) "first")]
     (cond
       (= :ok (:status attempt1))
@@ -211,9 +242,17 @@ Wrap your reply in ```clojure ... ``` fences.")
             attempt2 (try-once feedback "repair")]
         (if (= :ok (:status attempt2))
           attempt2
-          {:status :gave-up
-           :leaf   name
-           :reason (str "Two attempts didn't produce a passing leaf. "
-                       "First: " (:status attempt1)
-                       ", second: " (:status attempt2))
-           :defn-src (or (:defn-src attempt2) (:defn-src attempt1))})))))
+          ;; Both attempts failed — return diagnostic detail so the
+          ;; caller can see exactly what the agent produced and why it
+          ;; was rejected. (Earlier this path lost the test output and
+          ;; the error message.)
+          {:status   :gave-up
+           :leaf     name
+           :reason   (str "Two attempts didn't produce a passing leaf. "
+                          "First: " (:status attempt1)
+                          ", second: " (:status attempt2))
+           :defn-src (or (:defn-src attempt2) (:defn-src attempt1))
+           :first-attempt-error  (:error attempt1)
+           :first-failure        (first (:failures attempt1))
+           :second-attempt-error (:error attempt2)
+           :second-failure       (first (:failures attempt2))})))))

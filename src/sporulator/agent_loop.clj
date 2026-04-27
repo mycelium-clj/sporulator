@@ -950,12 +950,45 @@ You're done when complete succeeds.")
                      (:turn state) " turns")
        :session (:session state)})))
 
+(defn- clear-cell-and-test-namespaces!
+  "Eval-clears the cell's namespace, the test namespace, and any
+   `tree-leaf.<name>` namespaces that previous bottom-up runs might
+   have populated. Called once at the start of `run!` so the agent
+   begins with guaranteed clean REPL state — no defs from a prior
+   orchestration / strategy / repair attempt linger and resolve in
+   `:eval` calls before the first `run_tests` triggers Q's clear.
+
+   We have a code graph in memory (state's :cell-graph + the cell-ns
+   convention), so we know exactly which namespaces to nuke without
+   over-clearing: cell-ns, test-ns, and tree-leaf.* (since leaves use
+   that prefix and a stale leaf could shadow a fresh one of the same
+   name)."
+  [{:keys [cell-ns test-ns-name]}]
+  (let [parts (cond-> []
+                cell-ns       (conj (str "(when (find-ns '" cell-ns
+                                         ") (remove-ns '" cell-ns "))"))
+                test-ns-name  (conj (str "(when (find-ns '" test-ns-name
+                                         ") (remove-ns '" test-ns-name "))"))
+                ;; Wipe any tree-leaf namespace from earlier orchestrations
+                ;; in this JVM.
+                :always       (conj
+                                "(doseq [n (filter (fn [n]
+                                                     (clojure.string/starts-with?
+                                                       (str (ns-name n))
+                                                       \"tree-leaf.\"))
+                                                   (all-ns))]
+                                   (remove-ns (ns-name n)))"))]
+    (when (seq parts)
+      (try (ev/eval-code (clojure.string/join "\n" parts))
+           (catch Throwable _ nil)))))
+
 (defn run!
   "Main entry point: runs the agent loop for one cell.
    Returns {:status :ok :cell-id :code :session}
         or {:status :error :cell-id :error :session}."
   [opts]
   (let [state (atom (init-session opts))]
+    (clear-cell-and-test-namespaces! @state)
     (emit @state "cell_implement" "started" :cell-id (:cell-id @state))
     (loop []
       (let [s @state]
