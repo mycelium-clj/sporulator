@@ -225,29 +225,53 @@
       (is (not-any? #(str/includes? % "BLOCKED") contents)
           "no BLOCKED messages should appear"))))
 
-(deftest reframe-hint-after-repeated-test-failures-test
-  (testing "after 3 consecutive run_tests failures, the harness appends a reframe hint"
-    ;; The hint is informational — the agent gets the actual test
-    ;; output AND the suggestion to step back. It can ignore or
-    ;; follow. No block, no censoring of the underlying error.
+(deftest run-tests-output-focuses-on-first-failure-test
+  (testing "run_tests output gives M/N summary + first failure block"
+    ;; Cells should be small enough that fixing one test at a time is a
+    ;; fast path. The harness now surfaces the first failing assertion
+    ;; in detail (expected/actual), with a 'fix this one then run again'
+    ;; nudge — instead of dumping the full clojure.test output and
+    ;; expecting the agent to parse it.
     (let [bad-handler "(fn [_ data] {:n (* 2 (:m data))})"
           result (run-with
                    [(tc :write_file {:path "handler.clj" :content bad-handler})
-                    (tc :run_tests)                  ;; 1st failure
-                    (tc :write_file {:path "handler.clj" :content bad-handler})
-                    (tc :run_tests)                  ;; 2nd failure (still no hint)
-                    (tc :write_file {:path "handler.clj" :content bad-handler})
-                    (tc :run_tests)                  ;; 3rd failure → hint
+                    (tc :run_tests)
+                    (tc :give_up {:reason "demo"})])
+          msgs   (-> result :session :messages deref)
+          contents (mapv :content (filter #(= "tool" (:role %)) msgs))
+          ;; Index 0 = write_file, index 1 = run_tests result.
+          run-tests-content (nth contents 1)]
+      (is (str/includes? run-tests-content "TESTS:")
+          "summary line should show M/N passing")
+      (is (or (str/includes? run-tests-content "FAIL")
+              (str/includes? run-tests-content "ERROR"))
+          "first failure should appear")
+      (is (str/includes? run-tests-content "expected:")
+          "first failure must include expected/actual breakdown")
+      (is (str/includes? run-tests-content "Fix this one")
+          "should nudge toward sequential-fix rhythm"))))
+
+(deftest progress-stall-hint-after-pass-count-plateau-test
+  (testing "after run_tests has been stuck at the same passing count for the threshold, a stall hint fires"
+    ;; The hint is informational — the agent gets the actual failure
+    ;; AND the suggestion to rethink/decompose. No block, no censoring.
+    (let [bad-handler "(fn [_ data] {:n (* 2 (:m data))})"
+          result (run-with
+                   [(tc :write_file {:path "handler.clj" :content bad-handler})
+                    (tc :run_tests)               ;; pass count 0
+                    (tc :run_tests)               ;; still 0
+                    (tc :run_tests)               ;; still 0
+                    (tc :run_tests)               ;; 4th in a row → stall hint
                     (tc :give_up {:reason "demo"})])
           msgs   (-> result :session :messages deref)
           contents (mapv :content (filter #(= "tool" (:role %)) msgs))]
-      ;; tool-result indexes align with the tc order above.
-      (is (str/includes? (nth contents 5) "failed 3 times in a row")
-          "3rd consecutive run_tests failure should mention the streak")
-      (is (not (str/includes? (nth contents 1) "failed 3 times in a row"))
-          "1st failure should NOT include the hint yet")
-      (is (not (str/includes? (nth contents 3) "failed 3 times in a row"))
-          "2nd failure should NOT include the hint yet"))))
+      ;; Indexes: 0=write, 1..4=run_tests, 5=give_up
+      (is (not (str/includes? (nth contents 1) "stuck at"))
+          "1st run_tests should NOT include the stall hint")
+      (is (str/includes? (nth contents 4) "stuck at")
+          "4th run_tests at the same pass count should include the stall hint")
+      (is (str/includes? (nth contents 4) "Rethink")
+          "stall hint should point at rethinking/decomposing"))))
 
 (deftest system-prompt-encourages-repl-experimentation-test
   (testing "system-prompt frames eval as a first-class REPL affordance"

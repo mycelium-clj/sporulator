@@ -352,6 +352,67 @@
         session  (llm/create-session (str "test:" cell-id) prompts/cell-prompt)]
     (emit on-event "cell_test" "started" :cell-id cell-id)
 
+    ;; Helper: run a sanity check on a candidate test_body. Returns
+    ;; {:status :ok} when tests load against a passthrough stub cell
+    ;; (and don't all error en masse) — i.e. the contract is at least
+    ;; structurally satisfiable. Returns {:status :error :message ...}
+    ;; when the test code is broken on its face: doesn't compile,
+    ;; references an undefined symbol, errors against every test.
+    (let [cell-id-kw (let [s (str cell-id)]
+                       (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+          schema-parsed (try
+                          (let [raw (binding [*read-eval* false]
+                                      (clojure.edn/read-string (:schema brief)))]
+                            {:input  (:input raw)
+                             :output (:output raw)})
+                          (catch Exception _ {:input [:map] :output [:map]}))
+          check-test-body
+          (fn [body]
+            (let [tc (codegen/assemble-test-source
+                       {:test-ns   test-ns
+                        :cell-ns   cell-ns
+                        :cell-id   cell-id-kw
+                        :test-body body})
+                  stub-src (codegen/assemble-stub-cell-source
+                             {:cell-ns cell-ns
+                              :cell-id cell-id-kw
+                              :doc     (or (:doc brief) "")
+                              :schema  schema-parsed})
+                  combined (str stub-src "\n\n" tc)
+                  eval-res (ev/eval-code combined)]
+              (cond
+                (not= :ok (:status eval-res))
+                {:status :error
+                 :message (str "Test code did not load against a stub cell: "
+                               (:error eval-res))}
+
+                :else
+                (let [test-res (ev/run-cell-tests tc)
+                      total    (or (get-in test-res [:summary :test]) 0)
+                      errored  (or (get-in test-res [:summary :error]) 0)]
+                  (cond
+                    (not= :ok (:status test-res))
+                    {:status :error
+                     :message (str "Test runner refused the contract: "
+                                   (or (:output test-res) (:error test-res)))}
+
+                    ;; Every single test ERROR'd (not just FAILed). With a
+                    ;; passthrough stub, FAIL is normal — values won't match.
+                    ;; But ERROR almost always means bad refs / type errors
+                    ;; in the test code itself, not in the (yet-unwritten)
+                    ;; handler.
+                    (and (pos? total) (= total errored))
+                    {:status :error
+                     :message (str "All " total " test(s) errored against a stub. "
+                                   "This usually means the test code references "
+                                   "an undefined symbol or has a type mismatch — "
+                                   "the actual implementation can't fix it. First "
+                                   "error: "
+                                   (:message (first (:failures test-res)) "(no detail)"))}
+
+                    :else
+                    {:status :ok})))))]
+
     ;; Generate test body (strip code fences if present)
     (let [test-prompt (build-test-prompt brief)
           raw-test    (:content (llm/session-send-stream session client test-prompt on-chunk))
@@ -363,13 +424,38 @@
       (let [review-prompt (self-review-prompt brief test-body)
             review-resp   (:content (llm/session-send-stream session client review-prompt on-chunk))
             ;; If corrections returned, use those instead
-            final-body    (if (str/includes? review-resp "ALL TESTS VERIFIED")
+            after-review  (if (str/includes? review-resp "ALL TESTS VERIFIED")
                             test-body
                             (or (extract/extract-first-code-block review-resp)
                                 test-body))
+            ;; Sanity-check the contract against a passthrough stub. If
+            ;; the test code is structurally broken, ask the LLM to fix
+            ;; it once. We don't loop endlessly — if a single repair
+            ;; doesn't help, hand the broken contract to the implementor
+            ;; and let it edit test.clj as part of its own loop.
+            check1        (check-test-body after-review)
+            final-body
+            (if (= :ok (:status check1))
+              after-review
+              (let [_ (emit on-event "cell_test" "lint_fix"
+                            :cell-id cell-id
+                            :message (:message check1))
+                    fix-prompt (str "Your test code has a structural issue:\n\n"
+                                    (:message check1)
+                                    "\n\nReturn a corrected test body (just the "
+                                    "(deftest ...) forms — no `(ns ...)` or "
+                                    "`:require`, those are added automatically).")
+                    fix-resp   (:content (llm/session-send-stream session client fix-prompt on-chunk))
+                    fixed-body (or (extract/extract-first-code-block fix-resp)
+                                   after-review)
+                    check2     (check-test-body fixed-body)]
+                (if (= :ok (:status check2))
+                  fixed-body
+                  ;; Still broken. Use the fixed body anyway — the
+                  ;; implementor can fall back to editing test.clj. We
+                  ;; don't want to gate forever on a bad contract.
+                  fixed-body)))
             ;; Assemble full test source
-            cell-id-kw    (let [s (str cell-id)]
-                            (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
             test-code     (codegen/assemble-test-source
                             {:test-ns  test-ns
                              :cell-ns  cell-ns
@@ -396,7 +482,7 @@
              :status       "pending"
              :revision     0}))
 
-        contract))))
+        contract)))))
 
 ;; ── Implementation from contract ───────────────────────────────
 

@@ -467,11 +467,84 @@ You're done when complete succeeds.")
                   {:status   :ok
                    :passed?  (:passed? test-res)
                    :output   (str (:output eval-res) "\n" (:output test-res))
-                   :summary  (:summary test-res)})))))))))
+                   :summary  (:summary test-res)
+                   :failures (:failures test-res)})))))))))
 
 ;; =============================================================
 ;; Tool dispatch
 ;; =============================================================
+
+(def ^:private progress-stall-threshold
+  "How many consecutive run_tests calls can finish at the same passing
+   count before the harness appends a 'you're stalled — rethink' hint.
+   The hint is advisory — the agent still chooses what to do."
+  3)
+
+(defn- progress-stall-hint
+  "Advisory appended to run_tests output when the passing test count has
+   plateaued for `n` consecutive runs. Suggests rethinking, decomposing,
+   or refining test.clj — does NOT block."
+  [n pass total]
+  (str "\n\n— Passing count has been stuck at " pass "/" total " for " n
+       " consecutive run_tests calls. Tweaking the same approach is not "
+       "moving the number. Try one of:\n"
+       "- **Rethink the approach.** What hypothesis am I making that\n"
+       "  could be wrong? Try a completely different shape — different\n"
+       "  data flow, different control structure, different library\n"
+       "  primitive — instead of refining the current attempt.\n"
+       "- **Decompose.** Can the failing test be made simpler by\n"
+       "  pulling the work into a helper you can verify in isolation?\n"
+       "  Write the helper, eval it directly with a sample input, and\n"
+       "  confirm it returns what you expect before wiring it into the\n"
+       "  handler.\n"
+       "- **Verify in the REPL.** The cell is loaded; try\n"
+       "    ((:handler (mycelium.cell/get-cell! :your-id)) {:db ds} {...})\n"
+       "  on the exact input the failing test uses. The actual return\n"
+       "  value tells you the gap immediately.\n"
+       "- **Refine test.clj.** If the failing test asserts something\n"
+       "  the brief doesn't promise, edit it to align with the brief —\n"
+       "  the brief is the contract, the tests are derived."))
+
+(defn- format-failure
+  "Renders one failure entry from run-cell-tests structured `:failures`
+   into a focused 'fix this one' block."
+  [{:keys [kind test message expected actual line]}]
+  (str (if (= :error kind) "ERROR" "FAIL") " in " test
+       (when line (str " (line " line ")"))
+       "\n  expected: " (pr-str expected)
+       "\n  actual:   " (pr-str actual)
+       (when-not (str/blank? message)
+         (str "\n  message:  " message))))
+
+(defn- format-run-tests-failure
+  "Renders the run_tests result when at least one test failed: shows the
+   M/N summary, the first failing test in detail, and a brief reminder
+   that one fix at a time is the rhythm. Includes any plateau hint
+   based on `pass-count-history`."
+  [result history]
+  (let [summary (or (:summary result) {})
+        pass    (:pass summary 0)
+        fail    (:fail summary 0)
+        errs    (:error summary 0)
+        tests   (:test summary 0)
+        first-failure (first (:failures result))
+        stall-streak  (let [recent (take-last (inc progress-stall-threshold) history)]
+                        (if (and (>= (count recent) (inc progress-stall-threshold))
+                                 (apply = recent))
+                          (dec (count recent))
+                          0))]
+    (str "TESTS: " pass "/" tests " passing"
+         (when (pos? fail) (str ", " fail " failing"))
+         (when (pos? errs) (str ", " errs " errored"))
+         "\n\n"
+         (if first-failure
+           (str (format-failure first-failure)
+                "\n\nFix this one, then run_tests again to see the next.")
+           ;; Status was :ok-but-not-passed but no structured failure
+           ;; (rare path) — fall back to raw output.
+           (or (:output result) "Tests failed."))
+         (when (pos? stall-streak)
+           (progress-stall-hint stall-streak pass tests)))))
 
 (defn- ok  [state msg] {:state state :result (str "ok — " msg)})
 (defn- err [state msg] {:state state :result (str "ERROR — " msg)})
@@ -636,24 +709,35 @@ You're done when complete succeeds.")
       :list_files  (handle-file-list  state)
 
       :run_tests
-      (let [result (assemble-and-eval state)]
+      (let [result    (assemble-and-eval state)
+            pass-now  (or (get-in result [:summary :pass]) 0)
+            tests-now (or (get-in result [:summary :test]) 0)
+            history   (-> (or (:pass-count-history state) [])
+                          (conj pass-now)
+                          ;; keep enough history to evaluate the stall threshold
+                          (->> (take-last (inc progress-stall-threshold))
+                               vec))]
         (cond
           (not= :ok (:status result))
-          (err state (:output result))
+          ;; Eval-time failure (cell didn't compile, ns missing, etc.).
+          (err (assoc state :pass-count-history history)
+               (or (:output result) "Run failed."))
 
           (:passed? result)
           (let [new-state (assoc state
-                            :green-files       (:files state)
-                            :last-tests-green? true)]
+                            :green-files        (:files state)
+                            :last-tests-green?  true
+                            :pass-count-history history)]
             (ok new-state
-                (str "ALL TESTS PASSED.\n"
-                     (or (:output result) "")
-                     "\n\nWhen you're satisfied, call complete to finalize. "
+                (str "ALL TESTS PASSED (" pass-now "/" tests-now ").\n\n"
+                     "When you're satisfied, call complete to finalize. "
                      "You can also keep iterating — refactor, add tests, etc.")))
 
           :else
-          (err (assoc state :last-tests-green? false)
-               (or (:output result) "Tests failed."))))
+          (err (assoc state
+                 :last-tests-green?  false
+                 :pass-count-history history)
+               (format-run-tests-failure result history))))
 
       :lint
       (let [handler-src (get-in state [:files "handler.clj"])]
@@ -702,54 +786,16 @@ You're done when complete succeeds.")
             :give-up-reason (or (:reason args) "No reason given"))
           (str "Gave up: " (or (:reason args) "no reason"))))))
 
-(def ^:private repeated-failure-hint-threshold
-  "After this many consecutive failed run_tests calls, the harness
-   appends a soft advisory suggesting the agent reframe the problem
-   or decompose it. Hint is informational — the agent still chooses
-   what to do. Phase 4 validation: persist-entry sometimes needed to
-   step back and try a different INSERT shape rather than tweak the
-   same one repeatedly."
-  3)
-
-(defn- repeated-failure-hint
-  "Soft advisory appended to a failed run_tests result after `n` >=
-   threshold consecutive failures. Does NOT block — just reframes."
-  [n]
-  (str "\n\n— Tests have failed " n " times in a row. If you feel "
-       "stuck, consider stepping back rather than tweaking the same "
-       "approach:\n"
-       "- Verify each helper in isolation. `eval` lets you call any\n"
-       "  function you've written and inspect what it actually returns,\n"
-       "  including database calls — set up an in-memory sqlite, run\n"
-       "  the helper against a sample row, and compare to what the\n"
-       "  test expects.\n"
-       "- Eval the handler directly with a test input:\n"
-       "    `((:handler (mycelium.cell/get-cell! :your-cell-id))\n"
-       "      {:db ds} {...})` — what does it return? Is the shape\n"
-       "    wrong, or is the data different from what the test sets up?\n"
-       "- Is your initial hypothesis wrong? If you've been refining\n"
-       "  the same INSERT/SELECT/parse strategy and it still fails,\n"
-       "  try a completely different shape — RETURNING vs SELECT after\n"
-       "  insert, qualified vs unqualified keys, separate helper vs\n"
-       "  inline.\n"
-       "- Is the test contract reasonable for the brief? You can\n"
-       "  edit test.clj if a test asserts something the brief doesn't\n"
-       "  promise.\n"
-       "Use the REPL — the cell file you wrote on the last write_file\n"
-       "is loaded; explore freely."))
-
 (defn- dispatch-tool-call
   "Runs one tool call against the agent state, appends the tool result to
    the LLM session, and returns the new state.
 
    The agent has free run of every tool: read, write, edit, eval, inspect,
    run_tests, complete, give_up. The harness adds NO blocks or warnings on
-   tool selection — orchestration belongs to the model. The one piece of
-   advisory feedback is on the run_tests result itself: after the agent has
-   seen `repeated-failure-hint-threshold` consecutive test failures, the
-   tool output gets a transparent hint suggesting it reframe rather than
-   keep tweaking. The hint is appended to the actual test output, not in
-   place of it, so the agent still has the underlying error to work with."
+   tool selection — orchestration belongs to the model. Advisory feedback
+   (e.g. the progress-stall hint inside `format-run-tests-failure`) is
+   built into the per-tool handler's response so the model still gets the
+   underlying tool output."
   [state {:keys [id name arguments]}]
   (let [tool-name (tools/normalize-tool-name name)
         session   (:session state)]
@@ -758,25 +804,9 @@ You're done when complete succeeds.")
             (str "ERROR — unknown tool '" (clojure.core/name tool-name) "'."))
           state)
       (let [{new-state :state result :result}
-            (handle-dispatch-tool state {:name tool-name :args arguments})
-            ;; Track consecutive run_tests failures so the harness can
-            ;; offer a 'reframe' hint after the agent has seen the same
-            ;; class of failure several times.
-            run-tests?      (= :run_tests tool-name)
-            tests-failed?   (and run-tests? (str/starts-with? result "ERROR"))
-            tests-passed?   (and run-tests? (str/starts-with? result "ok"))
-            prev-failures   (or (:consecutive-test-failures state) 0)
-            new-failures    (cond
-                              tests-passed? 0
-                              tests-failed? (inc prev-failures)
-                              :else         prev-failures)
-            hint?           (and tests-failed?
-                                 (>= new-failures repeated-failure-hint-threshold))
-            final-result    (if hint?
-                              (str result (repeated-failure-hint new-failures))
-                              result)]
-        (llm/session-append-tool-result! session id final-result)
-        (assoc new-state :consecutive-test-failures new-failures)))))
+            (handle-dispatch-tool state {:name tool-name :args arguments})]
+        (llm/session-append-tool-result! session id result)
+        new-state))))
 
 (defn- process-turn
   "One LLM round-trip:

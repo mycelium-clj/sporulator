@@ -88,43 +88,63 @@
             (if-not test-ns
               {:status :error
                :error  (str "Could not find test namespace: " ns-name)}
-              (let [out       (StringWriter.)
-                counters  (atom {:test 0 :pass 0 :fail 0 :error 0})
-                ;; Custom reporter that captures results without
-                ;; leaking to the parent test framework
-                reporter  (fn [m]
-                            (let [out-w out]
-                              (case (:type m)
-                                :begin-test-ns nil
-                                :end-test-ns   nil
-                                :begin-test-var
-                                (swap! counters update :test inc)
-                                :pass
-                                (swap! counters update :pass inc)
-                                :fail
-                                (do (swap! counters update :fail inc)
-                                    (.write out-w
-                                      (str "\nFAIL in " (test/testing-vars-str m) "\n"
-                                           (:message m "")
-                                           "\nexpected: " (pr-str (:expected m))
-                                           "\n  actual: " (pr-str (:actual m)) "\n")))
-                                :error
-                                (do (swap! counters update :error inc)
-                                    (.write out-w
-                                      (str "\nERROR in " (test/testing-vars-str m) "\n"
-                                           (:message m "")
-                                           "\n  actual: " (pr-str (:actual m)) "\n")))
-                                :summary nil
-                                nil)))
-                _         (binding [*out*        out
-                                    test/report  reporter]
-                            (test/run-tests test-ns))
-                summary   @counters]
-            {:status  :ok
-             :passed? (and (zero? (:fail summary))
-                           (zero? (:error summary)))
-             :summary summary
-             :output  (str (:output load-result) (str out))}))))))))
+              (let [out         (StringWriter.)
+                counters    (atom {:test 0 :pass 0 :fail 0 :error 0})
+                ;; Structured capture of every failure / error so callers
+                ;; can present them one-at-a-time. Each entry has the
+                ;; deftest var name, the file:line if known, the literal
+                ;; expected/actual forms, and a free-form message.
+                failures    (atom [])
+                current-var (atom nil)
+                add-failure (fn [m kind]
+                              (swap! failures conj
+                                {:kind     kind
+                                 :test     (or (some-> @current-var meta :name str)
+                                               (test/testing-vars-str m))
+                                 :file     (-> @current-var meta :file)
+                                 :line     (-> @current-var meta :line)
+                                 :message  (or (:message m) "")
+                                 :expected (:expected m)
+                                 :actual   (:actual m)}))
+                ;; Custom reporter — captures results without leaking to
+                ;; the parent test framework.
+                reporter    (fn [m]
+                              (let [out-w out]
+                                (case (:type m)
+                                  :begin-test-ns nil
+                                  :end-test-ns   nil
+                                  :begin-test-var
+                                  (do (reset! current-var (:var m))
+                                      (swap! counters update :test inc))
+                                  :pass
+                                  (swap! counters update :pass inc)
+                                  :fail
+                                  (do (swap! counters update :fail inc)
+                                      (add-failure m :fail)
+                                      (.write out-w
+                                        (str "\nFAIL in " (test/testing-vars-str m) "\n"
+                                             (:message m "")
+                                             "\nexpected: " (pr-str (:expected m))
+                                             "\n  actual: " (pr-str (:actual m)) "\n")))
+                                  :error
+                                  (do (swap! counters update :error inc)
+                                      (add-failure m :error)
+                                      (.write out-w
+                                        (str "\nERROR in " (test/testing-vars-str m) "\n"
+                                             (:message m "")
+                                             "\n  actual: " (pr-str (:actual m)) "\n")))
+                                  :summary nil
+                                  nil)))
+                _           (binding [*out*        out
+                                      test/report  reporter]
+                              (test/run-tests test-ns))
+                summary     @counters]
+            {:status   :ok
+             :passed?  (and (zero? (:fail summary))
+                            (zero? (:error summary)))
+             :summary  summary
+             :failures @failures
+             :output   (str (:output load-result) (str out))}))))))))
 
 ;; ── Contract verification ──────────────────────────────────────
 
