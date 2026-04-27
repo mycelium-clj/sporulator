@@ -778,9 +778,6 @@ You're done when complete succeeds.")
                                      (:errors lint-res)))))
               (ok state "No lint errors.")))))
 
-      :check_schema
-      (ok state "Schema validation: no runtime schema checking configured.")
-
       :complete
       (let [result (if (:last-tests-green? state)
                      {:status :ok :passed? true :output "(using last green run)"}
@@ -799,10 +796,17 @@ You're done when complete succeeds.")
               "complete: tests green, finalizing.")
 
           :else
+          ;; Reuse run_tests' structured first-failure format so the
+          ;; agent gets the same clean signal regardless of which tool
+          ;; surface caught the failure. Otherwise complete returns
+          ;; raw clojure.test text and the agent has to triage twice
+          ;; (once on run_tests, once on complete).
           (err (assoc state :last-tests-green? false)
-               (str "complete blocked — tests not green:\n"
-                    (or (:output result) "")
-                    "\nFix the failure and run_tests again, or give_up."))))
+               (str "complete blocked — tests not green.\n\n"
+                    (format-run-tests-failure
+                      result
+                      (or (:pass-count-history state) []))
+                    "\n\nFix the failure and run_tests again, or give_up."))))
 
       :give_up
       (ok (assoc state

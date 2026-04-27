@@ -129,11 +129,6 @@
      "Run clj-kondo on handler.clj."
      {} [])
 
-   :check_schema
-   (tool-fn :check_schema
-     "Validate the cell's handler against its declared schema."
-     {} [])
-
    :complete
    (tool-fn :complete
      "Signal that the implementation is finished. The harness re-runs the
