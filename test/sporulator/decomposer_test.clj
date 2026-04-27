@@ -12,25 +12,30 @@
 
   (testing "missing handler root"
     (is (str/includes? (:error (decomposer/validate-tree
-                                 [{:name "foo" :doc "" :params [] :examples []
+                                 [{:name "foo" :doc "" :params [] :test-body ""
                                    :depends-on []}]))
                        "handler")))
 
   (testing "good shape passes"
     (is (nil? (decomposer/validate-tree
                 [{:name "valid?" :doc "..." :params ["s"]
-                  :examples [["a" true]]
+                  :test-body "(deftest t (is (true? (valid? \"a\"))))"
                   :depends-on []}
                  {:name "handler" :doc "..." :params ["resources" "data"]
-                  :examples [[[{} {:k 1}] {:n 1}]]
-                  :depends-on ["valid?"]}])))))
+                  :test-body "(deftest t2 (is (= {:n 1} (handler {} {:k 1}))))"
+                  :depends-on ["valid?"]}]))))
+
+  (testing "test-body must be a string, not a vector"
+    (is (some? (decomposer/validate-tree
+                 [{:name "handler" :doc "" :params [] :test-body []
+                   :depends-on []}])))))
 
 (deftest topo-sort-orders-leaves-first-test
-  (let [tree [{:name "a" :params [] :examples [] :depends-on ["b" "c"]
+  (let [tree [{:name "a" :params [] :test-body "" :depends-on ["b" "c"]
                :doc "" }
-              {:name "b" :params [] :examples [] :depends-on []
+              {:name "b" :params [] :test-body "" :depends-on []
                :doc ""}
-              {:name "c" :params [] :examples [] :depends-on ["b"]
+              {:name "c" :params [] :test-body "" :depends-on ["b"]
                :doc ""}]
         ordered (decomposer/ordered-nodes tree)
         names (mapv :name ordered)]
@@ -40,25 +45,8 @@
         "c before a (a depends on c)")))
 
 (deftest topo-sort-detects-cycles-test
-  (let [tree [{:name "a" :params [] :examples [] :depends-on ["b"]
+  (let [tree [{:name "a" :params [] :test-body "" :depends-on ["b"]
                :doc ""}
-              {:name "b" :params [] :examples [] :depends-on ["a"]
+              {:name "b" :params [] :test-body "" :depends-on ["a"]
                :doc ""}]]
     (is (thrown? Exception (decomposer/ordered-nodes tree)))))
-
-(deftest examples-to-deftests-renders-deftest-form-test
-  (testing "single-arg fn"
-    (let [out (decomposer/examples->deftests
-                {:name "doubled" :params ["n"]
-                 :examples [[1 2] [10 20]]})]
-      (is (str/includes? out "(deftest test-doubled"))
-      (is (str/includes? out "(doubled 1)"))
-      (is (str/includes? out "(is (= 2"))))
-
-  (testing "multi-arg fn — input wrapped in vector"
-    (let [out (decomposer/examples->deftests
-                {:name "add" :params ["a" "b"]
-                 :examples [[[1 2] 3] [[10 20] 30]]})]
-      (is (str/includes? out "(add 1 2)"))
-      (is (str/includes? out "(is (= 3"))
-      (is (str/includes? out "(add 10 20)")))))

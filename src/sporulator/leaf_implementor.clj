@@ -1,8 +1,13 @@
 (ns sporulator.leaf-implementor
   "Implements one tree node — a single (defn name [params] body) — by
-   asking the LLM for the body and verifying it compiles + (when
-   testable) passes the deftests synthesised from the node's
-   :examples.
+   asking the LLM for the body and verifying it compiles + passes the
+   `:test-body` deftests the decomposer planned for this node.
+
+   Per the decomposer's contract, every node carries a runnable
+   `:test-body` string. That deftest source uses real resources
+   (in-memory sqlite, real sample data) — no placeholder symbols.
+   The leaf-implementor eval-loads the leaf alongside its deps and
+   the test-body, runs the tests, and reports.
 
    The harness here is intentionally narrower than `agent-loop/run!`:
    leaves are small (≤20 lines per the decomposer's contract) and
@@ -10,39 +15,9 @@
    attempt; if the leaf still doesn't pass we hand it back unverified
    and let the cell-level run catch the gap."
   (:require [clojure.string :as str]
-            [sporulator.decomposer :as decomposer]
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
             [sporulator.llm :as llm]))
-
-;; -----------------------------------------------------------------
-;; Detect whether the node's :examples can be turned into deftests
-;; -----------------------------------------------------------------
-
-(defn- example-arg-stable?
-  "Heuristic: does this example argument look like something we can
-   pass to a function literally? Symbols like `some-db` / `DB` /
-   placeholders fail a real call; raw values (numbers, strings,
-   keywords, maps, vectors of stable values) work."
-  [arg]
-  (cond
-    (symbol? arg)  false
-    (and (string? arg) (re-find #"\b(?:DB|some-|sample-|placeholder|mock-)" arg)) false
-    (vector? arg)  (every? example-arg-stable? arg)
-    (map? arg)     (and (every? example-arg-stable? (keys arg))
-                        (every? example-arg-stable? (vals arg)))
-    :else          true))
-
-(defn- examples-testable?
-  "True when every :examples entry uses literal data the deftest can
-   evaluate at runtime. Returns false when any example references a
-   symbol like `some-db` (the decomposer uses these as placeholders
-   for resources we can't synthesise)."
-  [examples]
-  (every? (fn [[input output]]
-            (and (example-arg-stable? input)
-                 (example-arg-stable? output)))
-          examples))
 
 ;; -----------------------------------------------------------------
 ;; Source assembly for the leaf eval/test step
@@ -120,7 +95,8 @@ of small composable helpers.
 You will be given:
 - The function's name, doc, and parameter list.
 - The bodies of any helpers it depends on (already implemented).
-- A few example input/output pairs for guidance.
+- The deftest source the harness will run against your function. Make
+  it pass.
 
 Your reply MUST be exactly one (defn ...) form for the requested
 function. No (ns ...), no extra requires, no commentary. The
@@ -134,7 +110,7 @@ function must:
 Wrap your reply in ```clojure ... ``` fences.")
 
 (defn- leaf-prompt
-  [{:keys [name doc params examples]} helpers-source]
+  [{:keys [name doc params test-body]} helpers-source]
   (str "## Function to implement\n\n"
        "Name: `" name "`\n"
        "Doc:  " doc "\n"
@@ -142,15 +118,9 @@ Wrap your reply in ```clojure ... ``` fences.")
        (when (and helpers-source (seq helpers-source))
          (str "## Helpers in scope\n\n"
               "```clojure\n" helpers-source "\n```\n\n"))
-       "## Example I/O\n\n"
-       (str/join "\n"
-         (map (fn [[input output]]
-                (let [call (if (= 1 (count params))
-                             (str "(" name " " (pr-str input) ")")
-                             (str "(" name " " (str/join " " (map pr-str input)) ")"))]
-                  (str "- " call " => " (pr-str output))))
-              examples))
-       "\n\nReturn the (defn " name " [...] ...) form."))
+       "## Tests your function must pass\n\n"
+       "```clojure\n" test-body "\n```\n\n"
+       "Return ONLY the (defn " name " [...] ...) form."))
 
 (defn- extract-defn
   "Pulls a single (defn name ...) form from the LLM reply. Returns
@@ -163,7 +133,7 @@ Wrap your reply in ```clojure ... ``` fences.")
 (defn implement-leaf
   "Drives the LLM to produce a (defn name ...) for one tree node.
 
-   `node` is a decomposer node ({:name :doc :params :examples
+   `node` is a decomposer node ({:name :doc :params :test-body
    :depends-on}); `helpers-source` is the accumulated source of
    already-implemented siblings/leaves.
 
@@ -173,10 +143,9 @@ Wrap your reply in ```clojure ... ``` fences.")
   [client node {:keys [helpers-source on-event]
                 :or {helpers-source ""
                      on-event       (fn [_])}}]
-  (let [{:keys [name examples]} node
+  (let [{:keys [name test-body]} node
         leaf-ns      (str "tree-leaf." name)
-        tests-source (when (examples-testable? examples)
-                       (decomposer/examples->deftests node))
+        tests-source test-body
         session      (llm/create-session (str "leaf:" name) leaf-system-prompt)
         try-once     (fn [user-msg label]
                        (on-event {:phase "leaf_implement"

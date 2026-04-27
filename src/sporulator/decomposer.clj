@@ -13,7 +13,6 @@
    helpers in scope. The result is one cell namespace built from
    small, independently-verified pieces."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
             [sporulator.extract :as extract]
             [sporulator.llm :as llm]))
 
@@ -48,11 +47,21 @@ For each function, provide:
   :name        — string, kebab-case identifier
   :doc         — one-line description of behaviour
   :params      — vector of arg-name strings
-  :examples    — vector of `[input output]` pairs (Clojure data,
-                 quoted as data — e.g. `[[\"alice\" true] [\"\" false]]`).
-                 2–4 pairs is the right ballpark. These become deftests.
-                 If the function takes multiple args, wrap the input
-                 list in a vector: `[[[\"alice\" 5] true] ...]`.
+  :test-body   — a STRING containing one or more `(deftest …)` forms
+                 that will be run against the function in isolation.
+                 Use REAL resources, not placeholders:
+                 - For pure functions, just `(is (= expected (fn args)))`.
+                 - For functions that take a db datasource, set up an
+                   in-memory or temp-file sqlite with `next.jdbc/get-datasource`
+                   inside the test, seed any rows the test needs with
+                   `next.jdbc/execute!`, then call the function.
+                 - For time-dependent functions, pass a literal epoch
+                   timestamp argument (the function takes `now` as a
+                   parameter) — never depend on `(System/currentTimeMillis)`
+                   at test time.
+                 NEVER use placeholder symbols like `'some-db` or strings
+                 like `\"DB\"` as test inputs. The harness eval-runs your
+                 deftests literally.
   :depends-on  — vector of names (strings) of OTHER functions in this
                  tree that this function calls. Empty `[]` for leaves.
 
@@ -63,14 +72,18 @@ Respond with:
  :tree [{:name \"valid-handle?\"
          :doc \"Returns true iff handle is non-empty and matches /[A-Za-z0-9_-]+/\"
          :params [\"s\"]
-         :examples [[\"alice\" true] [\"\" false] [\"bad!\" false]]
+         :test-body \"(deftest test-valid-handle?\\n  (is (true? (valid-handle? \\\"alice\\\")))\\n  (is (false? (valid-handle? \\\"\\\")))\\n  (is (false? (valid-handle? \\\"bad!\\\"))))\"
+         :depends-on []}
+        {:name \"count-recent\"
+         :doc \"Counts rows for handle in guestbook with created_at >= since.\"
+         :params [\"db\" \"handle\" \"since\"]
+         :test-body \"(deftest test-count-recent\\n  (let [tmp (str \\\"/tmp/leaf-\\\" (System/nanoTime) \\\".sqlite\\\")\\n        ds (next.jdbc/get-datasource {:dbtype \\\"sqlite\\\" :dbname tmp})]\\n    (next.jdbc/execute! ds [\\\"CREATE TABLE guestbook (handle TEXT, created_at INT)\\\"])\\n    (next.jdbc/execute! ds [\\\"INSERT INTO guestbook VALUES ('alice', 100), ('alice', 500), ('bob', 50)\\\"])\\n    (is (= 1 (count-recent ds \\\"alice\\\" 200)))\\n    (is (= 2 (count-recent ds \\\"alice\\\" 50)))\\n    (is (= 0 (count-recent ds \\\"bob\\\" 100)))))\"
          :depends-on []}
         {:name \"handler\"
          :doc \"Validates input handle, returns flat dispatched shape.\"
          :params [\"resources\" \"data\"]
-         :examples [[[{} {:handle \"alice\"}] {:validated-handle \"alice\"}]
-                    [[{} {:handle \"\"}] {:error \"Invalid handle: \\\"\\\"\"}]]
-         :depends-on [\"valid-handle?\"]}]}
+         :test-body \"(deftest test-handler\\n  (let [tmp (str \\\"/tmp/handler-\\\" (System/nanoTime) \\\".sqlite\\\")\\n        ds (next.jdbc/get-datasource {:dbtype \\\"sqlite\\\" :dbname tmp})]\\n    (next.jdbc/execute! ds [\\\"CREATE TABLE guestbook (handle TEXT, created_at INT)\\\"])\\n    (is (= {:validated-handle \\\"alice\\\"}\\n           (handler {:db ds :now 1000} {:handle \\\"alice\\\"})))))\"
+         :depends-on [\"valid-handle?\" \"count-recent\"]}]}
 ```
 
 Rules for the tree:
@@ -80,13 +93,19 @@ Rules for the tree:
   `:tree`.
 - The root node MUST be named `\"handler\"` and depends-on-transitively
   must reach every other node (no orphans).
-- Examples must reference ONLY the function being defined and its
-  declared `:depends-on`; do NOT use library namespaces in example
-  inputs/outputs (those are integration concerns, handled at the cell
-  level).
-- For functions that need resources (e.g. a `:db`), put the resource
-  binding at the cell handler level — leaves should be pure where
-  possible.
+- The harness eval-loads each leaf's :test-body. Setup that the test
+  needs (sqlite tables, seed rows, sample data) MUST live INSIDE the
+  deftest's `let`. Do not assume any vars exist outside the test.
+- The harness has these requires available in every leaf's namespace:
+  `[clojure.test :refer [deftest is testing]]`,
+  `[next.jdbc :as jdbc]`, `[next.jdbc.result-set :as rs]`,
+  `[clojure.string :as str]`. Use those without re-requiring.
+- For functions that need a db, accept the datasource as a parameter
+  (so the test can pass a temp sqlite ds). Do not use a global
+  resource; that's the cell-handler's job.
+- For time-dependent leaves (rate limits, expiry), accept `now` (an
+  epoch second) as a parameter. The handler computes
+  `(quot (System/currentTimeMillis) 1000)` and passes it down.
 
 Wrap your reply in ```edn ... ``` fences. EDN, not JSON. No
 explanation outside the fences.")
@@ -153,10 +172,10 @@ explanation outside the fences.")
     (not (every? (fn [n] (and (string? (:name n))
                               (string? (:doc n))
                               (vector? (:params n))
-                              (vector? (:examples n))
+                              (string? (:test-body n))
                               (vector? (:depends-on n))))
                  tree))
-    {:error "every node must have :name :doc :params :examples :depends-on"}
+    {:error "every node must have :name (string) :doc (string) :params (vector) :test-body (string) :depends-on (vector)"}
 
     (not (some #(= "handler" (:name %)) tree))
     {:error "tree must contain a node named 'handler'"}
@@ -171,27 +190,6 @@ explanation outside the fences.")
   [tree]
   (topo-sort tree))
 
-(defn examples->deftests
-  "Builds a deftest source string for one tree node from its :examples.
-   Each example becomes one (is (= expected (fn-name input))) form."
-  [{:keys [name params examples]}]
-  (str "(deftest test-" name "\n"
-       (str/join
-         "\n"
-         (map-indexed
-           (fn [i [input expected]]
-             (let [;; Multi-arg input arrives wrapped in a vector;
-                   ;; single-arg input is the value itself. Detect by
-                   ;; whether params count > 1.
-                   call (if (= 1 (count params))
-                          (str "(" name " " (pr-str input) ")")
-                          (str "(" name " "
-                               (str/join " " (map pr-str input))
-                               ")"))]
-               (str "  (testing \"example " (inc i) "\"\n"
-                    "    (is (= " (pr-str expected) " " call ")))")))
-           examples))
-       ")\n"))
 
 (defn assess-and-decompose
   "Calls the decomposer LLM with the cell's brief + test contract.

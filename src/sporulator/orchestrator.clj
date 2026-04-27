@@ -679,8 +679,10 @@
      :task         — overall orchestration task description"
   [client {:keys [contract store run-id on-event on-chunk max-attempts
                   project-path base-ns task
-                  prev-source change-summary]
-           :or   {max-attempts 3}}]
+                  prev-source change-summary
+                  strategy]
+           :or   {max-attempts 3
+                  strategy     :flat}}]
   (let [{:keys [cell-id brief test-code cell-ns]} contract
         cell-id-kw (let [s (str cell-id)]
                      (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
@@ -705,26 +707,62 @@
                                            :else v))]
                           {:input  (fix-keys (:input raw))
                            :output (fix-keys (:output raw))})
-                        (catch Exception _ {:input [:map] :output [:map]}))]
-    (let [prev-parts (when prev-source (extract/extract-cell-source-parts prev-source))]
-      (agent-loop/run!
-        {:client          client
-         :cell-id         cell-id-kw
-         :cell-ns         cell-ns
-         :brief           brief
-         :test-code       test-code
-         :schema-parsed   schema-parsed
-         :turn-budget     max-attempts
-         :on-event        on-event
-         :on-chunk        on-chunk
-         :store           store
-         :run-id          run-id
-         :project-path    project-path
-         :base-ns         base-ns
-         :task            task
-         :initial-handler (:handler prev-parts)
-         :initial-helpers (:helpers prev-parts)
-         :change-summary  change-summary}))))
+                        (catch Exception _ {:input [:map] :output [:map]}))
+        prev-parts (when prev-source (extract/extract-cell-source-parts prev-source))
+        agent-opts {:client          client
+                    :cell-id         cell-id-kw
+                    :cell-ns         cell-ns
+                    :brief           brief
+                    :test-code       test-code
+                    :schema-parsed   schema-parsed
+                    :turn-budget     max-attempts
+                    :on-event        on-event
+                    :on-chunk        on-chunk
+                    :store           store
+                    :run-id          run-id
+                    :project-path    project-path
+                    :base-ns         base-ns
+                    :task            task
+                    :initial-handler (:handler prev-parts)
+                    :initial-helpers (:helpers prev-parts)
+                    :change-summary  change-summary}]
+    (case strategy
+      :flat
+      (agent-loop/run! agent-opts)
+
+      :bottom-up
+      ;; Decomposer plans a function tree, leaves get implemented in
+      ;; parallel batches with isolated tests, then the handler runs
+      ;; through agent_loop/run! with all helpers in scope. See
+      ;; sporulator.decomposer + sporulator.tree-implementor.
+      (let [decomp-result
+            ((requiring-resolve 'sporulator.decomposer/assess-and-decompose)
+              client
+              {:cell-id  (str cell-id-kw)
+               :doc      (:doc brief)
+               :schema   (:schema brief)
+               :requires (:requires brief)
+               :test-body (:test-body contract)})]
+        (case (:status decomp-result)
+          :ok
+          (let [tree-result
+                ((requiring-resolve 'sporulator.tree-implementor/run-tree!)
+                  client (:tree decomp-result) agent-opts)]
+            (or (:handler tree-result)
+                {:status :error
+                 :error  "tree-implementor returned no handler result"
+                 :tree-result tree-result}))
+
+          :too-big
+          {:status :error
+           :error  (str "Decomposer flagged this cell as too big for one ns: "
+                        (:reason decomp-result))}
+
+          ;; :error / unknown — fall back to flat to avoid blocking
+          (do (on-event {:phase  "tree_decomposer"
+                         :status "fallback_to_flat"
+                         :reason (:reason decomp-result)})
+              (agent-loop/run! agent-opts)))))))
 ;; ── Main orchestration ─────────────────────────────────────────
 
 (defn- bare-cell-id
@@ -1185,8 +1223,9 @@
    snapshot are dropped from the active set and emitted as cell_carry_over
    events. Removed cells are deprecated + their files deleted."
   [client {:keys [leaves manifest base-ns store project-path
-                  on-event on-chunk manifest-id]
-           :or   {base-ns "app" manifest-id ""}}]
+                  on-event on-chunk manifest-id strategy]
+           :or   {base-ns "app" manifest-id ""
+                  strategy :flat}}]
   (let [run-id      (str "run-" (System/nanoTime))
         on-event    (or on-event (fn [_]))
         on-chunk    (or on-chunk (fn [_]))
@@ -1305,6 +1344,7 @@
          :prev-cells-by-id prev-cells-by-id
          :new-cells-by-id  new-cells-by-id
          :prev-run-id     (:run-id prev-snapshot)
+         :strategy        strategy
          :callbacks       {:on-event on-event :on-chunk on-chunk}})
 
       (emit on-event "orchestration" "started"
@@ -1394,7 +1434,8 @@
                           :project-path    nil ;; don't write to disk yet
                           :base-ns         base-ns
                           :prev-source     nil ;; fresh-mode (see comment above)
-                          :change-summary  summary})]
+                          :change-summary  summary
+                          :strategy        (or (:strategy run) :flat)})]
             (if (= :ok (:status result))
               ;; Implementation succeeded — get source from store (where implement-from-contract saved it)
               (let [latest-cell (when store (store/get-latest-cell store cell-id))
@@ -1592,7 +1633,8 @@
                           :project-path    nil ;; don't write to disk yet
                           :base-ns         base-ns
                           :prev-source     nil ;; fresh-mode (see comment above)
-                          :change-summary  change-summary})]
+                          :change-summary  change-summary
+                          :strategy        (or (:strategy run) :flat)})]
             (if (= :ok (:status result))
               (let [latest-cell (when store (store/get-latest-cell store cell-id))
                     impl-source (format-source (or (:handler latest-cell) ""))]
