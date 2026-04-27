@@ -148,10 +148,10 @@ Wrap your reply in ```clojure ... ``` fences.")
         tests-source test-body
         session      (llm/create-session (str "leaf:" name) leaf-system-prompt)
         try-once     (fn [user-msg label]
-                       (on-event {:phase "leaf_implement"
-                                  :status "attempt"
-                                  :leaf name
-                                  :label label})
+                       (on-event {"phase"  "leaf_implement"
+                                  "status" "attempt"
+                                  "leaf"   name
+                                  "label"  label})
                        (let [resp     (llm/session-send session client user-msg
                                         :temperature 0.2)
                              defn-src (extract-defn (:content resp) name)]

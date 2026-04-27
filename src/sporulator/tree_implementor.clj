@@ -203,9 +203,9 @@
            leaf-log     []]
       (if (empty? batches-left)
         ;; All leaves done — run the handler.
-        (do (on-event {:phase  "tree_handler"
-                       :status "started"
-                       :leaves (count leaf-log)})
+        (do (on-event {"phase"  "tree_handler"
+                       "status" "started"
+                       "leaves" (count leaf-log)})
             (let [result (agent-loop/run!
                            (assoc opts
                              :initial-helpers helpers-src
@@ -225,9 +225,9 @@
                :handler  result}))
         ;; Run the next leaf batch in parallel.
         (let [batch    (first batches-left)
-              _        (on-event {:phase  "tree_batch"
-                                  :status "started"
-                                  :leaves (mapv :name batch)})
+              _        (on-event {"phase"  "tree_batch"
+                                  "status" "started"
+                                  "leaves" (mapv :name batch)})
               results  (implement-leaf-batch client batch helpers-src on-event)
               new-defs (->> results
                             (filter #(= :ok (get-in % [:result :status])))
@@ -237,10 +237,10 @@
                                 :status   (:status result)
                                 :defn-src (:defn-src result)})
                              results)]
-          (on-event {:phase  "tree_batch"
-                     :status "done"
-                     :ok-count (count new-defs)
-                     :total    (count batch)})
+          (on-event {"phase"    "tree_batch"
+                     "status"   "done"
+                     "ok-count" (count new-defs)
+                     "total"    (count batch)})
           (recur (rest batches-left)
                  (str (ensure-newline-padded helpers-src)
                       (str/join "\n\n" new-defs))
