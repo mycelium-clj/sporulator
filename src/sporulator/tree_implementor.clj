@@ -23,7 +23,8 @@
    skeleton-mode shows whether the decomposition is useful at all."
   (:require [clojure.string :as str]
             [sporulator.agent-loop :as agent-loop]
-            [sporulator.decomposer :as decomposer]))
+            [sporulator.decomposer :as decomposer]
+            [sporulator.leaf-implementor :as leaf]))
 
 (defn- node->stub-defn
   "Renders one tree node as a stub `(defn name [params] (throw …))`
@@ -109,18 +110,138 @@
          :change-summary  change-summary}))))
 
 ;; -----------------------------------------------------------------
-;; Bottom-up + parallel-leaves mode (TODO — phase B)
+;; Bottom-up + parallel-leaves mode
 ;; -----------------------------------------------------------------
 
-;; The bottom-up mode is the user's full vision: implement each leaf
-;; in isolation against its own deftests (built from :examples), in
-;; parallel batches keyed by the dependency graph, then lift into a
-;; shared helpers.clj before running the handler. The hardest part is
-;; per-leaf testing for impure / non-deterministic leaves whose
-;; example I/O can't be turned into exact-equality assertions; we
-;; either need the LLM to produce property-shaped tests or fall back
-;; to verifying at the cell level after recomposition.
-;;
-;; Skeleton-mode (above) is the prototype that validates the
-;; decomposer is useful as a scaffold. If it pays off we'll build out
-;; this fuller path.
+(defn- batch-by-deps
+  "Splits `tree` into successive batches where each batch's nodes
+   have all their :depends-on satisfied by names from earlier
+   batches. Within a batch, nodes are independent and can be
+   implemented in parallel.
+
+   `tree` is the topo-ordered decomposer output (leaves first,
+   root last)."
+  [tree]
+  (loop [remaining tree
+         done #{}
+         batches []]
+    (if (empty? remaining)
+      batches
+      (let [{ready true blocked false}
+            (group-by (fn [{:keys [depends-on]}] (every? done depends-on))
+                      remaining)
+            ready (vec (or ready []))
+            new-done (into done (map :name) ready)
+            still (vec (or blocked []))]
+        (when (empty? ready)
+          (throw (ex-info "Cycle in decomposer tree — no nodes ready in this batch"
+                          {:remaining (mapv :name remaining)})))
+        (recur still new-done (conj batches ready))))))
+
+(defn- implement-leaf-batch
+  "Runs `leaf/implement-leaf` for every node in `batch` in parallel.
+   Returns a vector of {:node ... :result ...} maps, in the same
+   order as the batch."
+  [client batch helpers-source on-event]
+  (let [futures (mapv (fn [node]
+                        (future
+                          {:node   node
+                           :result (try (leaf/implement-leaf client node
+                                          {:helpers-source helpers-source
+                                           :on-event       on-event})
+                                        (catch Throwable t
+                                          {:status :crashed
+                                           :error  (.getMessage t)}))}))
+                      batch)]
+    (mapv deref futures)))
+
+(defn- ensure-newline-padded
+  "When concatenating helpers blobs, make sure each defn starts on
+   its own line — avoids accidental run-together."
+  [s]
+  (cond
+    (str/blank? s)        s
+    (str/ends-with? s "\n\n") s
+    (str/ends-with? s "\n")   (str s "\n")
+    :else                 (str s "\n\n")))
+
+(defn run-tree!
+  "Full bottom-up implementation. For every non-handler batch in
+   topo-order:
+   - run leaf/implement-leaf for each node in parallel (the leaves
+     have no in-batch deps);
+   - lift each successful :defn-src into the accumulating
+     helpers-source.
+
+   When all helpers are implemented, hand control to
+   `agent-loop/run!` for the handler with the accumulated helpers
+   as :initial-helpers — the handler agent sees real, working
+   helpers in scope, not stubs.
+
+   Returns a map:
+     {:status     :ok | :error
+      :leaves     [{:name :status :defn-src ...} ...]   (per-leaf log)
+      :helpers    \"...\"          (accumulated helpers source)
+      :handler    <agent-loop/run! result map>}        (final cell run)
+
+   `opts` is forwarded to `agent-loop/run!` for the handler step.
+   Anything not relevant to the handler (just :on-event below) is
+   ignored elsewhere."
+  [client tree opts]
+  (let [{:keys [on-event] :or {on-event (fn [_])}} opts
+        ordered  (decomposer/ordered-nodes tree)
+        batches  (batch-by-deps ordered)
+        ;; Split off the batch that contains "handler" — that one
+        ;; always runs last via the full agent_loop.
+        handler-batch-idx
+        (first (keep-indexed
+                 (fn [i b] (when (some #(= "handler" (:name %)) b) i))
+                 batches))
+        leaf-batches (subvec (vec batches) 0 handler-batch-idx)]
+    (loop [batches-left leaf-batches
+           helpers-src  ""
+           leaf-log     []]
+      (if (empty? batches-left)
+        ;; All leaves done — run the handler.
+        (do (on-event {:phase  "tree_handler"
+                       :status "started"
+                       :leaves (count leaf-log)})
+            (let [result (agent-loop/run!
+                           (assoc opts
+                             :initial-helpers helpers-src
+                             :change-summary
+                             (str "## Helpers pre-implemented\n"
+                                  "The decomposer planned this cell as "
+                                  (count tree) " functions. The "
+                                  (count leaf-log) " non-handler leaves "
+                                  "are already implemented and visible in "
+                                  "helpers.clj — read them, then write "
+                                  "handler.clj that composes them. You can "
+                                  "still revise helpers.clj if a leaf needs "
+                                  "fixing, but they passed isolation checks.")))]
+              {:status   (if (= :ok (:status result)) :ok :error)
+               :leaves   leaf-log
+               :helpers  helpers-src
+               :handler  result}))
+        ;; Run the next leaf batch in parallel.
+        (let [batch    (first batches-left)
+              _        (on-event {:phase  "tree_batch"
+                                  :status "started"
+                                  :leaves (mapv :name batch)})
+              results  (implement-leaf-batch client batch helpers-src on-event)
+              new-defs (->> results
+                            (filter #(= :ok (get-in % [:result :status])))
+                            (map #(get-in % [:result :defn-src])))
+              entries  (mapv (fn [{:keys [node result]}]
+                               {:name     (:name node)
+                                :status   (:status result)
+                                :defn-src (:defn-src result)})
+                             results)]
+          (on-event {:phase  "tree_batch"
+                     :status "done"
+                     :ok-count (count new-defs)
+                     :total    (count batch)})
+          (recur (rest batches-left)
+                 (str (ensure-newline-padded helpers-src)
+                      (str/join "\n\n" new-defs))
+                 (into leaf-log entries)))))))
