@@ -1071,9 +1071,15 @@
             ;; manifest) keep working.
             briefs (mapv (fn [leaf]
                            (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
+                                 ;; Cell-ids may arrive with a leading colon
+                                 ;; (e.g. ":todomvc/foo" from (str kw)). Strip
+                                 ;; before keywordizing so the id->cell-name
+                                 ;; lookup actually hits.
+                                 cell-id-bare (let [s (str cell-id)]
+                                                (cond-> s (str/starts-with? s ":") (subs 1)))
                                  cell-name (when id->cell-name
-                                             (get id->cell-name (keyword cell-id)
-                                                  (get id->cell-name cell-id)))
+                                             (or (get id->cell-name (keyword cell-id-bare))
+                                                 (get id->cell-name cell-id-bare)))
                                  manifest-cell (when (and manifest cell-name)
                                                  (get-in manifest [:cells cell-name]))
                                  doc (or (:doc manifest-cell)
