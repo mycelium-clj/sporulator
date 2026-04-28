@@ -217,3 +217,29 @@
       (is (= 2 (count result)))
       (is (= :a/one (second (first result))))
       (is (= :b/two (second (second result)))))))
+
+(deftest extract-cell-source-parts-test
+  (testing "handler-only cell (no helpers)"
+    (let [src "(ns app.cells.foo (:require [mycelium.cell :as cell]))\n\n(cell/defcell :foo/bar\n  {:doc \"test\" :input [:map] :output [:map]}\n  (fn [resources data] data))\n"
+          parts (extract/extract-cell-source-parts src)]
+      (is (some? (:handler parts)))
+      (is (re-find #"\(fn \[resources data\]" (:handler parts)))
+      (is (nil? (:helpers parts)))))
+
+  (testing "cell with helpers"
+    (let [src "(ns app.cells.foo (:require [mycelium.cell :as cell]))\n\n(defn doubled [x] (* x 2))\n(defn squared [x] (* x x))\n\n(cell/defcell :foo/bar\n  {:doc \"\" :input [:map] :output [:map]}\n  (fn [_ data] {:n (doubled (:n data))}))\n"
+          parts (extract/extract-cell-source-parts src)]
+      (is (some? (:handler parts)))
+      (is (re-find #"doubled" (:handler parts)))
+      (is (some? (:helpers parts)))
+      (is (re-find #"defn doubled" (:helpers parts)))
+      (is (re-find #"defn squared" (:helpers parts)))))
+
+  (testing "blank or nil source"
+    (is (nil? (extract/extract-cell-source-parts nil)))
+    (is (nil? (extract/extract-cell-source-parts "")))
+    (is (nil? (extract/extract-cell-source-parts "   "))))
+
+  (testing "non-defcell source returns nil handler but no error"
+    (let [parts (extract/extract-cell-source-parts "(defn foo [] 1)")]
+      (is (nil? (:handler parts))))))

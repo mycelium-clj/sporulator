@@ -5,17 +5,21 @@
             [clojure.data.json :as json]
             [zprint.core :as zp]
             [clojure.string :as str]
+            [sporulator.agent-loop :as agent-loop]
             [sporulator.cell-agent :as cell-agent]
-            [sporulator.source-gen :as source-gen]
             [sporulator.codegen :as codegen]
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
             [sporulator.feedback :refer [feedback-loop]]
+            [sporulator.graph-agent :as graph-agent]
             [sporulator.llm :as llm]
             [sporulator.hashline :as hashline]
+            [sporulator.manifest-diff :as manifest-diff]
             [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
-            [sporulator.store :as store]))
+            [sporulator.source-gen :as source-gen]
+            [sporulator.store :as store]
+            [sporulator.workflow-smoke :as smoke]))
 
 ;; ── System EDN reading ────────────────────────────────────────
 
@@ -40,34 +44,54 @@
         (clojure.edn/read-string {:readers aero-readers} (slurp f))))
     (catch Exception _ nil)))
 
+(defn- ig->injection-key-map
+  "Reads :reitit.routes/pages out of a parsed system.edn and returns a
+   map from integrant key (e.g. :db/sqlite) to injection key (e.g. :db).
+   These are the names cells `:requires`."
+  [sys-edn]
+  (let [routes-cfg (get sys-edn :reitit.routes/pages)]
+    (when (map? routes-cfg)
+      (into {} (keep (fn [[inject-key ig-ref]]
+                       (when (keyword? ig-ref)
+                         [ig-ref inject-key]))
+                     routes-cfg)))))
+
+(defn- extract-resource-attribute
+  "Generic helper: pulls a single attribute (`:mycelium/doc`,
+   `:mycelium/fixture`, …) off every resource in a parsed system.edn
+   and rekeys by the injection key cells use in `:requires`."
+  [sys-edn attr]
+  (when sys-edn
+    (let [vals-by-ig-key (->> sys-edn
+                              (keep (fn [[k v]]
+                                      (when (and (map? v) (contains? v attr))
+                                        [k (get v attr)])))
+                              (into {}))
+          ig->injection  (ig->injection-key-map sys-edn)]
+      (->> vals-by-ig-key
+           (map (fn [[ig-key v]]
+                  [(or (get ig->injection ig-key) (keyword (name ig-key))) v]))
+           (into {})))))
+
 (defn extract-resource-docs
   "Extracts :mycelium/doc metadata from a parsed system.edn map.
    Cross-references with :reitit.routes/pages to find the key name
    each resource is injected under (e.g. :db, not :sqlite).
    Returns {resource-keyword doc-string}."
   [sys-edn]
-  (when sys-edn
-    (let [;; Build mapping: integrant-key → :mycelium/doc
-          docs-by-ig-key (->> sys-edn
-                              (keep (fn [[k v]]
-                                      (when (and (map? v) (:mycelium/doc v))
-                                        [k (:mycelium/doc v)])))
-                              (into {}))
-          ;; Get the routes config to find injection key names
-          ;; :reitit.routes/pages {:db #ig/ref :db/sqlite} → :db/sqlite is injected as :db
-          routes-cfg (get sys-edn :reitit.routes/pages)
-          ;; Build reverse: integrant-key → injection-key
-          ig->injection (when (map? routes-cfg)
-                          (into {} (map (fn [[inject-key ig-ref]]
-                                         (when (keyword? ig-ref)
-                                           [ig-ref inject-key]))
-                                       routes-cfg)))]
-      (->> docs-by-ig-key
-           (map (fn [[ig-key doc]]
-                  (let [inject-key (or (get ig->injection ig-key)
-                                      (keyword (name ig-key)))]
-                    [inject-key doc])))
-           (into {})))))
+  (extract-resource-attribute sys-edn :mycelium/doc))
+
+(defn extract-resource-fixtures
+  "Extracts :mycelium/fixture forms from a parsed system.edn map.
+   Each fixture is a Clojure form (read as data) that, when evaluated,
+   returns a freshly-initialized resource value (e.g. a DataSource
+   with the schema applied). Used by the cell-implementor's `:eval`
+   tool to pre-bind `resources` so the agent doesn't have to invent
+   library setup boilerplate.
+
+   Returns {resource-keyword fixture-form-as-data}."
+  [sys-edn]
+  (extract-resource-attribute sys-edn :mycelium/fixture))
 
 ;; ── Formatting ────────────────────────────────────────────────
 
@@ -129,30 +153,163 @@
 
 ;; ── Test contract generation ───────────────────────────────────
 
+(defn parse-schema-output
+  "Parses a brief's :schema string and returns the :output value, or nil
+   if the string is unparseable. Tolerates symbol/string keys."
+  [schema-str]
+  (when (seq (str schema-str))
+    (try
+      (let [raw (binding [*read-eval* false]
+                  (clojure.edn/read-string (str schema-str)))
+            kw  (fn kw [v]
+                  (cond
+                    (and (map? v) (seq v)
+                         (some #(or (string? %) (symbol? %)) (keys v)))
+                    (into {} (map (fn [[k vv]] [(keyword (name k)) (kw vv)])) v)
+                    (map? v) (into {} (map (fn [[k vv]] [k (kw vv)])) v)
+                    :else v))]
+        (kw (:output raw)))
+      (catch Exception _ nil))))
+
+(defn dispatched-output?
+  "True if `output` is a dispatched-output map: keyed by transition labels
+   (e.g. :success / :failure), each value an inner sub-schema. Recognises
+   both the lite-form (map values) and the Malli-form (vector values).
+
+   {:success {:n :int} :failure {:e :string}}            → true
+   {:success [:map [:n :int]] :failure [:map [:e :string]]} → true
+   {:n :int :x :string}                                   → false (flat)
+   {} or [:map ...]                                       → false"
+  [output]
+  (and (map? output) (seq output)
+       (every? (fn [v] (or (and (map? v) (seq v))
+                            (vector? v)))
+               (vals output))))
+
+(defn- dispatched-shape-block
+  "Renders the dispatched-output guidance block for the test/implementor
+   prompts when the cell's output is dispatched. `output` is the parsed
+   dispatched-output map."
+  [output]
+  (let [pairs (vec output)
+        first-pair (first pairs)
+        first-label (name (key first-pair))
+        first-keys (cond
+                     (map? (val first-pair)) (vec (keys (val first-pair)))
+                     :else [])
+        sample-key (or (first first-keys) :result)
+        labels (mapv (comp name key) pairs)]
+    (str "## Dispatched output — read carefully\n"
+         "This cell has a dispatched output schema. Mycelium dispatches by\n"
+         "looking at which keys appear in the handler's flat return map and\n"
+         "matching them against the per-transition sub-schemas declared in\n"
+         "`:output`. Possible transitions: "
+         (str/join " | " (map #(str "`" % "`") labels))
+         ".\n\n"
+         "**The handler returns a flat map matching ONE of the transition\n"
+         "sub-schemas — it never wraps the result under the transition\n"
+         "label.** Tests should assert against the flat shape, not against\n"
+         "a nested `{:" first-label " {…}}` form.\n\n"
+         "Example shape (assuming `:" first-label "` carries `" sample-key "`):\n"
+         "```clojure\n"
+         "(deftest test-" first-label "-path\n"
+         "  (let [result (handler {} {…})]\n"
+         "    (is (contains? result " sample-key "))))\n"
+         "\n"
+         "(deftest test-other-path\n"
+         "  (let [result (handler {} {…})]\n"
+         "    (is (contains? result :error))))    ;; or whatever the failure key is\n"
+         "```\n"
+         "Do NOT do `(:" first-label " result)` or `(get-in result [:"
+         first-label " ...])` — there is no such wrapper key.\n")))
+
+(defn- format-resources-block
+  "Formats per-resource docstrings into a 'Resources' section.
+   `requires` is the vector of resource keywords; `resource-docs` is a map
+   from resource keyword to its docstring (extracted from system.edn)."
+  [requires resource-docs]
+  (when (seq requires)
+    (str "**Resources** (passed as the first arg of the handler):\n"
+         (str/join "\n"
+           (for [r requires
+                 :let [k    (keyword (name r))
+                       doc  (get resource-docs k
+                                  (get resource-docs r))]]
+             (if doc
+               (str "- `" r "` — " doc)
+               (str "- `" r "` (no docstring; treat as the real runtime resource)"))))
+         "\n")))
+
+(defn- turn-budget-for
+  "Computes the agent-loop turn budget for a brief. Cells that pull in
+   external resources (`:db`, `:http`, etc.) reliably need more turns to
+   write helpers, write the handler, debug resource interaction, and
+   converge — Phase 4 validation runs stagnated all `:requires` cells at
+   15 turns while pure cells finished in <20 tool calls. Default 15;
+   bump to 25 when ANY resource is required."
+  [brief]
+  (if (seq (:requires brief)) 25 15))
+
 (defn- build-test-prompt
   "Builds the prompt to ask the LLM to write tests for a cell."
-  [{:keys [id doc schema requires context]}]
-  (str "Write tests for the following Mycelium cell using clojure.test.\n\n"
+  [{:keys [id doc schema requires resource-docs context]}]
+  (let [output (parse-schema-output schema)]
+    (str "Write tests for the following Mycelium cell using clojure.test.\n\n"
        "**Cell ID:** `" id "`\n"
        "**Requirements:** " doc "\n"
        "**Schema:** `" schema "`\n"
-       (when (seq requires)
-         (str "**Resources:** " (str/join ", " requires) "\n"))
+       (format-resources-block requires resource-docs)
        (when context
          (str "\n" context "\n"))
        (when (prompts/needs-math-precision? schema)
          (str "\n" prompts/math-precision-rules "\n"))
-       "\nReturn ONLY the `deftest` forms. Do NOT include the `(ns ...)` declaration "
-       "or any requires — those are added automatically.\n"
-       "The handler is available as `handler` and resources as `{}`.\n"
-       "Use `(handler {} {:input-key value})` to call the cell.\n\n"
-       "Example test structure:\n"
+       (when (dispatched-output? output)
+         (str "\n" (dispatched-shape-block output)))
+       "\n## Error-path assertions — avoid verbatim strings\n"
+       "When the cell signals failure via an `:error` field (or similar),\n"
+       "do NOT assert on an exact error string unless the brief above\n"
+       "literally specifies that wording. The implementor has no way to\n"
+       "guess your invented message, so a hardcoded `(= \"…\" (:error r))`\n"
+       "becomes unsatisfiable and the impl loop stagnates.\n"
+       "Default to one of:\n"
+       "- `(is (string? (:error result)))`\n"
+       "- `(is (clojure.string/includes? (:error result) \"keyword from the brief\"))`\n"
+       "- `(is (some? (:error result)))`\n"
+       "Only use `(= \"verbatim\" (:error result))` when the brief locks\n"
+       "the wording.\n"
+       "The handler signature is `(fn [resources data] ...)`.\n"
+       "- `resources` is a map. The keys are the cell's `:requires` keywords.\n"
+       "  Their values are the **real runtime objects** (a JDBC DataSource\n"
+       "  for `:db`, an HTTP client for `:http`, etc.) — NOT mock maps that\n"
+       "  pretend to expose framework functions as keyed entries. Do NOT\n"
+       "  fake them as `{:execute-one! (fn ...)}` or `{:get (fn ...)}`.\n"
+       "  If you need to test a `:db` interaction, use a real in-memory\n"
+       "  SQLite DataSource:\n"
+       "    `(next.jdbc/get-datasource {:dbtype \"sqlite\" :dbname (str \"/tmp/test-\" (System/nanoTime) \".sqlite\")})`,\n"
+       "  create the table the cell needs, exercise the handler against it.\n"
+       "- `data` is a flat Clojure map whose keys match the cell's `:input`\n"
+       "  schema *directly*. The schema `{:handle :string}` means the\n"
+       "  handler receives `{:handle \"alice\"}` — NOT `{:input {:handle \"alice\"}}`.\n"
+       "  Never wrap the data under an `:input` or `:output` key.\n\n"
+       "Return ONLY the `deftest` forms. Do NOT include `(ns ...)` or `:require` —\n"
+       "those are added automatically.\n\n"
+       "Example shape (no resources):\n"
        "```clojure\n"
        "(deftest test-basic-case\n"
        "  (let [result (handler {} {:key \"value\"})]\n"
-       "    (is (contains? result :expected-key))\n"
        "    (is (= expected-value (:expected-key result)))))\n"
-       "```\n"))
+       "```\n\n"
+       "Example shape (with `:db` resource):\n"
+       "```clojure\n"
+       "(deftest test-db-interaction\n"
+       "  (let [tmp (str \"/tmp/test-\" (System/nanoTime) \".sqlite\")\n"
+       "        ds  (next.jdbc/get-datasource {:dbtype \"sqlite\" :dbname tmp})]\n"
+       "    (next.jdbc/execute! ds [\"CREATE TABLE foo (id INTEGER PRIMARY KEY, x TEXT)\"])\n"
+       "    (let [result (handler {:db ds} {:x \"hi\"})]\n"
+       "      (is (int? (:id result))))))\n"
+       "```\n"
+       "If the test needs `next.jdbc`, just use it as `next.jdbc/...` —\n"
+       "the test namespace requires it for you.\n")))
 
 (defn- self-review-prompt
   "Builds the self-review prompt for generated tests."
@@ -187,24 +344,119 @@
         session  (llm/create-session (str "test:" cell-id) prompts/cell-prompt)]
     (emit on-event "cell_test" "started" :cell-id cell-id)
 
+    ;; Helper: run a sanity check on a candidate test_body. Returns
+    ;; {:status :ok} when tests load against a passthrough stub cell
+    ;; (and don't all error en masse) — i.e. the contract is at least
+    ;; structurally satisfiable. Returns {:status :error :message ...}
+    ;; when the test code is broken on its face: doesn't compile,
+    ;; references an undefined symbol, errors against every test.
+    (let [cell-id-kw (let [s (str cell-id)]
+                       (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+          schema-parsed (try
+                          (let [raw (binding [*read-eval* false]
+                                      (clojure.edn/read-string (:schema brief)))]
+                            {:input  (:input raw)
+                             :output (:output raw)})
+                          (catch Exception _ {:input [:map] :output [:map]}))
+          check-test-body
+          (fn [body]
+            (let [tc (codegen/assemble-test-source
+                       {:test-ns   test-ns
+                        :cell-ns   cell-ns
+                        :cell-id   cell-id-kw
+                        :test-body body})
+                  stub-src (codegen/assemble-stub-cell-source
+                             {:cell-ns cell-ns
+                              :cell-id cell-id-kw
+                              :doc     (or (:doc brief) "")
+                              :schema  schema-parsed})
+                  ;; Mirror the run_tests fix (Q): clear cell-ns and
+                  ;; test-ns before re-evaluating. Otherwise stale stub
+                  ;; vars and stale deftest vars from EARLIER sanity
+                  ;; checks (in the same JVM) leak into this check and
+                  ;; the run-cell-tests summary lies — `:test 2 :fail 1`
+                  ;; when only one test is in the new contract.
+                  clear    (str
+                             "(when (find-ns '" cell-ns ") (remove-ns '" cell-ns "))\n"
+                             "(when (find-ns '" test-ns ") (remove-ns '" test-ns "))\n")
+                  combined (str clear stub-src "\n\n" tc)
+                  eval-res (ev/eval-code combined)]
+              (cond
+                (not= :ok (:status eval-res))
+                {:status :error
+                 :message (str "Test code did not load against a stub cell: "
+                               (:error eval-res))}
+
+                :else
+                (let [test-res (ev/run-cell-tests tc)
+                      total    (or (get-in test-res [:summary :test]) 0)
+                      errored  (or (get-in test-res [:summary :error]) 0)]
+                  (cond
+                    (not= :ok (:status test-res))
+                    {:status :error
+                     :message (str "Test runner refused the contract: "
+                                   (or (:output test-res) (:error test-res)))}
+
+                    ;; Every single test ERROR'd (not just FAILed). With a
+                    ;; passthrough stub, FAIL is normal — values won't match.
+                    ;; But ERROR almost always means bad refs / type errors
+                    ;; in the test code itself, not in the (yet-unwritten)
+                    ;; handler.
+                    (and (pos? total) (= total errored))
+                    {:status :error
+                     :message (str "All " total " test(s) errored against a stub. "
+                                   "This usually means the test code references "
+                                   "an undefined symbol or has a type mismatch — "
+                                   "the actual implementation can't fix it. First "
+                                   "error: "
+                                   (:message (first (:failures test-res)) "(no detail)"))}
+
+                    :else
+                    {:status :ok})))))]
+
     ;; Generate test body (strip code fences if present)
     (let [test-prompt (build-test-prompt brief)
-          raw-test    (llm/session-send-stream session client test-prompt on-chunk)
+          raw-test    (:content (llm/session-send-stream session client test-prompt on-chunk))
           test-body   (or (extract/extract-first-code-block raw-test) raw-test)]
 
       (emit on-event "cell_test" "written" :cell-id cell-id)
 
       ;; Self-review
       (let [review-prompt (self-review-prompt brief test-body)
-            review-resp   (llm/session-send-stream session client review-prompt on-chunk)
+            review-resp   (:content (llm/session-send-stream session client review-prompt on-chunk))
             ;; If corrections returned, use those instead
-            final-body    (if (str/includes? review-resp "ALL TESTS VERIFIED")
+            after-review  (if (str/includes? review-resp "ALL TESTS VERIFIED")
                             test-body
                             (or (extract/extract-first-code-block review-resp)
                                 test-body))
+            ;; Sanity-check the contract against a passthrough stub. If
+            ;; the test code is structurally broken, ask the LLM to fix
+            ;; it once. We don't loop endlessly — if a single repair
+            ;; doesn't help, hand the broken contract to the implementor
+            ;; and let it edit test.clj as part of its own loop.
+            check1        (check-test-body after-review)
+            final-body
+            (if (= :ok (:status check1))
+              after-review
+              (let [_ (emit on-event "cell_test" "lint_fix"
+                            :cell-id cell-id
+                            :message (:message check1))
+                    fix-prompt (str "Your test code has a structural issue:\n\n"
+                                    (:message check1)
+                                    "\n\nReturn a corrected test body (just the "
+                                    "(deftest ...) forms — no `(ns ...)` or "
+                                    "`:require`, those are added automatically).")
+                    fix-resp   (:content (llm/session-send-stream session client fix-prompt on-chunk))
+                    fixed-body (or (extract/extract-first-code-block fix-resp)
+                                   after-review)
+                    check2     (check-test-body fixed-body)]
+                (if (= :ok (:status check2))
+                  fixed-body
+                  ;; Still broken. Use the fixed body anyway — the
+                  ;; implementor can fall back to editing test.clj. We
+                  ;; don't want to gate forever on a bad contract.
+                  fixed-body)))
             ;; Assemble full test source
-            cell-id-kw    (let [s (str cell-id)]
-                            (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
             test-code     (codegen/assemble-test-source
                             {:test-ns  test-ns
                              :cell-ns  cell-ns
@@ -231,7 +483,7 @@
              :status       "pending"
              :revision     0}))
 
-        contract))))
+        contract)))))
 
 ;; ── Implementation from contract ───────────────────────────────
 
@@ -400,7 +652,12 @@
        "Do NOT include `(ns ...)` or `(cell/defcell ...)` — those are generated for you.\n"))
 
 (defn implement-from-contract
-  "Implements a cell from a test contract using the LLM + eval feedback loop.
+  "Implements a cell from a test contract using the interactive agent loop.
+   The agent loop uses tool-call dispatch (DISPATCH -> REVIEW phases) instead
+   of the old monolithic eval-feedback retry loop.
+
+   Each cell is isolated — it gets its own call graph built dynamically
+   from code it writes.  It does NOT see other cells or the workflow graph.
 
    Options:
      :contract     — test contract map
@@ -408,234 +665,261 @@
      :run-id       — orchestration run ID
      :on-event     — event callback
      :on-chunk     — streaming callback
-     :max-attempts — max fix attempts (default 3)
+     :max-attempts — max fix attempts (default 3) — forwarded as turn-budget
      :project-path — project root directory for writing source files
-     :base-ns      — base namespace for source files"
+     :base-ns      — base namespace for source files
+     :task         — overall orchestration task description"
   [client {:keys [contract store run-id on-event on-chunk max-attempts
-                  project-path base-ns]
-           :or   {max-attempts 3}}]
+                  project-path base-ns task
+                  prev-source change-summary
+                  strategy]
+           :or   {max-attempts 3
+                  strategy     :flat}}]
   (let [{:keys [cell-id brief test-code cell-ns]} contract
-        session (or (:session contract)
-                    (llm/create-session (str "impl:" cell-id) prompts/cell-prompt))]
-    (emit on-event "cell_implement" "started" :cell-id cell-id)
+        cell-id-kw (let [s (str cell-id)]
+                     (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
+        schema-parsed (try
+                        (let [raw (binding [*read-eval* false]
+                                   (clojure.edn/read-string (:schema brief)))
+                              fix-keys (fn fix-keys [v]
+                                         (cond
+                                           (and (map? v) (seq v)
+                                                (every? #(or (string? %) (symbol? %)) (keys v)))
+                                           (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
+                                           (and (map? v) (seq v) (every? keyword? (keys v)))
+                                           v
+                                           (and (vector? v) (= "map" (first v)))
+                                           (into [:map] (map (fn [entry]
+                                                                (if (vector? entry)
+                                                                  [(keyword (first entry)) (keyword (second entry))]
+                                                                  (keyword entry)))
+                                                              (rest v)))
+                                           (string? v) (keyword v)
+                                           (symbol? v) (keyword v)
+                                           :else v))]
+                          {:input  (fix-keys (:input raw))
+                           :output (fix-keys (:output raw))})
+                        (catch Exception _ {:input [:map] :output [:map]}))
+        prev-parts (when prev-source (extract/extract-cell-source-parts prev-source))
+        agent-opts {:client          client
+                    :cell-id         cell-id-kw
+                    :cell-ns         cell-ns
+                    :brief           brief
+                    :test-code       test-code
+                    :schema-parsed   schema-parsed
+                    :turn-budget     max-attempts
+                    :on-event        on-event
+                    :on-chunk        on-chunk
+                    :store           store
+                    :run-id          run-id
+                    :project-path    project-path
+                    :base-ns         base-ns
+                    :task            task
+                    :initial-handler (:handler prev-parts)
+                    :initial-helpers (:helpers prev-parts)
+                    :change-summary  change-summary}]
+    (case strategy
+      :flat
+      (agent-loop/run! agent-opts)
 
-    ;; Pre-parse schema once (used in every iteration)
-    (let [cell-id-kw (let [s (str cell-id)]
-                       (keyword (cond-> s (str/starts-with? s ":") (subs 1))))
-          schema-parsed (try
-                          (let [raw (binding [*read-eval* false]
-                                     (clojure.edn/read-string (:schema brief)))
-                                fix-keys (fn fix-keys [v]
-                                           (cond
-                                             ;; Map with string or symbol keys → keyword-key map (lite Malli)
-                                             (and (map? v)
-                                                  (seq v)
-                                                  (every? #(or (string? %) (symbol? %)) (keys v)))
-                                             (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
-                                             ;; Already keyword-keyed map → pass through (valid lite Malli)
-                                             (and (map? v) (seq v) (every? keyword? (keys v)))
-                                             v
-                                             ;; Vector starting with "map" string → convert to [:map ...]
-                                             (and (vector? v) (= "map" (first v)))
-                                             (into [:map] (map (fn [entry]
-                                                                  (if (vector? entry)
-                                                                    [(keyword (first entry)) (keyword (second entry))]
-                                                                    (keyword entry)))
-                                                                (rest v)))
-                                             ;; String or symbol → keyword
-                                             (string? v) (keyword v)
-                                             (symbol? v) (keyword v)
-                                             :else v))]
-                            {:input  (fix-keys (:input raw))
-                             :output (fix-keys (:output raw))})
-                          (catch Exception _ {:input [:map] :output [:map]}))]
+      :bottom-up
+      ;; Decomposer plans a function tree, leaves get implemented in
+      ;; parallel batches with isolated tests, then the handler runs
+      ;; through agent_loop/run! with all helpers in scope. See
+      ;; sporulator.decomposer + sporulator.tree-implementor.
+      (let [decomp-result
+            ((requiring-resolve 'sporulator.decomposer/assess-and-decompose)
+              client
+              {:cell-id  (str cell-id-kw)
+               :doc      (:doc brief)
+               :schema   (:schema brief)
+               :requires (:requires brief)
+               :test-body (:test-body contract)})]
+        (case (:status decomp-result)
+          :ok
+          (let [tree-result
+                ((requiring-resolve 'sporulator.tree-implementor/run-tree!)
+                  client (:tree decomp-result) agent-opts)]
+            (or (:handler tree-result)
+                {:status :error
+                 :error  "tree-implementor returned no handler result"
+                 :tree-result tree-result}))
 
-    (loop [msg     (build-impl-prompt contract)
-           attempt 0]
-      (let [content  (llm/session-send-stream session client msg on-chunk)
-            raw-code (or (extract/extract-first-code-block content) content)
-            fn-body       (extract/extract-fn-body raw-code)
-            helpers       (extract/extract-helpers raw-code)
-            extra-requires (extract/extract-extra-requires raw-code)]
+          :too-big
+          {:status :error
+           :error  (str "Decomposer flagged this cell as too big for one ns: "
+                        (:reason decomp-result))}
 
-        ;; If we couldn't extract a (fn ...) form, tell the LLM exactly what's wrong
-        (if (and (nil? fn-body) (< attempt max-attempts))
-          (do
-            (emit on-event "cell_implement" "error" :cell-id cell-id
-                  :message "No (fn [resources data] ...) form found" :attempt (inc attempt))
-            (when store
-              (store/save-cell-attempt! store
-                {:run-id run-id :cell-id cell-id :attempt-type "implement"
-                 :attempt-number (inc attempt) :code raw-code
-                 :output "Could not find (fn [resources data] ...) in your response" :passed? false}))
-            (recur (str "Your response did not contain a valid `(fn [resources data] ...)` form.\n\n"
-                        "I received:\n```\n" (subs raw-code 0 (min 500 (count raw-code))) "\n```\n\n"
-                        "You MUST return a `(fn [resources data] ...)` as the LAST form in your response.\n"
-                        "The function should take two arguments:\n"
-                        "- `resources` — map of injected dependencies (e.g. {:db datasource})\n"
-                        "- `data` — map of input data with keyword keys (e.g. {:handle \"user\" :message \"hi\"})\n\n"
-                        "Return ONLY the function. Example:\n"
-                        "```clojure\n(fn [resources data]\n  {:result-key (some-computation (:input-key data))})\n```")
-                   (inc attempt)))
-
-          ;; We have a fn-body (or exhausted attempts) — assemble and eval
-          (let [fn-body (or fn-body '(fn [resources data] data)) ;; last-resort identity
-                source (codegen/assemble-cell-source
-                         {:cell-ns        cell-ns
-                          :cell-id        cell-id-kw
-                          :doc            (or (:doc brief) "")
-                          :schema         schema-parsed
-                          :requires       (mapv keyword (or (:requires brief) []))
-                          :extra-requires (or extra-requires [])
-                          :helpers        (or helpers [])
-                          :fn-body        fn-body})]
-
-        (emit on-event "cell_implement" "written" :cell-id cell-id
-              :attempt (inc attempt))
-
-        ;; Eval cell + tests together (avoids require-can't-find-namespace issue)
-        ;; Replace the cell require in test source so it doesn't try to load from disk
-        (let [test-src-fixed (if cell-ns
-                               (str/replace test-code
-                                 (str "[" cell-ns "]")
-                                 (str "[" cell-ns " :as _cell-ns]"))
-                               test-code)
-              combined (str source "\n\n" test-src-fixed)
-              eval-res (ev/eval-code combined)]
-          (if (not= :ok (:status eval-res))
-            ;; Eval failed (cell or test loading)
-            (do
-              (emit on-event "cell_implement" "error" :cell-id cell-id
-                    :message (:error eval-res) :attempt (inc attempt))
-              (when store
-                (store/save-cell-attempt! store
-                  {:run-id run-id :cell-id cell-id :attempt-type "implement"
-                   :attempt-number (inc attempt) :code source
-                   :output (:error eval-res) :passed? false}))
-              (if (< attempt max-attempts)
-                (recur (str "The code produced this error when evaluated:\n```\n"
-                            (:error eval-res)
-                            "\n```\n\n"
-                            "Your handler function (which was assembled into the cell) was:\n```clojure\n"
-                            (pr-str fn-body)
-                            "\n```\n\n"
-                            "Please fix and return ONLY the corrected `(fn [resources data] ...)` handler.\n"
-                            "Remember:\n"
-                            "- Input data uses KEYWORD keys like `:handle`, `:message` (not strings)\n"
-                            "- Return a map with KEYWORD keys\n"
-                            "- Do NOT include (ns ...) or (cell/defcell ...) — those are generated for you")
-                       (inc attempt))
-                {:status :error :error (:error eval-res) :cell-id cell-id}))
-
-            ;; Eval succeeded — run the tests from the loaded test namespace
-            (let [test-ns-name (second (re-find #"\(ns\s+(\S+)" test-code))
-                  test-ns      (when test-ns-name (find-ns (symbol test-ns-name)))
-                  test-res     (if test-ns
-                                 ;; Run tests via clojure.test
-                                 (let [out       (java.io.StringWriter.)
-                                       counters  (atom {:test 0 :pass 0 :fail 0 :error 0})
-                                       reporter  (fn [m]
-                                                   (case (:type m)
-                                                     :begin-test-ns nil
-                                                     :end-test-ns nil
-                                                     :begin-test-var (swap! counters update :test inc)
-                                                     :pass (swap! counters update :pass inc)
-                                                     :fail (do (swap! counters update :fail inc)
-                                                               (.write out
-                                                                 (str "\nFAIL in " (clojure.test/testing-vars-str m) "\n"
-                                                                      (:message m "")
-                                                                      "\nexpected: " (pr-str (:expected m))
-                                                                      "\n  actual: " (pr-str (:actual m)) "\n")))
-                                                     :error (do (swap! counters update :error inc)
-                                                                (.write out
-                                                                  (str "\nERROR in " (clojure.test/testing-vars-str m) "\n"
-                                                                       (:message m "")
-                                                                       "\n  actual: " (pr-str (:actual m)) "\n")))
-                                                     :summary nil
-                                                     nil))
-                                       _         (binding [*out* out
-                                                           clojure.test/report reporter]
-                                                   (clojure.test/run-tests test-ns))
-                                       summary   @counters]
-                                   {:status  :ok
-                                    :passed? (and (zero? (:fail summary))
-                                                  (zero? (:error summary)))
-                                    :summary summary
-                                    :output  (str (:output eval-res) (str out))})
-                                 ;; Test namespace not found
-                                 {:status :error
-                                  :error  (str "Test namespace not found: " test-ns-name)
-                                  :output (:output eval-res)})]
-              (when store
-                (store/save-cell-attempt! store
-                  {:run-id run-id :cell-id cell-id :attempt-type "test"
-                   :attempt-number (inc attempt) :code source
-                   :test-code test-code
-                   :output (:output test-res)
-                   :passed? (and (= :ok (:status test-res)) (:passed? test-res))}))
-
-              (cond
-                ;; Tests not runnable
-                (not= :ok (:status test-res))
-                (do
-                  (emit on-event "cell_test" "error" :cell-id cell-id
-                        :message (:error test-res))
-                  (if (< attempt max-attempts)
-                    (recur (str "Tests failed to load with this error:\n```\n"
-                                (:error test-res)
-                                "\n```\n\n"
-                                "Your handler was:\n```clojure\n" (pr-str fn-body) "\n```\n\n"
-                                "Please fix and return ONLY the corrected `(fn [resources data] ...)` handler.\n"
-                                "Remember: use KEYWORD keys (:handle, :message) not string keys.")
-                           (inc attempt))
-                    {:status :error :error (:error test-res) :cell-id cell-id}))
-
-                ;; Tests passed
-                (:passed? test-res)
-                (let [formatted-source (format-source source)]
-                  (emit on-event "cell_test" "passed" :cell-id cell-id
-                        :attempt (inc attempt))
-                  ;; Save cell to store
-                  (when store
-                    (let [defcell-code (extract/extract-defcell content)]
-                      (store/save-cell! store
-                        {:id         cell-id
-                         :handler    (format-source (or defcell-code source))
-                         :schema     (or (:schema brief) "")
-                         :doc        (or (:doc brief) "")
-                         :created-by "cell-agent-tdd"})))
-                  ;; Write formatted source file to disk
-                  (when (and project-path base-ns)
-                    (source-gen/write-cell! project-path base-ns cell-id formatted-source)
-                    (emit on-event "cell_implement" "file_written"
-                          :cell-id cell-id))
-                  {:status :ok :cell-id cell-id
-                   :output (:output test-res)
-                   :summary (:summary test-res)})
-
-                ;; Tests failed — retry
-                :else
-                (do
-                  (emit on-event "cell_test" "failed" :cell-id cell-id
-                        :attempt (inc attempt))
-                  (if (< attempt max-attempts)
-                    (let [fix-prompt (prompts/build-graduated-fix-prompt
-                                      {:test-output (:output test-res)
-                                       :test-code   test-code
-                                       :impl-code   source
-                                       :brief       brief
-                                       :cell-id     cell-id
-                                       :attempt     (inc attempt)
-                                       :max-attempts max-attempts})]
-                      (recur fix-prompt (inc attempt)))
-                    {:status :error
-                     :error  (str "Tests failed after " (inc attempt) " attempts")
-                     :cell-id cell-id
-                     :output (:output test-res)})))))))))))))
+          ;; :error / unknown — fall back to flat to avoid blocking
+          (do (on-event {:phase  "tree_decomposer"
+                         :status "fallback_to_flat"
+                         :reason (:reason decomp-result)})
+              (agent-loop/run! agent-opts)))))))
 ;; ── Main orchestration ─────────────────────────────────────────
 
+(defn- bare-cell-id
+  "Strips the leading colon from a cell-id string. ':guestbook/x' → 'guestbook/x'."
+  [cell-id]
+  (let [s (str cell-id)]
+    (cond-> s (str/starts-with? s ":") (subs 1))))
+
+(defn- cell-id-keyword
+  "Normalises a cell-id (string or keyword) to a keyword for diff comparisons."
+  [cell-id]
+  (if (keyword? cell-id) cell-id (keyword (bare-cell-id cell-id))))
+
+(defn- build-cell-class-index
+  "Given a manifest-diff result, returns {cell-id-keyword → :added/:removed/...}."
+  [diff-result]
+  (reduce (fn [m k]
+            (reduce #(assoc %1 %2 k) m (get diff-result k)))
+          {}
+          [:added :removed :schema-changed :doc-changed :unchanged]))
+
+(defn- prior-test-code
+  "Returns the test_code from the prior run for a cell-id, or nil."
+  [store run-id cell-id]
+  (when (and store run-id)
+    (let [bare (bare-cell-id cell-id)
+          ;; Test contracts are stored with the leading-colon form.
+          contract (or (store/get-test-contract store run-id (str ":" bare))
+                       (store/get-test-contract store run-id bare))]
+      (:test-code contract))))
+
+(defn- carry-over-result
+  "Builds a synthetic :ok result for a carried-over cell so downstream
+   reporting treats it identically to a freshly-implemented cell."
+  [cell-id]
+  {:status :ok :cell-id (cell-id-keyword cell-id) :carried-over? true})
+
+;; ── Architect repair loop ─────────────────────────────────────
+;;
+;; When the manifest fails edge-validation, we re-spawn the graph-agent
+;; with the structured errors as a hint and ask for an amendment.
+;; Reuses graph-agent/chat-stream-with-feedback's internal validate-
+;; loop, which already retries when the LLM returns a still-broken
+;; manifest. After the architect responds with a candidate, we re-run
+;; validate-edges; if still :error, retry up to `max-retries` more
+;; times. The fix may legitimately need several rounds — surfacing a
+;; second-order issue only after the first is addressed is normal.
+
+(defn- format-validation-hint
+  "Renders a manifest-validation result as a multi-line message the
+   architect can use to amend the manifest. Includes the structured
+   error list AND a canonical-form recipe so the architect doesn't
+   keep inventing `:any`/`[:?]`/etc. workarounds."
+  [validation]
+  (str/trim
+    (str (mv/format-issues
+           (select-keys validation [:issues :mismatches]))
+         "\n\n"
+         "## Canonical schema forms (use these exactly)\n\n"
+         "**Required map entry:** `[:k :type]`\n"
+         "**Optional map entry:** `[:k {:optional true} :type]`\n"
+         "**Map with mixed required + optional fields:**\n"
+         "  `[:map [:id :int] [:filter {:optional true} [:enum \"a\" \"b\"]]]`\n"
+         "**Forbidden:** `:output :any` — every cell must declare what it produces\n"
+         "**Forbidden in map entries:** `[:? :type]`, `[:* :type]`, `[:+ :type]` — "
+         "those are SEQUENCE schemas, not optional markers. Use `{:optional true}` "
+         "in the entry props instead.\n\n"
+         "## When a cell has multiple outgoing edges (dispatched edges)\n\n"
+         "If a cell's `:edges` entry is a map (e.g. "
+         "`{:list :a, :add :b, :toggle :c}`), the cell must declare a "
+         "**per-transition `:output`** — a map keyed by the same transition "
+         "labels, where each value is a `[:map ...]` describing the data "
+         "shape produced on THAT transition. Each transition's output must "
+         "supply every REQUIRED key the corresponding target cell's `:input` "
+         "declares.\n\n"
+         "Example for a router with three branches:\n"
+         "```clojure\n"
+         ":output {:list   [:map [:filter {:optional true} [:enum \"all\" \"active\"]]]\n"
+         "         :add    [:map [:title :string]]\n"
+         "         :toggle [:map [:id :int]]}\n"
+         "```\n\n"
+         "A single-shape `:output` with all-optional keys does NOT satisfy "
+         "downstream consumers that require those keys — the producer's "
+         "REQUIRED keys are what counts.\n\n"
+         "Return the corrected manifest as a single EDN block in a "
+         "```clojure``` fence — no commentary outside the fence.")))
+
+(defn- ask-architect-to-repair!
+  "One repair turn — sends the validation report to the graph-agent
+   and returns whatever manifest it parses back (or the original if
+   the LLM didn't return a parseable manifest). The session is shared
+   across all attempts in one repair-manifest! loop so the architect
+   accumulates feedback rather than starting from scratch each turn.
+
+   We use `llm/session-send-stream` directly (rather than
+   chat-stream-with-feedback) because our enclosing repair-manifest!
+   loop already handles retries — chaining two feedback loops just
+   confused the response-shape contract.
+
+   `attempt 0` includes the full manifest in the prompt; subsequent
+   attempts include only the validation diff so the architect doesn't
+   waste tokens re-reading what's already in its session."
+  [client session manifest validation attempt {:keys [on-event on-chunk]}]
+  (let [hint    (format-validation-hint validation)
+        prompt  (if (zero? attempt)
+                  (str "The manifest you produced has schema-compatibility "
+                       "issues. Here is the current manifest:\n\n```edn\n"
+                       (pr-str manifest) "\n```\n\n"
+                       "Validation report:\n" hint)
+                  (str "Your last amendment still has issues. Validation "
+                       "report:\n" hint
+                       "\n\nReturn another corrected manifest."))
+        _       (emit on-event "manifest_repair" "started" :attempt attempt)
+        resp    (llm/session-send-stream session client prompt
+                  (or on-chunk (fn [_])))
+        content (:content resp)
+        amended (graph-agent/extract-manifest content)]
+    (or amended manifest)))
+
+(defn repair-manifest!
+  "Drives the architect repair loop until validate-edges is clean OR
+   we hit `max-retries`. The architect sees ONE persistent LLM session
+   across all attempts, so it accumulates context (the original
+   manifest, prior attempts, prior errors) rather than starting from
+   scratch every turn — important for second-order issues that only
+   surface once a first-order issue is fixed.
+
+   Returns
+     {:status :ok        :manifest <amended>}
+     {:status :exhausted :manifest <last-attempt> :validation <last-errors>}"
+  [client initial-manifest initial-validation
+   {:keys [max-retries run-id on-event on-chunk]
+    :or   {max-retries 3}
+    :as   opts}]
+  (let [session-id (or (:session-id opts)
+                       (str "manifest-repair-" run-id))
+        ;; One session for the whole loop — accumulates feedback.
+        session    (llm/create-session session-id prompts/graph-prompt)]
+    (loop [attempt    0
+           manifest   initial-manifest
+           validation initial-validation]
+      (cond
+        (= :ok (:status validation))
+        {:status :ok :manifest manifest}
+
+        (>= attempt max-retries)
+        (do (emit on-event "manifest_repair" "exhausted"
+                  :attempts attempt)
+            {:status :exhausted :manifest manifest :validation validation})
+
+        :else
+        (let [_         (emit on-event "manifest_repair" "attempting"
+                              :attempt attempt)
+              new-mani  (ask-architect-to-repair! client session manifest
+                                                  validation attempt opts)
+              new-valid (mv/validate-edges new-mani)]
+          (when (= :ok (:status new-valid))
+            (emit on-event "manifest_repair" "succeeded"
+                  :attempts (inc attempt)))
+          (recur (inc attempt) new-mani new-valid))))))
+
 (defn orchestrate!
-  "Runs the full TDD orchestration for a set of leaf cells.
+  "Runs the full TDD orchestration for a set of leaf cells, diff-aware:
+   compares the supplied manifest against the latest green snapshot for
+   `manifest-id` and only regenerates cells whose contract changed.
 
    Options:
      :leaves        — vector of leaf cell maps (cell-id, doc, schemas, etc.)
@@ -653,10 +937,72 @@
                   spec-hash project-path]
            :or   {auto-approve? false max-attempts 3
                   manifest-id "" spec-hash ""}
-           :as   opts}]
+           :as   _opts}]
   (let [run-id  (str "run-" (System/nanoTime))
         on-event (or on-event (fn [_]))
-        on-chunk (or on-chunk (fn [_]))]
+        on-chunk (or on-chunk (fn [_]))
+        ;; Canonical manifest-id form (no leading colon) for snapshots
+        ;; and run records.
+        manifest-id (manifest-diff/normalize-manifest-id manifest-id)
+        ;; Manifest gate — if the architect's manifest has opaque
+        ;; outputs or schema mismatches between cells sharing an edge,
+        ;; the run is doomed before it starts. Bail before spending
+        ;; LLM tokens on test-gen / impl. Uses the schema-only
+        ;; validator (validate-edges); structural minutiae are
+        ;; mycelium's concern at workflow-compile time.
+        ;;
+        ;; If validation fails AND we have an LLM client, run the
+        ;; architect repair loop: re-spawn the graph-agent with the
+        ;; structured errors and ask for an amendment. Repeat until
+        ;; the manifest is clean or we exhaust retries. If the architect
+        ;; can't fix it, fail the run with `manifest_invalid` so the
+        ;; caller can surface the unresolved errors to a human.
+        initial-validation (when manifest (mv/validate-edges manifest))
+        repair-result      (when (and client manifest
+                                      (= :error (:status initial-validation)))
+                             (repair-manifest! client manifest initial-validation
+                               {:run-id   run-id
+                                :store    store
+                                :on-event on-event
+                                :on-chunk on-chunk}))
+        manifest           (if repair-result (:manifest repair-result) manifest)
+        validation         (cond
+                             ;; Repair ran AND succeeded → clean.
+                             (and repair-result (= :ok (:status repair-result)))
+                             {:status :ok}
+
+                             ;; Repair ran AND exhausted → return its
+                             ;; last validation as the failure to surface.
+                             (and repair-result (= :exhausted (:status repair-result)))
+                             (:validation repair-result)
+
+                             ;; No repair attempted (no client, no manifest, or
+                             ;; it was already valid).
+                             :else
+                             initial-validation)]
+    (if (= :error (:status validation))
+      (do
+        (emit on-event "manifest" "invalid"
+              :issues     (or (:issues validation) [])
+              :mismatches (mapv #(select-keys % [:source-name :target-name
+                                                  :missing-fields :type-diffs])
+                                (or (:mismatches validation) [])))
+        {"status"     "manifest_invalid"
+         "run_id"     run-id
+         :issues      (:issues validation)
+         :mismatches  (:mismatches validation)
+         :manifest    manifest})
+      (do
+        ;; If the architect amended the manifest during repair,
+        ;; persist the new version to disk so subsequent runs see it
+        ;; (and so callers can inspect what changed). Mirrors the
+        ;; write-manifest! call already in start-orchestration!.
+        (when (and repair-result
+                   (= :ok (:status repair-result))
+                   project-path manifest)
+          (source-gen/write-manifest! project-path base-ns
+            (or (when (seq manifest-id) manifest-id) (str (:id manifest)))
+            (pr-str manifest)))
 
     ;; Create run in store
     (when store
@@ -668,55 +1014,155 @@
 
     (emit on-event "manifest" "started" :run-id run-id)
 
-    ;; Build reverse mapping: cell-id → cell-name (for graph context lookup)
-    (let [id->cell-name (when manifest
-                          (into {} (map (fn [[cell-name cell-def]]
-                                         [(:id cell-def) cell-name]))
-                                (:cells manifest)))
+    ;; ── Diff against the previous green snapshot ──────────────────
+    (let [prev-snapshot   (when (and store (seq manifest-id))
+                            (store/get-latest-green-snapshot store manifest-id))
+          prev-manifest   (when prev-snapshot
+                            (let [parsed (mv/parse-manifest (:body prev-snapshot))]
+                              (when-not (:error parsed) parsed)))
+          diff-result     (manifest-diff/diff prev-manifest manifest)
+          cell-class      (build-cell-class-index diff-result)
+          prev-cells-by-id (manifest-diff/cells-by-id prev-manifest)
+          new-cells-by-id  (manifest-diff/cells-by-id manifest)
+          actionable?      (fn [cell-id]
+                             (let [k (cell-id-keyword cell-id)]
+                               (#{:added :schema-changed :doc-changed} (get cell-class k))))]
 
-          ;; Load resource docs from system.edn
-          resource-docs (when project-path
-                          (extract-resource-docs
-                            (read-system-edn (str project-path "/resources/system.edn"))))
+      ;; Emit carry-over events for unchanged cells
+      (doseq [cid (:unchanged diff-result)]
+        (emit on-event "cell_carry_over" "skipped" :cell-id cid))
 
-          ;; Build briefs from leaves (accept both kebab and underscore keys from JSON)
-          briefs (mapv (fn [leaf]
-                         (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
-                               doc (or (:doc leaf) "")
-                               input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
-                               output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
-                               requires (or (:requires leaf) [])
-                               ;; Build graph context from manifest
-                               cell-name (when id->cell-name
-                                           (get id->cell-name (keyword cell-id)
-                                                (get id->cell-name cell-id)))
-                               context (when (and manifest cell-name)
-                                         (let [ctx (mv/build-graph-context manifest cell-name)]
-                                           (mv/format-graph-context ctx)))]
-                           {:id            cell-id
-                            :doc           doc
-                            :schema        (str "{:input " input-schema " :output " output-schema "}")
-                            :requires      requires
-                            :resource-docs resource-docs
-                            :context       context}))
-                       leaves)]
+      ;; Handle removed cells: deprecate in store + delete file
+      (doseq [cid (:removed diff-result)]
+        (when store (store/deprecate-cell! store (bare-cell-id cid)))
+        (when (and project-path base-ns)
+          (try
+            (source-gen/delete-cell! project-path base-ns (bare-cell-id cid))
+            (catch Exception _ nil)))
+        (emit on-event "cell_remove" "done" :cell-id cid))
 
-      ;; Phase 1: Generate test contracts
+      ;; Build reverse mapping: cell-id → cell-name (for graph context lookup)
+      (let [id->cell-name (when manifest
+                            (into {} (map (fn [[cell-name cell-def]]
+                                            [(:id cell-def) cell-name]))
+                                  (:cells manifest)))
+
+            ;; Load resource docs + fixtures from system.edn.
+            sys-edn           (when project-path
+                                (read-system-edn (str project-path "/resources/system.edn")))
+            resource-docs     (extract-resource-docs sys-edn)
+            resource-fixtures (extract-resource-fixtures sys-edn)
+
+            ;; Filter leaves to only those that need regeneration. Carry-over
+            ;; and removed cells are handled above; we don't waste LLM calls
+            ;; on them.
+            actionable-leaves (filterv (fn [leaf]
+                                         (actionable? (or (:cell-id leaf)
+                                                          (:cell_id leaf))))
+                                       leaves)
+
+            ;; Build briefs from actionable leaves. Schemas are sourced
+            ;; from the (possibly-amended) manifest's cell definition,
+            ;; not from the leaf — the architect repair loop may have
+            ;; rewritten the manifest's schemas, and leaves passed in
+            ;; by the caller don't get amended in lockstep. Falling back
+            ;; to the leaf's input/output strings when no manifest cell
+            ;; is found lets old test fixtures (or callers without a
+            ;; manifest) keep working.
+            briefs (mapv (fn [leaf]
+                           (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
+                                 ;; Cell-ids may arrive with a leading colon
+                                 ;; (e.g. ":todomvc/foo" from (str kw)). Strip
+                                 ;; before keywordizing so the id->cell-name
+                                 ;; lookup actually hits.
+                                 cell-id-bare (let [s (str cell-id)]
+                                                (cond-> s (str/starts-with? s ":") (subs 1)))
+                                 cell-name (when id->cell-name
+                                             (or (get id->cell-name (keyword cell-id-bare))
+                                                 (get id->cell-name cell-id-bare)))
+                                 manifest-cell (when (and manifest cell-name)
+                                                 (get-in manifest [:cells cell-name]))
+                                 doc (or (:doc manifest-cell)
+                                         (:doc leaf)
+                                         "")
+                                 m-in  (get-in manifest-cell [:schema :input])
+                                 m-out (get-in manifest-cell [:schema :output])
+                                 input-schema  (if m-in
+                                                 (pr-str m-in)
+                                                 (or (:input-schema leaf)
+                                                     (:input_schema leaf) "{}"))
+                                 output-schema (if m-out
+                                                 (pr-str m-out)
+                                                 (or (:output-schema leaf)
+                                                     (:output_schema leaf) "{}"))
+                                 requires (or (:requires manifest-cell)
+                                              (:requires leaf) [])
+                                 context (when (and manifest cell-name)
+                                           (let [ctx (mv/build-graph-context manifest cell-name)]
+                                             (mv/format-graph-context ctx)))]
+                             {:id                cell-id
+                              :doc               doc
+                              :schema            (str "{:input " input-schema " :output " output-schema "}")
+                              :requires          requires
+                              :resource-docs     resource-docs
+                              :resource-fixtures resource-fixtures
+                              :context           context}))
+                         actionable-leaves)]
+
+      ;; Phase 1: Generate test contracts.
+      ;; For :doc-changed cells we reuse the prior run's test contract since
+      ;; the schema and resources haven't moved — only the doc.
       (emit on-event "cell_test" "started" :message "Generating test contracts")
-      (let [contracts (mapv (fn [brief]
-                              (try
-                                (generate-test-contract client
-                                  {:brief    brief
-                                   :base-ns  base-ns
-                                   :store    store
-                                   :run-id   run-id
-                                   :on-event on-event
-                                   :on-chunk on-chunk})
-                                (catch Exception e
-                                  {:cell-id (:id brief)
-                                   :error   (.getMessage e)})))
-                            briefs)
-            ;; Split into good and failed
+      (let [prev-run-id (:run-id prev-snapshot)
+            contracts
+            (mapv (fn [brief]
+                    (let [class (get cell-class (cell-id-keyword (:id brief)))]
+                      (try
+                        (if (and (= class :doc-changed) prev-run-id)
+                          (let [test-code (prior-test-code store prev-run-id (:id brief))]
+                            (if (seq test-code)
+                              (let [stored-cell-id (str (cell-id-keyword (:id brief)))
+                                    contract {:cell-id   stored-cell-id
+                                              :test-code test-code
+                                              :test-body test-code
+                                              :run-id    run-id
+                                              :brief     brief
+                                              :cell-ns   (cell-ns-name base-ns (:id brief))
+                                              :reused?   true}]
+                                ;; Persist a row for this run-id so future
+                                ;; green snapshots can locate the contract
+                                ;; via this run-id without falling back to
+                                ;; fresh generation.
+                                (when store
+                                  (store/save-test-contract! store
+                                    {:run-id    run-id
+                                     :cell-id   stored-cell-id
+                                     :test-code test-code
+                                     :test-body test-code
+                                     :status    "approved"})
+                                  (emit on-event "test_review" "reused"
+                                        :cell-id stored-cell-id
+                                        :message "doc-only change; reused prior test contract"))
+                                contract)
+                              ;; No prior contract found; fall back to fresh.
+                              (generate-test-contract client
+                                {:brief    brief
+                                 :base-ns  base-ns
+                                 :store    store
+                                 :run-id   run-id
+                                 :on-event on-event
+                                 :on-chunk on-chunk})))
+                          (generate-test-contract client
+                            {:brief    brief
+                             :base-ns  base-ns
+                             :store    store
+                             :run-id   run-id
+                             :on-event on-event
+                             :on-chunk on-chunk}))
+                        (catch Exception e
+                          {:cell-id (:id brief)
+                           :error   (.getMessage e)}))))
+                  briefs)
             good-contracts (filterv :test-code contracts)
             failed         (filterv :error contracts)]
 
@@ -767,29 +1213,48 @@
                            ;; No review callback — auto-approve
                            good-contracts))]
 
-          ;; Phase 3: Implement approved contracts in parallel
+          ;; Phase 3: Implement approved contracts in parallel.
+          ;; Edit-mode opts (prev-source + change-summary) are computed
+          ;; per-cell from the diff classification.
           (emit on-event "cell_implement" "started"
                 :message (str "Implementing " (count approved) " cells"))
           (let [impl-futures
                 (mapv (fn [contract]
                         (future
                           (try
-                            (implement-from-contract client
-                              {:contract     contract
-                               :store        store
-                               :run-id       run-id
-                               :on-event     on-event
-                               :on-chunk     on-chunk
-                               :max-attempts max-attempts
-                               :project-path project-path
-                               :base-ns      base-ns})
+                            (let [cid-kw   (cell-id-keyword (:cell-id contract))
+                                  class    (get cell-class cid-kw)
+                                  edit?    (#{:doc-changed :schema-changed} class)
+                                  ;; Fresh-mode: see approve-tests! comment.
+                                  ;; Edit-mode anchored the agent on broken
+                                  ;; prior patterns; fresh regenerated cleanly.
+                                  summary  (when edit?
+                                             (manifest-diff/change-summary
+                                               (get prev-cells-by-id cid-kw)
+                                               (get new-cells-by-id cid-kw)))]
+                              (implement-from-contract client
+                                {:contract        contract
+                                 :store           store
+                                 :run-id          run-id
+                                 :on-event        on-event
+                                 :on-chunk        on-chunk
+                                 :max-attempts    max-attempts
+                                 :project-path    project-path
+                                 :base-ns         base-ns
+                                 :prev-source     nil
+                                 :change-summary  summary}))
                             (catch Exception e
                               {:status  :error
                                :cell-id (:cell-id contract)
                                :error   (.getMessage e)}))))
                       approved)
                 impl-results (mapv deref impl-futures)
-                passed  (filterv #(= :ok (:status %)) impl-results)
+                ;; Synthesize :ok results for cells that were carried over
+                ;; — they didn't run through the implementor but downstream
+                ;; reporting and the green snapshot still need to count them.
+                carry-over-results (mapv carry-over-result (:unchanged diff-result))
+                all-results (into impl-results carry-over-results)
+                passed  (filterv #(= :ok (:status %)) all-results)
                 failed-impl (filterv #(not= :ok (:status %)) impl-results)]
 
             ;; Phase 4: Post-implementation workflow compilation check
@@ -805,25 +1270,144 @@
                   (emit on-event "compile" "failed"
                         :error (.getMessage e)))))
 
-            ;; Update run status and tree
-            (let [final-status (if (and (empty? failed) (empty? failed-impl))
-                                 "completed" "partial")
-                  tree-json    (json/write-str
-                                 {:passed (mapv :cell-id passed)
-                                  :failed (into (mapv :cell-id failed)
-                                                (mapv :cell-id failed-impl))})]
-              (when store
-                (store/update-run-tree! store run-id final-status tree-json))
-              (emit on-event "complete" "done"
-                    :passed (count passed)
-                    :failed (+ (count failed) (count failed-impl)))
+            ;; Smoke-test the assembled workflow before declaring victory.
+            ;; Per-cell tests verify each cell in isolation, but they don't
+            ;; catch integration-level mismatches like:
+            ;; - chain-validator errors (cell outputs don't supply the keys
+            ;;   downstream cells need)
+            ;; - schema-form errors that only surface when malli actually
+            ;;   tries to validate input/output (e.g. invented `[:?]` shapes)
+            ;; The smoke test pre-compiles the manifest and runs a synthetic
+            ;; request through it. Failure means we have a green-per-cell
+            ;; but red-as-a-whole workflow — don't record a green snapshot.
+            (let [all-cells-green?  (and (empty? failed) (empty? failed-impl))
+                  ;; Smoke test only runs when:
+                  ;; - all per-cell tests passed (no point smoking a known-broken graph)
+                  ;; - the caller supplied a project-path (so we can locate
+                  ;;   system.edn for fixtures + the manifest is real)
+                  smoke-runnable?   (and all-cells-green? (seq project-path) manifest)
+                  resource-fixtures (when smoke-runnable?
+                                      (extract-resource-fixtures
+                                        (read-system-edn
+                                          (str project-path "/resources/system.edn"))))
+                  ;; One-shot smoke runner — used both for the initial run
+                  ;; and for verifying after each auto-feedback retry.
+                  run-smoke!
+                  (fn []
+                    (try (smoke/smoke-test!
+                           {:manifest          manifest
+                            :resource-fixtures resource-fixtures})
+                         (catch Throwable t
+                           {:status :error :phase :exception
+                            :message (.getMessage t)})))
+                  ;; Re-implementation closure: when smoke fails with a
+                  ;; localizable :cell-id, re-spawn the cell-implementor
+                  ;; for that cell with the smoke error as a task hint.
+                  ;; Returns true if a re-impl was attempted.
+                  contracts-by-cell (into {} (map (juxt :cell-id identity)) approved)
+                  re-implement-with-hint!
+                  (fn [cell-id hint]
+                    (when-let [contract (get contracts-by-cell (str cell-id))]
+                      (let [cid-kw  (cell-id-keyword (:cell-id contract))
+                            class   (get cell-class cid-kw)
+                            edit?   (#{:doc-changed :schema-changed} class)
+                            summary (when edit?
+                                      (manifest-diff/change-summary
+                                        (get prev-cells-by-id cid-kw)
+                                        (get new-cells-by-id cid-kw)))
+                            task    (str "The workflow integration smoke test "
+                                         "failed at this cell. Concretely:\n\n"
+                                         hint
+                                         "\n\nFix the cell so the smoke test "
+                                         "passes; the per-cell tests must "
+                                         "still hold.")]
+                        (emit on-event "smoke_feedback" "re_implementing"
+                              :cell_id (str cell-id) :hint hint)
+                        (implement-from-contract client
+                          {:contract       contract
+                           :store          store
+                           :run-id         run-id
+                           :on-event       on-event
+                           :on-chunk       on-chunk
+                           :max-attempts   max-attempts
+                           :project-path   project-path
+                           :base-ns        base-ns
+                           :prev-source    nil
+                           :change-summary summary
+                           :task           task})
+                        true)))
+                  ;; Smoke + retry loop. Cap at 2 retries: a real
+                  ;; architecture bug won't be fixed by re-running the
+                  ;; same agent, so don't burn budget chasing it.
+                  smoke-result
+                  (when smoke-runnable?
+                    (emit on-event "smoke_test" "started")
+                    (loop [attempt 0]
+                      (let [result (run-smoke!)]
+                        (cond
+                          (= :ok (:status result))
+                          result
 
-              {"status"      (if (= "completed" final-status) "ok" "partial")
-               "run_id"      run-id
-               "passed"      (mapv :cell-id passed)
-               "failed"      (into (mapv :cell-id failed)
-                                   (mapv :cell-id failed-impl))
-               :results      impl-results})))))))
+                          (>= attempt 2)
+                          result
+
+                          (and (:cell-id result)
+                               (re-implement-with-hint!
+                                 (:cell-id result)
+                                 (smoke/format-error result)))
+                          (recur (inc attempt))
+
+                          :else
+                          result))))
+                  smoke-ok?        (or (nil? smoke-result)
+                                       (= :ok (:status smoke-result)))]
+              (when smoke-result
+                (if smoke-ok?
+                  (emit on-event "smoke_test" "passed")
+                  (emit on-event "smoke_test" "failed"
+                        :phase   (some-> (:phase smoke-result) name)
+                        :cell_id (some-> (:cell-id smoke-result) str)
+                        :message (smoke/format-error smoke-result))))
+
+              ;; On full success (cells green AND smoke passes), record a
+              ;; new green snapshot so subsequent runs can diff against this
+              ;; manifest version.
+              (when (and store (seq manifest-id) manifest
+                         all-cells-green? smoke-ok?)
+                (let [m-row (store/get-latest-manifest store manifest-id)]
+                  (store/save-green-snapshot! store
+                    {:manifest-id      manifest-id
+                     :manifest-version (or (:version m-row) 1)
+                     :body             (or (:body m-row) (pr-str manifest))
+                     :run-id           run-id})))
+
+              ;; Update run status and tree
+              (let [final-status (cond
+                                   (not all-cells-green?) "partial"
+                                   (not smoke-ok?)        "smoke_failed"
+                                   :else                  "completed")
+                    tree-json    (json/write-str
+                                   {:passed (mapv :cell-id passed)
+                                    :failed (into (mapv :cell-id failed)
+                                                  (mapv :cell-id failed-impl))})]
+                (when store
+                  (store/update-run-tree! store run-id final-status tree-json))
+                (emit on-event "complete" "done"
+                      :passed (count passed)
+                      :failed (+ (count failed) (count failed-impl))
+                      :smoke (if smoke-ok? "ok" "failed"))
+
+                {"status"        (case final-status
+                                   "completed"    "ok"
+                                   "smoke_failed" "smoke_failed"
+                                   "partial"      "partial")
+                 "run_id"        run-id
+                 "passed"        (mapv :cell-id passed)
+                 "failed"        (into (mapv :cell-id failed)
+                                       (mapv :cell-id failed-impl))
+                 :results        all-results
+                 :diff           diff-result
+                 :smoke-result   smoke-result})))))))))))
 
 ;; ── Resume ─────────────────────────────────────────────────────
 
@@ -910,54 +1494,107 @@
                  (get-in @runs [run-id :cells]))))
 
 (defn- check-orchestration-complete!
-  "Checks if all cells are done and emits orchestration_complete if so."
+  "Checks if all cells are done and emits orchestration_complete if so.
+   On full success, records a new green snapshot so subsequent runs can
+   diff against this manifest version."
   [run-id]
   (let [run    (get @runs run-id)
         cells  (:cells run)
         total  (count cells)
         done   (count (filter #(= :done (:status (val %))) cells))]
     (when (= done total)
-      (let [on-event (get-in run [:callbacks :on-event])
-            cell-ids (keys cells)]
-        (when (:store run)
-          (store/update-run-tree! (:store run) run-id "completed"
+      (let [on-event    (get-in run [:callbacks :on-event])
+            cell-ids    (keys cells)
+            store       (:store run)
+            manifest-id (:manifest-id run)
+            manifest    (:manifest run)]
+        (when store
+          (store/update-run-tree! store run-id "completed"
             (json/write-str {:passed (vec cell-ids) :failed []})))
+        ;; Record the new green baseline. Diff-aware re-runs against this
+        ;; manifest will now see the freshly-implemented cells as
+        ;; :unchanged.
+        (when (and store (seq manifest-id) manifest)
+          (let [m-row (store/get-latest-manifest store manifest-id)]
+            (store/save-green-snapshot! store
+              {:manifest-id      manifest-id
+               :manifest-version (or (:version m-row) 1)
+               :body             (or (:body m-row) (pr-str manifest))
+               :run-id           run-id})))
         (emit on-event "complete" "done"
               :run_id run-id :passed total :failed 0)))))
 
 (defn start-orchestration!
   "Starts interactive orchestration: creates run, writes manifest to disk,
    generates tests for all cells in parallel. Emits test_ready per cell.
-   Does NOT block — returns the run-id immediately."
+   Does NOT block — returns the run-id immediately.
+
+   Diff-aware: leaves whose contract is unchanged from the latest green
+   snapshot are dropped from the active set and emitted as cell_carry_over
+   events. Removed cells are deprecated + their files deleted."
   [client {:keys [leaves manifest base-ns store project-path
-                  on-event on-chunk manifest-id]
-           :or   {base-ns "app" manifest-id ""}}]
-  (let [run-id   (str "run-" (System/nanoTime))
-        on-event (or on-event (fn [_]))
-        on-chunk (or on-chunk (fn [_]))
+                  on-event on-chunk manifest-id strategy]
+           :or   {base-ns "app" manifest-id ""
+                  strategy :flat}}]
+  (let [run-id      (str "run-" (System/nanoTime))
+        on-event    (or on-event (fn [_]))
+        on-chunk    (or on-chunk (fn [_]))
+        manifest-id (manifest-diff/normalize-manifest-id manifest-id)
+        ;; Same gate as orchestrate! — fail fast on opaque outputs or
+        ;; edge schema mismatches before doing any work.
+        validation  (when manifest (mv/validate-edges manifest))]
+    (when (= :error (:status validation))
+      (emit on-event "manifest" "invalid"
+            :issues     (or (:issues validation) [])
+            :mismatches (mapv #(select-keys % [:source-name :target-name
+                                                :missing-fields :type-diffs])
+                              (or (:mismatches validation) []))))
+    (if (= :error (:status validation))
+      {"status"     "manifest_invalid"
+       "run_id"     run-id
+       :issues      (:issues validation)
+       :mismatches  (:mismatches validation)
+       :manifest    manifest}
+      (let [
+        ;; ── Diff against the previous green snapshot ──────────────
+        prev-snapshot (when (and store (seq manifest-id))
+                        (store/get-latest-green-snapshot store manifest-id))
+        prev-manifest (when prev-snapshot
+                        (let [parsed (mv/parse-manifest (:body prev-snapshot))]
+                          (when-not (:error parsed) parsed)))
+        diff-result   (manifest-diff/diff prev-manifest manifest)
+        cell-class    (build-cell-class-index diff-result)
+        prev-cells-by-id (manifest-diff/cells-by-id prev-manifest)
+        new-cells-by-id  (manifest-diff/cells-by-id manifest)
+        actionable?      (fn [cell-id]
+                           (#{:added :schema-changed :doc-changed}
+                            (get cell-class (cell-id-keyword cell-id))))
+
+        ;; Filter leaves to only those whose contracts changed.
+        active-leaves (filterv (fn [leaf]
+                                 (actionable? (or (:cell-id leaf)
+                                                  (:cell_id leaf))))
+                               leaves)
+        leaves        active-leaves
 
         ;; Build reverse mapping for graph context
         id->cell-name (when manifest
                         (into {} (map (fn [[cn cd]] [(:id cd) cn]))
                               (:cells manifest)))
 
-        ;; Load resource docs from system.edn
-        resource-docs (try
-                        (when project-path
-                          (let [f (java.io.File. (str project-path "/resources/system.edn"))]
-                            (when (.exists f)
-                              (let [sys (binding [*read-eval* false]
-                                          (read-string (slurp f)))]
-                                (->> sys
-                                     (keep (fn [[k v]]
-                                             (when (and (map? v) (:mycelium/doc v))
-                                               [(keyword (name k)) (:mycelium/doc v)])))
-                                     (into {}))))))
-                        (catch Exception _ nil))
+        ;; Load resource docs + fixtures from system.edn. Both go through
+        ;; the aero-tolerant reader so #or / #env / #ig/ref tags don't
+        ;; trip parsing, and both cross-reference :reitit.routes/pages
+        ;; so the keys match what cells use in :requires (e.g. :db).
+        sys-edn          (when project-path
+                           (read-system-edn (str project-path "/resources/system.edn")))
+        resource-docs    (extract-resource-docs sys-edn)
+        resource-fixtures (extract-resource-fixtures sys-edn)
 
         ;; Build briefs from leaves
         briefs (mapv (fn [leaf]
-                       (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
+                       (let [cell-id (bare-cell-id
+                                       (or (:cell-id leaf) (:cell_id leaf)))
                              doc (or (:doc leaf) "")
                              input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
                              output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
@@ -968,12 +1605,13 @@
                              context (when (and manifest cell-name)
                                        (let [ctx (mv/build-graph-context manifest cell-name)]
                                          (mv/format-graph-context ctx)))]
-                         {:id            cell-id
-                          :doc           doc
-                          :schema        (str "{:input " input-schema " :output " output-schema "}")
-                          :requires      requires
-                          :resource-docs resource-docs
-                          :context       context}))
+                         {:id                cell-id
+                          :doc               doc
+                          :schema            (str "{:input " input-schema " :output " output-schema "}")
+                          :requires          requires
+                          :resource-docs     resource-docs
+                          :resource-fixtures resource-fixtures
+                          :context           context}))
                      leaves)
 
         ;; Initialize per-cell state
@@ -993,19 +1631,46 @@
         (or manifest-id (str (:id manifest)))
         (pr-str manifest)))
 
-    ;; Store run state
-    (swap! runs assoc run-id
-      {:cells        cells-init
-       :base-ns      base-ns
-       :manifest     manifest
-       :client       client
-       :store        store
-       :project-path project-path
-       :callbacks    {:on-event on-event :on-chunk on-chunk}})
+    ;; Carry-over cells: unchanged from the last green run. Emit an event
+    ;; so the UI shows them as already done, and seed them as :done in run
+    ;; state so check-orchestration-complete! counts them toward total.
+    (let [carry-over-init
+          (into {} (for [cid (:unchanged diff-result)]
+                     [(str cid) {:status :done :carry-over? true}]))
+          cells-init (merge cells-init carry-over-init)]
 
-    (emit on-event "orchestration" "started"
-          :run_id run-id
-          :cell_ids (mapv :id briefs))
+      ;; Removed cells: deprecate in store + delete file from disk.
+      (doseq [cid (:removed diff-result)]
+        (when store
+          (store/deprecate-cell! store (bare-cell-id cid)))
+        (when (and project-path base-ns)
+          (try (source-gen/delete-cell! project-path base-ns (bare-cell-id cid))
+               (catch Exception _ nil)))
+        (emit on-event "cell_remove" "done" :cell_id cid))
+
+      (doseq [cid (:unchanged diff-result)]
+        (emit on-event "cell_carry_over" "skipped" :cell_id cid))
+
+      ;; Store run state
+      (swap! runs assoc run-id
+        {:cells           cells-init
+         :base-ns         base-ns
+         :manifest        manifest
+         :manifest-id     manifest-id
+         :client          client
+         :store           store
+         :project-path    project-path
+         :diff            diff-result
+         :cell-class      cell-class
+         :prev-cells-by-id prev-cells-by-id
+         :new-cells-by-id  new-cells-by-id
+         :prev-run-id     (:run-id prev-snapshot)
+         :strategy        strategy
+         :callbacks       {:on-event on-event :on-chunk on-chunk}})
+
+      (emit on-event "orchestration" "started"
+            :run_id run-id
+            :cell_ids (mapv :id briefs)))
 
     ;; Generate tests for all cells in parallel
     (doseq [brief briefs]
@@ -1033,19 +1698,37 @@
                   :run_id run-id
                   :error (.getMessage e))))))
 
-    run-id))
+    run-id))))
 
 (defn approve-tests!
-  "Approves a cell's tests. Writes test file to disk, starts implementation."
+  "Approves a cell's tests. Writes test file to disk, starts implementation.
+   For cells whose contract changed since the last green snapshot, the
+   prior implementation source and a change-summary are passed into the
+   implementor so it edits in place rather than starting from scratch."
   [run-id cell-id]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         store    (:store run)
         client   (:client run)
         base-ns  (:base-ns run)
         on-event (get-in run [:callbacks :on-event])
-        on-chunk (get-in run [:callbacks :on-chunk])]
+        on-chunk (get-in run [:callbacks :on-chunk])
+        ;; When this cell's contract is :schema-changed or :doc-changed,
+        ;; emit a structured change-summary so the implementor knows what
+        ;; the new contract demands. We deliberately do NOT pass the prior
+        ;; source: in Phase 4 validation runs the agent reliably anchored
+        ;; on broken patterns from earlier (lite-form schemas, ns drift,
+        ;; nested success/failure returns) and stagnated within the turn
+        ;; budget. Fresh-mode regenerated the same cells in 10–19 calls.
+        cid-kw   (cell-id-keyword cell-id)
+        class    (get (:cell-class run) cid-kw)
+        edit?    (#{:doc-changed :schema-changed} class)
+        summary  (when edit?
+                   (manifest-diff/change-summary
+                     (get (:prev-cells-by-id run) cid-kw)
+                     (get (:new-cells-by-id run) cid-kw)))]
     (when contract
       ;; Update store
       (when store
@@ -1063,14 +1746,17 @@
       (future
         (try
           (let [result (implement-from-contract client
-                         {:contract     contract
-                          :store        store
-                          :run-id       run-id
-                          :on-event     on-event
-                          :on-chunk     on-chunk
-                          :max-attempts 3
-                          :project-path nil ;; don't write to disk yet
-                          :base-ns      base-ns})]
+                         {:contract        contract
+                          :store           store
+                          :run-id          run-id
+                          :on-event        on-event
+                          :on-chunk        on-chunk
+                          :max-attempts    (turn-budget-for (:brief contract))
+                          :project-path    nil ;; don't write to disk yet
+                          :base-ns         base-ns
+                          :prev-source     nil ;; fresh-mode (see comment above)
+                          :change-summary  summary
+                          :strategy        (or (:strategy run) :flat)})]
             (if (= :ok (:status result))
               ;; Implementation succeeded — get source from store (where implement-from-contract saved it)
               (let [latest-cell (when store (store/get-latest-cell store cell-id))
@@ -1104,7 +1790,8 @@
 (defn reject-tests!
   "Rejects a cell's tests with feedback. Re-generates tests."
   [run-id cell-id feedback]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         client   (:client run)
@@ -1124,7 +1811,7 @@
                              "\n\n**Current test code:**\n```\n"
                              annotated
                              "\n```\n\nReturn ONLY the corrected `deftest` forms.")
-                content (llm/session-send-stream session client msg on-chunk)
+                content (:content (llm/session-send-stream session client msg on-chunk))
                 body    (or (extract/extract-first-code-block content) content)
                 cell-ns  (cell-ns-name base-ns cell-id)
                 test-ns  (test-ns-name base-ns cell-id)
@@ -1160,7 +1847,8 @@
 (defn save-tests!
   "Saves user-edited test code. Updates store, writes to disk, starts implementation."
   [run-id cell-id test-code]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         store    (:store run)]
@@ -1186,7 +1874,8 @@
 (defn approve-impl!
   "Approves a cell's implementation. Formats, writes to disk, saves to store."
   [run-id cell-id]
-  (let [run         (get @runs run-id)
+  (let [cell-id     (bare-cell-id cell-id)
+        run         (get @runs run-id)
         cell        (get-in run [:cells cell-id])
         source      (format-source (or (:impl-source cell) ""))
         store       (:store run)
@@ -1215,48 +1904,80 @@
         (check-orchestration-complete! run-id)))))
 
 (defn reject-impl!
-  "Rejects a cell's implementation with feedback. Re-implements."
+  "Rejects a cell's implementation with feedback and re-implements via the
+   agent loop. The previous implementation source (if any) is fed back as
+   :prev-source so the agent can edit incrementally rather than starting
+   from scratch; the user's feedback becomes the :change-summary. The
+   contract and the brief's schema drive the (ns ...) and (cell/defcell ...)
+   declarations through codegen — so namespace and schema declarations stay
+   consistent with the file path and the architect's contract."
   [run-id cell-id feedback]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         client   (:client run)
         store    (:store run)
         base-ns  (:base-ns run)
         on-event (get-in run [:callbacks :on-event])
-        on-chunk (get-in run [:callbacks :on-chunk])]
+        on-chunk (get-in run [:callbacks :on-chunk])
+        ;; Diff context (if any) — for cells flagged :doc-changed or
+        ;; :schema-changed during this run, append a structured summary
+        ;; of what moved in the contract. We deliberately do NOT pass
+        ;; the prior source: the agent reliably anchors on whatever
+        ;; pattern is in handler.clj and stagnates when that pattern
+        ;; conflicts with the new contract (Phase 4 validation
+        ;; 2026-04-26). Fresh-mode regenerates from scratch using the
+        ;; user feedback and the change-summary as guidance.
+        cid-kw      (cell-id-keyword cell-id)
+        class       (get (:cell-class run) cid-kw)
+        diff-summary (when (#{:doc-changed :schema-changed} class)
+                       (manifest-diff/change-summary
+                         (get (:prev-cells-by-id run) cid-kw)
+                         (get (:new-cells-by-id run) cid-kw)))
+        change-summary (cond-> (str "User feedback on the previous "
+                                    "implementation:\n  " feedback)
+                          diff-summary (str "\n\n" diff-summary))]
     (when contract
       (update-cell-status! run-id cell-id :implementing)
+      (emit on-event "cell_status" "implementing"
+            :cell_id cell-id :run_id run-id)
       (future
         (try
-          (let [session (or (:session contract)
-                            (llm/create-session (str "impl:" cell-id) prompts/cell-prompt))
-                annotated (hashline/annotate-hashlines
-                            (or (:impl-source cell) ""))
-                msg     (str "The implementation needs changes:\n\n" feedback
-                             (when (seq annotated)
-                               (str "\n\n**Current implementation:**\n```\n"
-                                    annotated "\n```"))
-                             "\n\nPlease fix and return the corrected source "
-                             "including `(ns ...)` and `(cell/defcell ...)`.")
-                content (llm/session-send-stream session client msg on-chunk)
-                source  (format-source
-                          (or (extract/extract-first-code-block content) content))]
-            ;; Eval + run tests
-            (let [eval-res (ev/eval-code source)]
-              (let [[test-output passed?]
-                    (if (not= :ok (:status eval-res))
-                      [(str "Eval error: " (:error eval-res)) false]
-                      (let [test-res (ev/run-cell-tests (:test-code contract))]
-                        [(or (:output test-res) "")
-                         (and (= :ok (:status test-res)) (:passed? test-res))]))]
-                (swap! runs update-in [run-id :cells cell-id]
-                       assoc :impl-source source :status :impl_ready)
-                (emit on-event "cell_status" "impl_ready"
+          (let [result (implement-from-contract client
+                         {:contract        contract
+                          :store           store
+                          :run-id          run-id
+                          :on-event        on-event
+                          :on-chunk        on-chunk
+                          :max-attempts    (turn-budget-for (:brief contract))
+                          :project-path    nil ;; don't write to disk yet
+                          :base-ns         base-ns
+                          :prev-source     nil ;; fresh-mode (see comment above)
+                          :change-summary  change-summary
+                          :strategy        (or (:strategy run) :flat)})]
+            (if (= :ok (:status result))
+              (let [latest-cell (when store (store/get-latest-cell store cell-id))
+                    impl-source (format-source (or (:handler latest-cell) ""))]
+                (if (seq impl-source)
+                  (do
+                    (swap! runs update-in [run-id :cells cell-id]
+                           assoc :impl-source impl-source :status :impl_ready)
+                    (emit on-event "cell_status" "impl_ready"
+                          :cell_id cell-id
+                          :run_id run-id
+                          :source impl-source
+                          :test_output (or (:output result) "")))
+                  (do
+                    (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
+                    (emit on-event "cell_status" "impl_error"
+                          :cell_id cell-id :run_id run-id
+                          :error "Implementation produced no source code"))))
+              (do
+                (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
+                (emit on-event "cell_status" "impl_error"
                       :cell_id cell-id :run_id run-id
-                      :source source
-                      :test_output test-output
-                      :tests_passed passed?))))
+                      :error (or (:error result) "Implementation failed")))))
           (catch Exception e
             (swap! runs assoc-in [run-id :cells cell-id :status] :impl_error)
             (emit on-event "cell_status" "impl_error"
@@ -1266,7 +1987,8 @@
 (defn save-impl!
   "Saves user-edited implementation. Evals, runs tests. If pass: writes to disk."
   [run-id cell-id source]
-  (let [run      (get @runs run-id)
+  (let [cell-id  (bare-cell-id cell-id)
+        run      (get @runs run-id)
         cell     (get-in run [:cells cell-id])
         contract (:contract cell)
         store    (:store run)

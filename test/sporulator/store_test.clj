@@ -377,3 +377,54 @@
             s2 (first (filter #(= "cnt-2" (:id %)) sessions))]
         (is (= 2 (:message-count s1)))
         (is (= 0 (:message-count s2)))))))
+
+;; =============================================================
+;; Green snapshots
+;; =============================================================
+
+(deftest green-snapshot-roundtrip-test
+  (testing "no snapshot returns nil"
+    (is (nil? (store/get-latest-green-snapshot *store* ":g/x"))))
+  (testing "save and read latest"
+    (store/save-green-snapshot! *store*
+      {:manifest-id ":g/x" :manifest-version 1
+       :body "{:id :g/x :cells {} :pipeline []}"
+       :run-id "run-1"})
+    (let [s (store/get-latest-green-snapshot *store* ":g/x")]
+      (is (some? s))
+      (is (= "g/x" (:manifest-id s)) "stored canonically without leading colon")
+      (is (= 1 (:manifest-version s)))
+      (is (= "run-1" (:run-id s)))))
+  (testing "second snapshot supersedes the first"
+    (store/save-green-snapshot! *store*
+      {:manifest-id ":g/x" :manifest-version 2
+       :body "{:id :g/x :cells {:a {:id :g/a}} :pipeline [:a]}"
+       :run-id "run-2"})
+    (let [s (store/get-latest-green-snapshot *store* ":g/x")]
+      (is (= 2 (:manifest-version s)))
+      (is (= "run-2" (:run-id s))))))
+
+(deftest green-snapshot-isolated-by-manifest-id-test
+  (store/save-green-snapshot! *store*
+    {:manifest-id ":g/a" :manifest-version 1 :body "" :run-id ""})
+  (store/save-green-snapshot! *store*
+    {:manifest-id ":g/b" :manifest-version 1 :body "" :run-id ""})
+  (is (= "g/a" (:manifest-id (store/get-latest-green-snapshot *store* ":g/a"))))
+  (is (= "g/b" (:manifest-id (store/get-latest-green-snapshot *store* ":g/b")))))
+
+;; =============================================================
+;; Cell deprecation
+;; =============================================================
+
+(deftest deprecate-cell-test
+  (store/save-cell! *store* {:id ":g/c" :handler "(fn [_ d] d)"})
+  (is (false? (store/cell-deprecated? *store* ":g/c")))
+  (store/deprecate-cell! *store* ":g/c")
+  (is (true? (store/cell-deprecated? *store* ":g/c"))))
+
+(deftest deprecation-marks-all-versions-test
+  (store/save-cell! *store* {:id ":g/d" :handler "(fn [_ d] d)"})
+  (store/save-cell! *store* {:id ":g/d" :handler "(fn [_ d] (assoc d :v 2))"})
+  (store/deprecate-cell! *store* ":g/d")
+  (is (true? (store/cell-deprecated? *store* ":g/d"))
+      "cell-deprecated? checks the latest version after deprecation"))

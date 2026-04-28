@@ -5,6 +5,46 @@
   (:require [clojure.string :as str]))
 
 ;; =============================================================
+;; Schema rendering helpers
+;; =============================================================
+
+(defn- lite-map->vector-schema
+  "Converts a lite-syntax map schema {:k :type ...} to Malli vector form
+   [:map [:k :type] ...]. Returns the schema unchanged if it isn't a
+   lite-syntax map."
+  [schema]
+  (if (and (map? schema)
+           (seq schema)
+           (every? keyword? (keys schema)))
+    (into [:map] (map (fn [[k v]] [k v])) schema)
+    schema))
+
+(defn- dispatched-output?
+  "True if `output` is a dispatched-output schema map keyed by transition
+   labels. Mirrors mycelium.cell/output-dispatched? but accepts either
+   already-vector or lite-map sub-schemas — codegen needs to recognise
+   both shapes so it can canonicalise sub-schemas to vector form before
+   emission."
+  [output]
+  (and (map? output)
+       (seq output)
+       (every? (fn [v] (or (vector? v) (and (map? v) (every? keyword? (keys v)))))
+               (vals output))))
+
+(defn- render-output-schema
+  "Renders a cell's :output schema for emission inside (cell/defcell ...).
+   For dispatched outputs, each per-transition sub-schema is canonicalised
+   to vector form so that `defcell`'s `output-dispatched?` heuristic
+   (every? vector? (vals output)) trips at load time. Flat outputs and
+   already-vector schemas pass through unchanged."
+  [output]
+  (cond
+    (nil? output)             output
+    (dispatched-output? output)
+    (into {} (map (fn [[label sub]] [label (lite-map->vector-schema sub)])) output)
+    :else                     output))
+
+;; =============================================================
 ;; Cell source assembly
 ;; =============================================================
 
@@ -32,7 +72,7 @@
        "\n(cell/defcell " (pr-str cell-id) "\n"
        "  {:doc " (pr-str doc) "\n"
        "   :input " (pr-str (:input schema)) "\n"
-       "   :output " (pr-str (:output schema))
+       "   :output " (pr-str (render-output-schema (:output schema)))
        (when (seq requires)
          (str "\n   :requires " (pr-str (vec requires))))
        "}\n"
@@ -47,7 +87,7 @@
        "(cell/defcell " (pr-str cell-id) "\n"
        "  {:doc " (pr-str doc) "\n"
        "   :input " (pr-str (:input schema)) "\n"
-       "   :output " (pr-str (:output schema)) "}\n"
+       "   :output " (pr-str (render-output-schema (:output schema))) "}\n"
        "  (fn [resources data] data))\n"))
 
 ;; =============================================================
@@ -62,6 +102,9 @@
        "  (:require [clojure.test :refer [deftest is testing]]\n"
        "            [mycelium.cell :as cell]\n"
        "            [malli.core :as m]\n"
+       "            [next.jdbc :as jdbc]\n"
+       "            [next.jdbc.sql :as jdbc-sql]\n"
+       "            [next.jdbc.result-set :as rs]\n"
        "            [" cell-ns "]))\n\n"
        "(def cell-spec (cell/get-cell! " (pr-str cell-id) "))\n"
        "(def handler (:handler cell-spec))\n"
