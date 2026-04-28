@@ -993,6 +993,16 @@
          :mismatches  (:mismatches validation)
          :manifest    manifest})
       (do
+        ;; If the architect amended the manifest during repair,
+        ;; persist the new version to disk so subsequent runs see it
+        ;; (and so callers can inspect what changed). Mirrors the
+        ;; write-manifest! call already in start-orchestration!.
+        (when (and repair-result
+                   (= :ok (:status repair-result))
+                   project-path manifest)
+          (source-gen/write-manifest! project-path base-ns
+            (or (when (seq manifest-id) manifest-id) (str (:id manifest)))
+            (pr-str manifest)))
 
     ;; Create run in store
     (when store
@@ -1051,16 +1061,36 @@
                                                           (:cell_id leaf))))
                                        leaves)
 
-            ;; Build briefs from actionable leaves
+            ;; Build briefs from actionable leaves. Schemas are sourced
+            ;; from the (possibly-amended) manifest's cell definition,
+            ;; not from the leaf — the architect repair loop may have
+            ;; rewritten the manifest's schemas, and leaves passed in
+            ;; by the caller don't get amended in lockstep. Falling back
+            ;; to the leaf's input/output strings when no manifest cell
+            ;; is found lets old test fixtures (or callers without a
+            ;; manifest) keep working.
             briefs (mapv (fn [leaf]
                            (let [cell-id (or (:cell-id leaf) (:cell_id leaf))
-                                 doc (or (:doc leaf) "")
-                                 input-schema (or (:input-schema leaf) (:input_schema leaf) "{}")
-                                 output-schema (or (:output-schema leaf) (:output_schema leaf) "{}")
-                                 requires (or (:requires leaf) [])
                                  cell-name (when id->cell-name
                                              (get id->cell-name (keyword cell-id)
                                                   (get id->cell-name cell-id)))
+                                 manifest-cell (when (and manifest cell-name)
+                                                 (get-in manifest [:cells cell-name]))
+                                 doc (or (:doc manifest-cell)
+                                         (:doc leaf)
+                                         "")
+                                 m-in  (get-in manifest-cell [:schema :input])
+                                 m-out (get-in manifest-cell [:schema :output])
+                                 input-schema  (if m-in
+                                                 (pr-str m-in)
+                                                 (or (:input-schema leaf)
+                                                     (:input_schema leaf) "{}"))
+                                 output-schema (if m-out
+                                                 (pr-str m-out)
+                                                 (or (:output-schema leaf)
+                                                     (:output_schema leaf) "{}"))
+                                 requires (or (:requires manifest-cell)
+                                              (:requires leaf) [])
                                  context (when (and manifest cell-name)
                                            (let [ctx (mv/build-graph-context manifest cell-name)]
                                              (mv/format-graph-context ctx)))]

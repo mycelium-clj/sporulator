@@ -294,12 +294,112 @@ Common types: :string :int :double :boolean :keyword :any :uuid
 Collections: [:vector :string], [:set :keyword]
 Enums: [:enum :pending :shipped :delivered]
 
-## Key Design Principles
+## Workflow Patterns
 
-1. **Cells are isolated** — they only see their input data and resources.
-2. **Key propagation** — data accumulates through the workflow.
-3. **Schema contracts** — every cell declares what it needs and produces.
-4. **Resources are injected** — declared in :requires.
+Use the simplest pattern that fits. If you find yourself reaching for
+something complex, decompose first.
+
+### Linear pipeline (preferred for sequential flows)
+
+```clojure
+{:cells    {:start :app/a, :step2 :app/b, :step3 :app/c}
+ :pipeline [:start :step2 :step3]}
+;; Expands to: :edges {:start :step2, :step2 :step3, :step3 :end}
+```
+
+### Branching (one cell, two-way split)
+
+```clojure
+{:edges {:check {:pass :process, :fail :error}}
+ :dispatches {:check [[:pass (fn [d] (:valid d))]
+                       [:fail (fn [d] (not (:valid d)))]]}}
+```
+Handler computes data; dispatch predicates choose the route. Separate
+concerns.
+
+### Per-transition output schema
+
+When a cell branches, declare an output schema per edge:
+
+```clojure
+:output {:pass [:map [:status [:= :ok]]]
+         :fail [:map [:status [:= :error]] [:reason :string]]}
+```
+
+### Default fallback
+
+```clojure
+:edges {:start {:success :ok, :default :fallback}}
+:dispatches {:start [[:success (fn [d] (:valid d))]]}
+;; :default auto-generates (constantly true) as last predicate
+```
+
+### Parallel join
+
+```clojure
+:joins {:fees {:cells [:tax :ship] :strategy :parallel}}
+```
+Join members have NO `:edges` entries; they receive the same input
+snapshot. Output keys must not overlap.
+
+## Decomposition philosophy — prefer many small cells over one large one
+
+Each cell is a state in the state machine. Each state should:
+- Produce a **single result OR a single error** — don't make one cell
+  produce 5 different shapes.
+- Hold ONE concern — validation, transformation, persistence, rendering.
+- Have a small input shape and a small output shape.
+
+**Anti-pattern: a router cell with N>2 dispatches and N different
+per-transition outputs.** When you have many branches each needing
+different downstream data, decompose:
+
+WRONG (one cell carrying six different output shapes):
+```clojure
+:start {:output {:list   [:map [:filter ...]]
+                 :add    [:map [:title :string]]
+                 :toggle [:map [:id :int]]
+                 :edit   [:map [:id :int] [:title :string]]
+                 :delete [:map [:id :int]]
+                 :clear  [:map]}}
+:edges {:start {:list :list-todos, :add :add-todo, :toggle :toggle-todo,
+                :edit :edit-todo, :delete :delete-todo, :clear :clear-completed}}
+```
+
+RIGHT (router cell + per-branch normalizer cells, each tiny):
+```clojure
+:start         {:output [:map [:intent :keyword] [:title {:optional true} :string]
+                        [:id {:optional true} :int] [:filter {:optional true} ...]]}
+:normalize-list   {:input <route-intent-output> :output [:map [:filter ...]]}
+:normalize-add    {:input <route-intent-output> :output [:map [:title :string]]}
+:normalize-toggle {:input <route-intent-output> :output [:map [:id :int]]}
+;; ... etc.
+:edges {:start            {:list :normalize-list, :add :normalize-add, ...}
+        :normalize-list   :list-todos
+        :normalize-add    :add-todo
+        ;; ... etc.}
+```
+
+Each normalizer is a 3-line cell that picks out exactly what its
+target needs. The router stays simple. The cell-implementor can
+satisfy each one in a couple of turns.
+
+## Cell-Output Rules
+
+1. **Errors are data, not exceptions.** Set a key (`:error`,
+   `:status :failed`) and let dispatch predicates route it. Don't
+   throw for expected failures.
+2. **Cells are isolated** — they only see their input data and
+   resources. They cannot read the manifest or other cells.
+3. **Schema contracts** — every cell declares what it needs and what
+   it produces. Required keys on the consumer side must be supplied
+   by the producer's output on every edge.
+4. **Resources are injected** — declared in `:requires`.
+5. **No `:any` outputs** — every cell must declare what it produces.
+   Downstream contract checks have nothing to bind against `:any`.
+6. **Optional shorthand: `{:optional true}` only.** `[:? :type]` and
+   `[:* :type]` are sequence schemas, not optional markers — they
+   never match a flat map-entry value.
 
 ## Your Role
 
