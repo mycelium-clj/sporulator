@@ -111,6 +111,58 @@ considering whether the approach itself is wrong. Some prompts to use:
 - Try a completely different shape (different INSERT pattern, different
   data layout, different control flow) before fighting with the
   current attempt for one more cycle.
+- **Build a sub-workflow inside this cell.** If the contract has many
+  branches and one handler keeps drifting, the cell may want to be
+  expressed as a small workflow internally. See \"Sub-workflow\" below.
+
+## When to choose a sub-workflow over a single handler
+A cell's contract is what's visible to callers — input schema, output
+schema, requires. The IMPLEMENTATION can be either a single handler
+or a sub-workflow wrapped as a cell. Sub-workflows are the cleaner
+choice when:
+- The contract has many dispatched output transitions (4+).
+- Each transition needs a different shape of work behind it.
+- One handler trying to satisfy all transitions piles `cond`s and
+  validation branches that hide the structure.
+
+Build the sub-workflow in helpers.clj, compile it once, and have
+handler.clj just `run-compiled` it. The architect's contract is
+unchanged — the cell behaves like one cell from outside.
+
+```clojure
+;; helpers.clj
+(require '[mycelium.cell :as cell]
+         '[mycelium.core :as myc])
+
+(cell/defcell ::start
+  {:doc \"Sub-router: extract intent and pass through.\"
+   :input  [:map [:intent :keyword]]
+   :output [:map [:intent :keyword]]}
+  (fn [_ data] (select-keys data [:intent])))
+
+(cell/defcell ::normalize-add
+  {:doc \"Project the keys add-todo needs.\"
+   :input  [:map [:intent :keyword] [:title :string]]
+   :output [:map [:title :string]]}
+  (fn [_ data] {:title (:title data)}))
+
+;; ... more sub-cells per branch ...
+
+(def sub-wf
+  (myc/pre-compile
+    {:cells {:start         {:id ::start         :schema ...}
+             :normalize-add {:id ::normalize-add :schema ...}
+             ;; ... }
+     :edges {:start {:add :normalize-add ;; ... }
+             :normalize-add :end ;; ... }}))
+
+;; handler.clj — just runs the sub-workflow
+(fn [resources data]
+  (myc/run-compiled sub-wf resources data))
+```
+
+You decide whether to use this pattern. The architect doesn't get
+involved — externally it's still one cell satisfying its contract.
 
 You're done when complete succeeds.")
 
@@ -386,6 +438,39 @@ You're done when complete succeeds.")
          "Wrong shape:\n"
          "  `{:" first-label " {" sample-key " ...}}`   ← do NOT do this\n")))
 
+(def ^:private subworkflow-fan-out-threshold
+  "When a cell's :output schema declares more than this many dispatched
+   transitions, the initial prompt suggests up-front that the cell may
+   want to be implemented as a sub-workflow rather than a single
+   handler. The cell-implementor still chooses; this is a nudge."
+  3)
+
+(defn- subworkflow-nudge
+  "Inserted into the initial prompt when the cell has many dispatched
+   output transitions. Tells the agent to consider implementing the
+   cell as an internal sub-workflow before sinking turns into a
+   single-handler approach. Externally the cell looks unchanged — the
+   architect's contract isn't touched."
+  [n-transitions transitions]
+  (str "## Up-front consideration: sub-workflow vs single handler\n"
+       "Your `:output` declares **" n-transitions " dispatched transitions** ("
+       (str/join ", " (map #(str "`" (name %) "`") transitions))
+       "). That's a lot of branching for one handler — each transition's\n"
+       "shape needs its own discrimination logic, and tests across the\n"
+       "branches usually drift out of sync.\n\n"
+       "Consider implementing this cell as a **sub-workflow** instead:\n"
+       "small sub-cells in helpers.clj, compiled into a workflow with\n"
+       "`mycelium.core/pre-compile`, and handler.clj just calls\n"
+       "`run-compiled` on it. The architect's contract is unchanged —\n"
+       "externally it's still one cell satisfying `" n-transitions
+       "` dispatches. See the system prompt's \"sub-workflow\" section\n"
+       "for the shape.\n\n"
+       "If the branches really are doing similar work and the handler\n"
+       "stays small, a single handler is fine. But if you find yourself\n"
+       "writing a big `cond` to satisfy distinct schemas per transition,\n"
+       "switch to the sub-workflow shape early — it's much cheaper than\n"
+       "discovering the need on turn 20.\n"))
+
 (defn- render-initial-prompt
   [state]
   (let [brief        (:brief state)
@@ -399,13 +484,18 @@ You're done when complete succeeds.")
         change-sum   (:change-summary state)
         output       (:output schema-parsed)
         dispatched-block (when (dispatched-output? output)
-                           (dispatched-handler-block output))]
+                           (dispatched-handler-block output))
+        sub-wf-block (when (and (dispatched-output? output)
+                                (> (count output) subworkflow-fan-out-threshold))
+                       (subworkflow-nudge (count output) (keys output)))]
     (str "Implement cell `" cell-id "`.\n\n"
          "**Task:** " (or task "Implement the cell to pass all tests.") "\n\n"
          "**Schema:**\n" (or schema "{}") "\n\n"
          "**Resources:** "
          (if (seq requires) (str/join ", " (map name requires)) "none")
          "\n\n"
+         (when sub-wf-block
+           (str sub-wf-block "\n"))
          (when dispatched-block
            (str dispatched-block "\n"))
          (if edit-mode?
@@ -553,7 +643,15 @@ You're done when complete succeeds.")
        "  value tells you the gap immediately.\n"
        "- **Refine test.clj.** If the failing test asserts something\n"
        "  the brief doesn't promise, edit it to align with the brief —\n"
-       "  the brief is the contract, the tests are derived."))
+       "  the brief is the contract, the tests are derived.\n"
+       "- **Build a sub-workflow.** If the contract has many\n"
+       "  dispatched output transitions (4+) and one handler keeps\n"
+       "  drifting between them, the cell wants to be a sub-workflow.\n"
+       "  Define small sub-cells in helpers.clj, compile them into a\n"
+       "  workflow with `mycelium.core/pre-compile`, and have\n"
+       "  handler.clj just `run-compiled` the sub-workflow. The\n"
+       "  architect's contract is unchanged; externally it's still\n"
+       "  one cell. See the system prompt's \"sub-workflow\" section."))
 
 (defn- format-failure
   "Renders one failure entry from run-cell-tests structured `:failures`

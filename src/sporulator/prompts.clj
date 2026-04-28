@@ -397,9 +397,39 @@ satisfy each one in a couple of turns.
 4. **Resources are injected** — declared in `:requires`.
 5. **No `:any` outputs** — every cell must declare what it produces.
    Downstream contract checks have nothing to bind against `:any`.
-6. **Optional shorthand: `{:optional true}` only.** `[:? :type]` and
-   `[:* :type]` are sequence schemas, not optional markers — they
-   never match a flat map-entry value.
+
+## Schema syntax — pick ONE form per schema, never mix
+
+Two forms are valid; do not blend them within a single schema.
+
+**Lite syntax** — Clojure map. EVERY KEY IS REQUIRED. There is no way
+to mark a key optional in lite syntax.
+```clojure
+:input {:title :string, :id :int}    ;; both required
+```
+
+**Vector syntax** — full Malli. Use this whenever you need
+`{:optional true}`, sequence operators, or any other Malli annotation.
+```clojure
+:input [:map
+        [:title :string]                                       ;; required
+        [:id :int]                                             ;; required
+        [:filter {:optional true} [:enum \"all\" \"active\"]]] ;; optional
+```
+
+**FORBIDDEN — hybrid that does NOT parse:**
+```clojure
+:input {:title :string, :id {:optional true} :int}   ;; ← BROKEN EDN
+```
+The `{:optional true}` annotation only works inside the `[:map ...]`
+vector form, never inside a lite-syntax `{:k :type}` map literal. If
+ANY entry in your schema needs `{:optional true}`, the WHOLE schema
+must be rewritten in `[:map ...]` vector form.
+
+**Also forbidden** — sequence operators in flat map entries:
+`[:? :type]`, `[:* :type]`, `[:+ :type]`. Those are sequence schemas
+(matching seqs of zero/one/many of the inner type), not optional
+markers. Use `{:optional true}` in the entry props instead.
 
 ## Your Role
 
