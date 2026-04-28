@@ -246,15 +246,30 @@
 ;; Type compatibility
 ;; =============================================================
 
+(defn- enum-values
+  "Pulls the literal values out of `[:enum v1 v2 ...]`. Returns nil for non-enum forms."
+  [t]
+  (when (and (vector? t) (= :enum (first t)))
+    (set (rest t))))
+
 (defn types-compatible?
   "Checks if an output type can feed an input type.
-   Exact match, :int → :double widening, or deep structural equality."
+
+   Compatible when:
+   - Exact structural match
+   - :int can feed :double (numeric widening)
+   - :any accepts anything
+   - Enum narrowing: producer's `[:enum :a]` flows into consumer's
+     `[:enum :a :b :c]` because every produced value is in the
+     consumer's accepted set."
   [output-type input-type]
   (or (= output-type input-type)
-      ;; Safe widening: :int can feed :double
       (and (= output-type :int) (= input-type :double))
-      ;; :any accepts anything
-      (= input-type :any)))
+      (= input-type :any)
+      (let [out-vals (enum-values output-type)
+            in-vals  (enum-values input-type)]
+        (and out-vals in-vals
+             (every? in-vals out-vals)))))
 
 ;; =============================================================
 ;; Edge pair extraction
