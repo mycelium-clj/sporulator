@@ -15,6 +15,7 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [sporulator.extract :as extract]
+            [sporulator.manifest-diff :as manifest-diff]
             [sporulator.store :as store]))
 
 ;; ── File walking ─────────────────────────────────────────────────
@@ -120,11 +121,15 @@
                         (try (binding [*read-eval* false]
                                (read-string manifest-body))
                              (catch Throwable _ nil)))
+        ;; Use the same manifest-id normalization the rest of sporulator
+        ;; uses (manifest-diff/normalize-manifest-id strips a leading
+        ;; colon but preserves slashes). Earlier we replaced "/" with
+        ;; "-" here, which produced a different id ("todomvc-app") than
+        ;; the architect's persistence path ("todomvc/app") and ended
+        ;; up with two duplicate manifest rows in the store.
         m-id          (or manifest-id
                           (when manifest
-                            (-> (str (:id manifest))
-                                (str/replace "/" "-")
-                                (cond-> #(str/starts-with? % ":") (subs 1)))))
+                            (manifest-diff/normalize-manifest-id (:id manifest))))
         existing-m    (when (and store m-id) (store/get-latest-manifest store m-id))
         manifest-saved?
         (boolean
