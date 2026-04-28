@@ -4,6 +4,7 @@
             [clojure.data.json :as json]
             [zprint.core :as zp]
             [clojure.string :as str]
+            [sporulator.bootstrap :as bootstrap]
             [sporulator.cell-agent :as cell-agent]
             [sporulator.eval :as ev]
             [sporulator.graph-agent :as graph-agent]
@@ -925,16 +926,44 @@
                      Falls back to GRAPH_BASE_URL, GRAPH_API_KEY, GRAPH_MODEL env vars
      :cell-llm     - cell agent LLM config {:base-url, :api-key, :model}
                      Falls back to CELL_BASE_URL, CELL_API_KEY, CELL_MODEL env vars"
-  [{:keys [port store project-path graph-llm cell-llm] :or {port 8420}}]
+  [{:keys [port store project-path graph-llm cell-llm base-ns]
+    :or   {port 8420 base-ns "app"}}]
   (let [graph-client (create-llm-client "GRAPH" graph-llm)
         cell-client  (create-llm-client "CELL" cell-llm)
         clients      (atom #{})
+        ;; If the store is empty for this project but the project has
+        ;; an existing manifest + cells on disk, seed them as the
+        ;; baseline so orchestrate!'s diff sees them as carry-over
+        ;; rather than re-implementing every cell from scratch.
+        boot-result  (when (and store project-path)
+                       (try (bootstrap/bootstrap-from-project!
+                              {:store store
+                               :project-path project-path
+                               :base-ns base-ns})
+                            (catch Throwable t
+                              (println "Sporulator bootstrap warning:"
+                                       (.getMessage t))
+                              nil)))
         ctx          {:store store :project-path project-path
                       :clients clients
                       :llm-client graph-client
                       :cell-client cell-client}
         stop-fn      (http/run-server (fn [req] (handler ctx req)) {:port port})]
     (println (str "Sporulator server started on port " port))
+    (when boot-result
+      (println (str "  Bootstrap: "
+                    (cond-> []
+                      (:manifest-saved? boot-result)
+                      (conj "manifest seeded")
+                      (pos? (:cells-saved boot-result))
+                      (conj (str (:cells-saved boot-result) " cell(s) seeded"))
+                      (pos? (:cells-skipped boot-result))
+                      (conj (str (:cells-skipped boot-result) " carry-over")))
+                    " (manifest-id: " (:manifest-id boot-result) ")"
+                    (when (and (not (:manifest-saved? boot-result))
+                               (zero? (:cells-saved boot-result))
+                               (zero? (:cells-skipped boot-result)))
+                      "no project files found"))))
     (doseq [[label client prefix] [["Graph" graph-client "GRAPH"]
                                     ["Cell"  cell-client  "CELL"]]]
       (if client

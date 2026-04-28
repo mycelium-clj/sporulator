@@ -10,8 +10,18 @@
 ;; =============================================================
 
 (defn open
-  "Opens or creates a SQLite database at the given path. Use \":memory:\" for testing."
+  "Opens or creates a SQLite database at the given path. Use \":memory:\"
+   for testing. If `path` points into a directory that doesn't exist yet
+   (e.g. \".sporulator/sporulator.db\" in a fresh project), the parent
+   directory is created first — sqlite-jdbc otherwise opens a half-
+   initialised connection where the schema DDLs partially succeed and
+   later CREATE INDEX statements fail with mysterious 'no such table'
+   errors."
   [path]
+  (when (and (string? path) (not= ":memory:" path))
+    (when-let [parent (.getParentFile (java.io.File. ^String path))]
+      (when (not (.exists parent))
+        (.mkdirs parent))))
   (let [ds (if (= ":memory:" path)
              ;; For in-memory DBs, use a single persistent connection
              ;; (each new connection gets a different in-memory DB)
