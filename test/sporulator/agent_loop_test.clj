@@ -68,7 +68,7 @@
 (def ^:private double-cell-brief
   {:id       :math/double
    :doc      "Doubles the :n field of input data."
-   :schema   "{:input {:n :long} :output {:n :long}}"
+   :schema   "{:input {:n :int} :output {:n :int}}"
    :requires []
    :context  ""})
 
@@ -86,8 +86,8 @@
    :cell-ns       "math.double"
    :brief         double-cell-brief
    :test-code     double-test-code
-   :schema-parsed {:input  [:map [:n :long]]
-                   :output [:map [:n :long]]}
+   :schema-parsed {:input  [:map [:n :int]]
+                   :output [:map [:n :int]]}
    :on-event      (fn [_])
    :on-chunk      (fn [_])
    :turn-budget   20})

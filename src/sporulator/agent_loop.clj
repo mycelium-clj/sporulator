@@ -6,6 +6,8 @@
    conversation history; agent state only tracks domain data."
   (:refer-clojure :exclude [run!])
   (:require [clojure.string :as str]
+            [clojure.walk :as walk]
+            [sporulator.cell-validate :as cv]
             [sporulator.codegen :as codegen]
             [sporulator.code-graph :as cg]
             [sporulator.eval :as ev]
@@ -79,12 +81,17 @@ Use `eval` like you would a Clojure REPL session:
   the helper is wrong.
 - Exercise the handler directly:
     `((:handler (mycelium.cell/get-cell! :your/cell-id))
-      {:db ds} {:k \"v\"})`
+      resources {:k \"v\"})`
   faster than running the whole test suite for a single case.
-- For `:db` cells, set up a real `next.jdbc/get-datasource` against an
-  in-memory sqlite, create the table the test uses, and try your INSERT
-  / SELECT / UPDATE there. JDBC has subtle key-shape and return-shape
-  defaults; experimenting beats guessing.
+- **`resources` is pre-bound for you.** When the cell's `:requires`
+  has resource keys (e.g. `:db`, `:http`), each `:eval` call gets a
+  fresh `resources` map already constructed from the project's
+  `:mycelium/fixture` definitions in `resources/system.edn`. So
+  `(:db resources)` returns a real, schema-applied DataSource — you
+  do NOT need to call `(next.jdbc/get-datasource …)` or set up
+  tables yourself. Each eval gets a clean slate; state does not
+  leak between evals. The per-resource doc above describes what
+  `(:k resources)` is.
 - `inspect_ns`, `list_functions`, `get_callers`, etc. are also there
   when you want to navigate.
 
@@ -188,6 +195,75 @@ You're done when complete succeeds.")
     (when (#{"handler.clj" "helpers.clj"} path)
       (rebuild-graph! s))
     s))
+
+;; =============================================================
+;; Resource fixtures — pre-bind project resources for :eval
+;; =============================================================
+;;
+;; Per resource-doc convention (notes/resource-doc-convention.md), a
+;; project's `resources/system.edn` ships a `:mycelium/fixture` form per
+;; resource describing how to build a fresh, ready-to-use instance for
+;; the cell-implementor's `:eval` tool. The orchestrator extracts those
+;; forms (as Clojure data) and threads them into the brief under
+;; `:resource-fixtures`. We splice them into a `(def resources {...})`
+;; prelude before the agent's user code so the agent can call
+;;
+;;   ((:handler (mycelium.cell/get-cell! :foo/bar)) resources {:k v})
+;;
+;; without re-inventing JDBC / HTTP / cache setup boilerplate.
+
+(defn- fixture-namespaces
+  "Walks fixture forms and collects fully-qualified Clojure namespaces
+   referenced via qualified symbols (e.g. `next.jdbc/execute!` →
+   `next.jdbc`). Skips Java class refs (their namespace component
+   contains a Capitalized segment, e.g. `java.io.File`)."
+  [fixtures]
+  (let [nss (atom #{})]
+    (doseq [form (vals fixtures)]
+      (walk/postwalk
+        (fn [x]
+          (when (and (symbol? x) (namespace x))
+            (let [ns-str (namespace x)
+                  parts  (str/split ns-str #"\.")]
+              (when-not (some (fn [seg]
+                                (and (seq seg)
+                                     (Character/isUpperCase (.charAt seg 0))))
+                              parts)
+                (swap! nss conj (symbol ns-str)))))
+          x)
+        form))
+    @nss))
+
+(defn- ensure-fixture-deps-loaded!
+  "Pre-requires every Clojure namespace mentioned in the fixture forms.
+   Idempotent; tolerates failures (e.g. transient classpath blips)."
+  [fixtures]
+  (doseq [n (fixture-namespaces fixtures)]
+    (try (require n) (catch Throwable _ nil))))
+
+(defn- relevant-fixtures
+  "Filters the brief's :resource-fixtures down to the keys the cell
+   actually `:requires`. Resource keys may be either bare keywords
+   (`:db`) or strings; tolerate both."
+  [requires fixtures]
+  (when (and (seq requires) (seq fixtures))
+    (into {}
+          (for [r requires
+                :let [k    (keyword (name r))
+                      form (or (get fixtures k) (get fixtures r))]
+                :when form]
+            [k form]))))
+
+(defn- resources-prelude
+  "Returns a `(def resources {...})` source string built from the
+   relevant fixture forms, or nil when there are no relevant fixtures.
+   The map literal is pr-str'd with each value still in form-as-data
+   shape, so when the eval thread reads it back the let/do/etc. inside
+   each value gets evaluated freshly — i.e. each :eval call creates a
+   new, schema-applied resource."
+  [requires fixtures]
+  (when-let [rel (relevant-fixtures requires fixtures)]
+    (str "(def resources " (pr-str rel) ")\n")))
 
 ;; =============================================================
 ;; Session state
@@ -659,26 +735,42 @@ You're done when complete succeeds.")
               helpers-src   (get files "helpers.clj")
               handler-form  (parse-handler-buffer handler-src)
               helpers-forms (parse-helpers-buffer helpers-src)
-              eval-src      (if (and (seq cell-ns)
-                                     handler-form
-                                     (seq? handler-form)
-                                     (= 'fn (first handler-form))
-                                     (some? helpers-forms))
+              brief         (:brief state)
+              fixtures      (:resource-fixtures brief)
+              requires      (:requires brief)
+              ;; Pre-load every Clojure ns the fixture forms reference
+              ;; (e.g. `next.jdbc`) so the splicing-in-source approach
+              ;; works on the very first :eval, before any test has
+              ;; touched the JVM. Idempotent.
+              _             (when (seq fixtures) (ensure-fixture-deps-loaded! fixtures))
+              prelude       (resources-prelude requires fixtures)
+              cell-loaded?  (and (seq cell-ns)
+                                 handler-form
+                                 (seq? handler-form)
+                                 (= 'fn (first handler-form))
+                                 (some? helpers-forms))
+              eval-src      (if cell-loaded?
                               (str "(when (find-ns '" cell-ns
                                    ") (remove-ns '" cell-ns "))\n"
                                    (codegen/assemble-cell-source
                                      {:cell-ns        cell-ns
                                       :cell-id        (:cell-id state)
-                                      :doc            (or (:doc (:brief state)) "")
+                                      :doc            (or (:doc brief) "")
                                       :schema         (:schema-parsed state)
                                       :requires       (mapv keyword
-                                                            (or (:requires (:brief state)) []))
+                                                            (or requires []))
                                       :extra-requires []
                                       :helpers        helpers-forms
                                       :fn-body        handler-form})
                                    "\n\n(in-ns '" cell-ns ")\n"
+                                   prelude
                                    code)
-                              code)
+                              ;; Cell can't be assembled yet — still
+                              ;; honor the resources prelude when
+                              ;; possible. Use the user namespace.
+                              (str (when prelude
+                                     (str "(in-ns 'user)\n" prelude))
+                                   code))
               res (ev/eval-code eval-src)]
           (if (= :ok (:status res))
             (ok state (str (pr-str (:result res))
@@ -737,6 +829,16 @@ You're done when complete succeeds.")
               (ok state "No lint errors.")))))
 
       :complete
+      ;; complete is a two-gate operation. Both must pass for the cell
+      ;; to be marked green:
+      ;;   1. The cell's own tests (re-run if not already green).
+      ;;   2. Per-cell contract validation (sporulator.cell-validate):
+      ;;      - schemas parse as valid Malli (catches `[:?]`-style
+      ;;        invented forms);
+      ;;      - sample input → handler → output validates against the
+      ;;        declared :output (catches handler-vs-schema drift that
+      ;;        happens when tests assert only on a few keys).
+      ;; Tests catch behaviour bugs; validation catches contract bugs.
       (let [result (if (:last-tests-green? state)
                      {:status :ok :passed? true :output "(using last green run)"}
                      (assemble-and-eval state))]
@@ -745,26 +847,38 @@ You're done when complete succeeds.")
           (err state (str "complete blocked — " (:output result)
                           "\nFix the failure and run_tests again, or give_up."))
 
-          (:passed? result)
-          (ok (assoc state
-                :green-files       (or (:green-files state) (:files state))
-                :last-tests-green? true
-                :phase             :done
-                :status            :ok)
-              "complete: tests green, finalizing.")
-
-          :else
+          (not (:passed? result))
           ;; Reuse run_tests' structured first-failure format so the
           ;; agent gets the same clean signal regardless of which tool
-          ;; surface caught the failure. Otherwise complete returns
-          ;; raw clojure.test text and the agent has to triage twice
-          ;; (once on run_tests, once on complete).
+          ;; surface caught the failure.
           (err (assoc state :last-tests-green? false)
                (str "complete blocked — tests not green.\n\n"
                     (format-run-tests-failure
                       result
                       (or (:pass-count-history state) []))
-                    "\n\nFix the failure and run_tests again, or give_up."))))
+                    "\n\nFix the failure and run_tests again, or give_up."))
+
+          :else
+          (let [validation (try
+                             (cv/validate-contract!
+                               {:cell-id           (:cell-id state)
+                                :resource-fixtures (:resource-fixtures (:brief state))})
+                             (catch Throwable t
+                               {:status :error :phase :validate-internal
+                                :message (.getMessage t)}))]
+            (if (= :ok (:status validation))
+              (ok (assoc state
+                    :green-files       (or (:green-files state) (:files state))
+                    :last-tests-green? true
+                    :phase             :done
+                    :status            :ok)
+                  "complete: tests green + contract validated, finalizing.")
+              (err state
+                   (str "complete blocked — tests pass but the contract "
+                        "validation failed.\n\n"
+                        (cv/format-error validation)
+                        "\n\nFix the schema or handler shape, then run_tests "
+                        "and complete again."))))))
 
       :give_up
       (ok (assoc state

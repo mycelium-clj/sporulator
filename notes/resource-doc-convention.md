@@ -1,22 +1,41 @@
-# Resource doc convention (`:mycelium/doc` in `system.edn`)
+# Resource doc convention (`:mycelium/doc` + `:mycelium/fixture` in `system.edn`)
 
 For each resource a cell can `:requires`, the project's
-`resources/system.edn` should ship a `:mycelium/doc` string that the
-orchestrator lifts into the cell-implementor's prompt. This is
-**how the model learns this project's conventions for the resources
-it works with** — without the harness baking in library-specific
-knowledge.
+`resources/system.edn` should ship two pieces of metadata that the
+orchestrator lifts into the cell-implementor's harness:
+
+1. `:mycelium/doc` — a string explaining the resource's purpose,
+   shape, conventions, and don'ts (the project's library-specific
+   knowledge for this resource).
+2. `:mycelium/fixture` — a Clojure form (read as data) that, when
+   evaluated, returns a freshly-initialized resource value. The
+   harness pre-binds this under `(:k resources)` for the agent's
+   `:eval` tool, so the agent can call its handler against a real
+   instance without inventing setup boilerplate.
+
+Together these are **how the model learns this project's conventions
+for the resources it works with** — without the harness baking in
+library-specific knowledge.
 
 The Phase-4 hardcoded blocks (`jdbc-handler-shape-block`,
 `jdbc-leaf-hints`, `jdbc-test-shape-block`) were a band-aid for
 projects that lacked rich resource docs. They've been removed; the
-correct channel is the `system.edn` doc.
+correct channel is the `system.edn` doc + fixture.
 
 ## Shape
 
 ```edn
 {:db/sqlite
  {:dbname "todos.sqlite"
+  :mycelium/fixture
+  (let [f  (java.io.File/createTempFile "fix-" ".sqlite")
+        _  (.deleteOnExit f)
+        ds (next.jdbc/get-datasource
+             {:dbtype "sqlite" :dbname (.getAbsolutePath f)})]
+    (next.jdbc/execute! ds
+      ["CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            title TEXT NOT NULL, ...)"])
+    ds)
   :mycelium/doc
   "## Purpose
    <One paragraph: what role does this resource play in the app?>
@@ -37,7 +56,8 @@ correct channel is the `system.edn` doc.
  {:db #ig/ref :db/sqlite}}
 ```
 
-The orchestrator's `extract-resource-docs` cross-references
+The orchestrator's `extract-resource-docs` and
+`extract-resource-fixtures` both cross-reference
 `:reitit.routes/pages` to map integrant keys back to the names
 cells use in their `:requires`. So `:db/sqlite` becomes `:db` for
 cells.
@@ -87,6 +107,52 @@ from rediscovering them empirically. Examples:
 These also save tokens — without them the agent burns turns
 trying anti-patterns it'd reach for from training data.
 
+## `:mycelium/fixture` — what goes here
+
+A single Clojure form (read as data, evaluated per-`:eval`) that
+returns a fresh, ready-to-use instance of this resource. The agent's
+`:eval` tool wraps user code in:
+
+```clojure
+(def resources {:db <fixture-form-evaluated>, ...})
+;; user code
+```
+
+so the agent calls
+
+```clojure
+((:handler (mycelium.cell/get-cell! :foo/bar)) resources {:k v})
+```
+
+against the same shape of resource the runtime will pass. Each `:eval`
+gets a clean instance — state does not leak between evals.
+
+Properties to aim for:
+- **Self-contained.** The form must be evaluable on its own; the
+  harness pre-requires every Clojure namespace mentioned by qualified
+  symbols in the form (it auto-detects `next.jdbc/...` etc.).
+- **Fresh state.** Each `:eval` creates a new instance — fresh schema,
+  empty tables, fresh in-memory cache, etc. Don't share state across
+  calls within a session.
+- **Schema-applied.** For a DB resource, run `CREATE TABLE` (and any
+  seed inserts) inside the fixture. The agent should not have to set
+  up the table itself.
+- **Realistic library/return shape.** Use the same library and config
+  shape your runtime uses. The point is for the agent to verify what
+  `next.jdbc/execute!` actually returns under your project's idioms.
+- **Cheap.** It runs on every `:eval` call. An in-memory or temp-file
+  sqlite is fine; a 30-second initial load is not.
+
+For SQLite specifically, prefer a temp file over `:memory:` —
+`next.jdbc/get-datasource` over `:memory:` opens a fresh in-memory DB
+per connection, so a schema applied via one connection isn't visible
+to the next.
+
+The harness extracts these via `extract-resource-fixtures` and threads
+them into the brief under `:resource-fixtures`. `agent-loop`'s `:eval`
+handler then splices a `(def resources {...})` prelude with the
+relevant subset (filtered by the cell's `:requires`).
+
 ## Why not generate this doc automatically?
 
 Because the conventions are project-decisions, not universal facts.
@@ -102,12 +168,22 @@ The architect (graph-agent) could be extended to also produce the
 `system.edn` alongside the manifest — that's a future direction.
 For now, the project author writes it.
 
-## Cold-start: what if there's no doc?
+## Cold-start: what if there's no doc / fixture?
 
-The orchestrator falls back to `(no docstring; treat as the real
-runtime resource)`. The agent has its training data, the brief, the
-test contract, and the `:eval` REPL — it can usually figure out the
-library. But for any non-trivial library / convention, the project
-should ship a doc; it's the difference between "agent converges in
-turn 1" and "agent burns 25 turns groping for the right shape" (Phase
-4 validation, JDBC INSERT case).
+If `:mycelium/doc` is absent, the orchestrator falls back to
+`(no docstring; treat as the real runtime resource)` in the prompt.
+
+If `:mycelium/fixture` is absent, the agent's `:eval` tool falls back
+to its prior behavior — no `resources` is pre-bound, and the agent has
+to construct its own resource (calling `next.jdbc/get-datasource`
+inside `:eval` etc.). For trivial pure cells, this is fine; for any
+cell with `:requires`, ship a fixture — the agent's first `:eval` is
+typically `(:db resources)` to confirm the shape, and skipping that
+shape-discovery turn matters.
+
+The agent has its training data, the brief, the test contract, and the
+`:eval` REPL — it can usually figure out the library. But for any
+non-trivial library / convention, the project should ship a doc + a
+fixture; it's the difference between "agent converges in turn 1" and
+"agent burns 25 turns groping for the right shape" (Phase 4
+validation, JDBC INSERT case).

@@ -11,13 +11,15 @@
             [sporulator.eval :as ev]
             [sporulator.extract :as extract]
             [sporulator.feedback :refer [feedback-loop]]
+            [sporulator.graph-agent :as graph-agent]
             [sporulator.llm :as llm]
             [sporulator.hashline :as hashline]
             [sporulator.manifest-diff :as manifest-diff]
             [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
             [sporulator.source-gen :as source-gen]
-            [sporulator.store :as store]))
+            [sporulator.store :as store]
+            [sporulator.workflow-smoke :as smoke]))
 
 ;; ── System EDN reading ────────────────────────────────────────
 
@@ -42,34 +44,54 @@
         (clojure.edn/read-string {:readers aero-readers} (slurp f))))
     (catch Exception _ nil)))
 
+(defn- ig->injection-key-map
+  "Reads :reitit.routes/pages out of a parsed system.edn and returns a
+   map from integrant key (e.g. :db/sqlite) to injection key (e.g. :db).
+   These are the names cells `:requires`."
+  [sys-edn]
+  (let [routes-cfg (get sys-edn :reitit.routes/pages)]
+    (when (map? routes-cfg)
+      (into {} (keep (fn [[inject-key ig-ref]]
+                       (when (keyword? ig-ref)
+                         [ig-ref inject-key]))
+                     routes-cfg)))))
+
+(defn- extract-resource-attribute
+  "Generic helper: pulls a single attribute (`:mycelium/doc`,
+   `:mycelium/fixture`, …) off every resource in a parsed system.edn
+   and rekeys by the injection key cells use in `:requires`."
+  [sys-edn attr]
+  (when sys-edn
+    (let [vals-by-ig-key (->> sys-edn
+                              (keep (fn [[k v]]
+                                      (when (and (map? v) (contains? v attr))
+                                        [k (get v attr)])))
+                              (into {}))
+          ig->injection  (ig->injection-key-map sys-edn)]
+      (->> vals-by-ig-key
+           (map (fn [[ig-key v]]
+                  [(or (get ig->injection ig-key) (keyword (name ig-key))) v]))
+           (into {})))))
+
 (defn extract-resource-docs
   "Extracts :mycelium/doc metadata from a parsed system.edn map.
    Cross-references with :reitit.routes/pages to find the key name
    each resource is injected under (e.g. :db, not :sqlite).
    Returns {resource-keyword doc-string}."
   [sys-edn]
-  (when sys-edn
-    (let [;; Build mapping: integrant-key → :mycelium/doc
-          docs-by-ig-key (->> sys-edn
-                              (keep (fn [[k v]]
-                                      (when (and (map? v) (:mycelium/doc v))
-                                        [k (:mycelium/doc v)])))
-                              (into {}))
-          ;; Get the routes config to find injection key names
-          ;; :reitit.routes/pages {:db #ig/ref :db/sqlite} → :db/sqlite is injected as :db
-          routes-cfg (get sys-edn :reitit.routes/pages)
-          ;; Build reverse: integrant-key → injection-key
-          ig->injection (when (map? routes-cfg)
-                          (into {} (map (fn [[inject-key ig-ref]]
-                                         (when (keyword? ig-ref)
-                                           [ig-ref inject-key]))
-                                       routes-cfg)))]
-      (->> docs-by-ig-key
-           (map (fn [[ig-key doc]]
-                  (let [inject-key (or (get ig->injection ig-key)
-                                      (keyword (name ig-key)))]
-                    [inject-key doc])))
-           (into {})))))
+  (extract-resource-attribute sys-edn :mycelium/doc))
+
+(defn extract-resource-fixtures
+  "Extracts :mycelium/fixture forms from a parsed system.edn map.
+   Each fixture is a Clojure form (read as data) that, when evaluated,
+   returns a freshly-initialized resource value (e.g. a DataSource
+   with the schema applied). Used by the cell-implementor's `:eval`
+   tool to pre-bind `resources` so the agent doesn't have to invent
+   library setup boilerplate.
+
+   Returns {resource-keyword fixture-form-as-data}."
+  [sys-edn]
+  (extract-resource-attribute sys-edn :mycelium/fixture))
 
 ;; ── Formatting ────────────────────────────────────────────────
 
@@ -770,6 +792,130 @@
   [cell-id]
   {:status :ok :cell-id (cell-id-keyword cell-id) :carried-over? true})
 
+;; ── Architect repair loop ─────────────────────────────────────
+;;
+;; When the manifest fails edge-validation, we re-spawn the graph-agent
+;; with the structured errors as a hint and ask for an amendment.
+;; Reuses graph-agent/chat-stream-with-feedback's internal validate-
+;; loop, which already retries when the LLM returns a still-broken
+;; manifest. After the architect responds with a candidate, we re-run
+;; validate-edges; if still :error, retry up to `max-retries` more
+;; times. The fix may legitimately need several rounds — surfacing a
+;; second-order issue only after the first is addressed is normal.
+
+(defn- format-validation-hint
+  "Renders a manifest-validation result as a multi-line message the
+   architect can use to amend the manifest. Includes the structured
+   error list AND a canonical-form recipe so the architect doesn't
+   keep inventing `:any`/`[:?]`/etc. workarounds."
+  [validation]
+  (str/trim
+    (str (mv/format-issues
+           (select-keys validation [:issues :mismatches]))
+         "\n\n"
+         "## Canonical schema forms (use these exactly)\n\n"
+         "**Required map entry:** `[:k :type]`\n"
+         "**Optional map entry:** `[:k {:optional true} :type]`\n"
+         "**Map with mixed required + optional fields:**\n"
+         "  `[:map [:id :int] [:filter {:optional true} [:enum \"a\" \"b\"]]]`\n"
+         "**Forbidden:** `:output :any` — every cell must declare what it produces\n"
+         "**Forbidden in map entries:** `[:? :type]`, `[:* :type]`, `[:+ :type]` — "
+         "those are SEQUENCE schemas, not optional markers. Use `{:optional true}` "
+         "in the entry props instead.\n\n"
+         "## When a cell has multiple outgoing edges (dispatched edges)\n\n"
+         "If a cell's `:edges` entry is a map (e.g. "
+         "`{:list :a, :add :b, :toggle :c}`), the cell must declare a "
+         "**per-transition `:output`** — a map keyed by the same transition "
+         "labels, where each value is a `[:map ...]` describing the data "
+         "shape produced on THAT transition. Each transition's output must "
+         "supply every REQUIRED key the corresponding target cell's `:input` "
+         "declares.\n\n"
+         "Example for a router with three branches:\n"
+         "```clojure\n"
+         ":output {:list   [:map [:filter {:optional true} [:enum \"all\" \"active\"]]]\n"
+         "         :add    [:map [:title :string]]\n"
+         "         :toggle [:map [:id :int]]}\n"
+         "```\n\n"
+         "A single-shape `:output` with all-optional keys does NOT satisfy "
+         "downstream consumers that require those keys — the producer's "
+         "REQUIRED keys are what counts.\n\n"
+         "Return the corrected manifest as a single EDN block in a "
+         "```clojure``` fence — no commentary outside the fence.")))
+
+(defn- ask-architect-to-repair!
+  "One repair turn — sends the validation report to the graph-agent
+   and returns whatever manifest it parses back (or the original if
+   the LLM didn't return a parseable manifest). The session is shared
+   across all attempts in one repair-manifest! loop so the architect
+   accumulates feedback rather than starting from scratch each turn.
+
+   We use `llm/session-send-stream` directly (rather than
+   chat-stream-with-feedback) because our enclosing repair-manifest!
+   loop already handles retries — chaining two feedback loops just
+   confused the response-shape contract.
+
+   `attempt 0` includes the full manifest in the prompt; subsequent
+   attempts include only the validation diff so the architect doesn't
+   waste tokens re-reading what's already in its session."
+  [client session manifest validation attempt {:keys [on-event on-chunk]}]
+  (let [hint    (format-validation-hint validation)
+        prompt  (if (zero? attempt)
+                  (str "The manifest you produced has schema-compatibility "
+                       "issues. Here is the current manifest:\n\n```edn\n"
+                       (pr-str manifest) "\n```\n\n"
+                       "Validation report:\n" hint)
+                  (str "Your last amendment still has issues. Validation "
+                       "report:\n" hint
+                       "\n\nReturn another corrected manifest."))
+        _       (emit on-event "manifest_repair" "started" :attempt attempt)
+        resp    (llm/session-send-stream session client prompt
+                  (or on-chunk (fn [_])))
+        content (:content resp)
+        amended (graph-agent/extract-manifest content)]
+    (or amended manifest)))
+
+(defn repair-manifest!
+  "Drives the architect repair loop until validate-edges is clean OR
+   we hit `max-retries`. The architect sees ONE persistent LLM session
+   across all attempts, so it accumulates context (the original
+   manifest, prior attempts, prior errors) rather than starting from
+   scratch every turn — important for second-order issues that only
+   surface once a first-order issue is fixed.
+
+   Returns
+     {:status :ok        :manifest <amended>}
+     {:status :exhausted :manifest <last-attempt> :validation <last-errors>}"
+  [client initial-manifest initial-validation
+   {:keys [max-retries run-id on-event on-chunk]
+    :or   {max-retries 3}
+    :as   opts}]
+  (let [session-id (or (:session-id opts)
+                       (str "manifest-repair-" run-id))
+        ;; One session for the whole loop — accumulates feedback.
+        session    (llm/create-session session-id prompts/graph-prompt)]
+    (loop [attempt    0
+           manifest   initial-manifest
+           validation initial-validation]
+      (cond
+        (= :ok (:status validation))
+        {:status :ok :manifest manifest}
+
+        (>= attempt max-retries)
+        (do (emit on-event "manifest_repair" "exhausted"
+                  :attempts attempt)
+            {:status :exhausted :manifest manifest :validation validation})
+
+        :else
+        (let [_         (emit on-event "manifest_repair" "attempting"
+                              :attempt attempt)
+              new-mani  (ask-architect-to-repair! client session manifest
+                                                  validation attempt opts)
+              new-valid (mv/validate-edges new-mani)]
+          (when (= :ok (:status new-valid))
+            (emit on-event "manifest_repair" "succeeded"
+                  :attempts (inc attempt)))
+          (recur (inc attempt) new-mani new-valid))))))
+
 (defn orchestrate!
   "Runs the full TDD orchestration for a set of leaf cells, diff-aware:
    compares the supplied manifest against the latest green snapshot for
@@ -797,7 +943,56 @@
         on-chunk (or on-chunk (fn [_]))
         ;; Canonical manifest-id form (no leading colon) for snapshots
         ;; and run records.
-        manifest-id (manifest-diff/normalize-manifest-id manifest-id)]
+        manifest-id (manifest-diff/normalize-manifest-id manifest-id)
+        ;; Manifest gate — if the architect's manifest has opaque
+        ;; outputs or schema mismatches between cells sharing an edge,
+        ;; the run is doomed before it starts. Bail before spending
+        ;; LLM tokens on test-gen / impl. Uses the schema-only
+        ;; validator (validate-edges); structural minutiae are
+        ;; mycelium's concern at workflow-compile time.
+        ;;
+        ;; If validation fails AND we have an LLM client, run the
+        ;; architect repair loop: re-spawn the graph-agent with the
+        ;; structured errors and ask for an amendment. Repeat until
+        ;; the manifest is clean or we exhaust retries. If the architect
+        ;; can't fix it, fail the run with `manifest_invalid` so the
+        ;; caller can surface the unresolved errors to a human.
+        initial-validation (when manifest (mv/validate-edges manifest))
+        repair-result      (when (and client manifest
+                                      (= :error (:status initial-validation)))
+                             (repair-manifest! client manifest initial-validation
+                               {:run-id   run-id
+                                :store    store
+                                :on-event on-event
+                                :on-chunk on-chunk}))
+        manifest           (if repair-result (:manifest repair-result) manifest)
+        validation         (cond
+                             ;; Repair ran AND succeeded → clean.
+                             (and repair-result (= :ok (:status repair-result)))
+                             {:status :ok}
+
+                             ;; Repair ran AND exhausted → return its
+                             ;; last validation as the failure to surface.
+                             (and repair-result (= :exhausted (:status repair-result)))
+                             (:validation repair-result)
+
+                             ;; No repair attempted (no client, no manifest, or
+                             ;; it was already valid).
+                             :else
+                             initial-validation)]
+    (if (= :error (:status validation))
+      (do
+        (emit on-event "manifest" "invalid"
+              :issues     (or (:issues validation) [])
+              :mismatches (mapv #(select-keys % [:source-name :target-name
+                                                  :missing-fields :type-diffs])
+                                (or (:mismatches validation) [])))
+        {"status"     "manifest_invalid"
+         "run_id"     run-id
+         :issues      (:issues validation)
+         :mismatches  (:mismatches validation)
+         :manifest    manifest})
+      (do
 
     ;; Create run in store
     (when store
@@ -842,10 +1037,11 @@
                                             [(:id cell-def) cell-name]))
                                   (:cells manifest)))
 
-            ;; Load resource docs from system.edn
-            resource-docs (when project-path
-                            (extract-resource-docs
-                              (read-system-edn (str project-path "/resources/system.edn"))))
+            ;; Load resource docs + fixtures from system.edn.
+            sys-edn           (when project-path
+                                (read-system-edn (str project-path "/resources/system.edn")))
+            resource-docs     (extract-resource-docs sys-edn)
+            resource-fixtures (extract-resource-fixtures sys-edn)
 
             ;; Filter leaves to only those that need regeneration. Carry-over
             ;; and removed cells are handled above; we don't waste LLM calls
@@ -868,12 +1064,13 @@
                                  context (when (and manifest cell-name)
                                            (let [ctx (mv/build-graph-context manifest cell-name)]
                                              (mv/format-graph-context ctx)))]
-                             {:id            cell-id
-                              :doc           doc
-                              :schema        (str "{:input " input-schema " :output " output-schema "}")
-                              :requires      requires
-                              :resource-docs resource-docs
-                              :context       context}))
+                             {:id                cell-id
+                              :doc               doc
+                              :schema            (str "{:input " input-schema " :output " output-schema "}")
+                              :requires          requires
+                              :resource-docs     resource-docs
+                              :resource-fixtures resource-fixtures
+                              :context           context}))
                          actionable-leaves)]
 
       ;; Phase 1: Generate test contracts.
@@ -1037,37 +1234,144 @@
                   (emit on-event "compile" "failed"
                         :error (.getMessage e)))))
 
-            ;; On full success, record a new green snapshot so subsequent
-            ;; runs can diff against this manifest version.
-            (when (and store (seq manifest-id) manifest
-                       (empty? failed) (empty? failed-impl))
-              (let [m-row (store/get-latest-manifest store manifest-id)]
-                (store/save-green-snapshot! store
-                  {:manifest-id      manifest-id
-                   :manifest-version (or (:version m-row) 1)
-                   :body             (or (:body m-row) (pr-str manifest))
-                   :run-id           run-id})))
+            ;; Smoke-test the assembled workflow before declaring victory.
+            ;; Per-cell tests verify each cell in isolation, but they don't
+            ;; catch integration-level mismatches like:
+            ;; - chain-validator errors (cell outputs don't supply the keys
+            ;;   downstream cells need)
+            ;; - schema-form errors that only surface when malli actually
+            ;;   tries to validate input/output (e.g. invented `[:?]` shapes)
+            ;; The smoke test pre-compiles the manifest and runs a synthetic
+            ;; request through it. Failure means we have a green-per-cell
+            ;; but red-as-a-whole workflow — don't record a green snapshot.
+            (let [all-cells-green?  (and (empty? failed) (empty? failed-impl))
+                  ;; Smoke test only runs when:
+                  ;; - all per-cell tests passed (no point smoking a known-broken graph)
+                  ;; - the caller supplied a project-path (so we can locate
+                  ;;   system.edn for fixtures + the manifest is real)
+                  smoke-runnable?   (and all-cells-green? (seq project-path) manifest)
+                  resource-fixtures (when smoke-runnable?
+                                      (extract-resource-fixtures
+                                        (read-system-edn
+                                          (str project-path "/resources/system.edn"))))
+                  ;; One-shot smoke runner — used both for the initial run
+                  ;; and for verifying after each auto-feedback retry.
+                  run-smoke!
+                  (fn []
+                    (try (smoke/smoke-test!
+                           {:manifest          manifest
+                            :resource-fixtures resource-fixtures})
+                         (catch Throwable t
+                           {:status :error :phase :exception
+                            :message (.getMessage t)})))
+                  ;; Re-implementation closure: when smoke fails with a
+                  ;; localizable :cell-id, re-spawn the cell-implementor
+                  ;; for that cell with the smoke error as a task hint.
+                  ;; Returns true if a re-impl was attempted.
+                  contracts-by-cell (into {} (map (juxt :cell-id identity)) approved)
+                  re-implement-with-hint!
+                  (fn [cell-id hint]
+                    (when-let [contract (get contracts-by-cell (str cell-id))]
+                      (let [cid-kw  (cell-id-keyword (:cell-id contract))
+                            class   (get cell-class cid-kw)
+                            edit?   (#{:doc-changed :schema-changed} class)
+                            summary (when edit?
+                                      (manifest-diff/change-summary
+                                        (get prev-cells-by-id cid-kw)
+                                        (get new-cells-by-id cid-kw)))
+                            task    (str "The workflow integration smoke test "
+                                         "failed at this cell. Concretely:\n\n"
+                                         hint
+                                         "\n\nFix the cell so the smoke test "
+                                         "passes; the per-cell tests must "
+                                         "still hold.")]
+                        (emit on-event "smoke_feedback" "re_implementing"
+                              :cell_id (str cell-id) :hint hint)
+                        (implement-from-contract client
+                          {:contract       contract
+                           :store          store
+                           :run-id         run-id
+                           :on-event       on-event
+                           :on-chunk       on-chunk
+                           :max-attempts   max-attempts
+                           :project-path   project-path
+                           :base-ns        base-ns
+                           :prev-source    nil
+                           :change-summary summary
+                           :task           task})
+                        true)))
+                  ;; Smoke + retry loop. Cap at 2 retries: a real
+                  ;; architecture bug won't be fixed by re-running the
+                  ;; same agent, so don't burn budget chasing it.
+                  smoke-result
+                  (when smoke-runnable?
+                    (emit on-event "smoke_test" "started")
+                    (loop [attempt 0]
+                      (let [result (run-smoke!)]
+                        (cond
+                          (= :ok (:status result))
+                          result
 
-            ;; Update run status and tree
-            (let [final-status (if (and (empty? failed) (empty? failed-impl))
-                                 "completed" "partial")
-                  tree-json    (json/write-str
-                                 {:passed (mapv :cell-id passed)
-                                  :failed (into (mapv :cell-id failed)
-                                                (mapv :cell-id failed-impl))})]
-              (when store
-                (store/update-run-tree! store run-id final-status tree-json))
-              (emit on-event "complete" "done"
-                    :passed (count passed)
-                    :failed (+ (count failed) (count failed-impl)))
+                          (>= attempt 2)
+                          result
 
-              {"status"      (if (= "completed" final-status) "ok" "partial")
-               "run_id"      run-id
-               "passed"      (mapv :cell-id passed)
-               "failed"      (into (mapv :cell-id failed)
-                                   (mapv :cell-id failed-impl))
-               :results      all-results
-               :diff         diff-result}))))))))
+                          (and (:cell-id result)
+                               (re-implement-with-hint!
+                                 (:cell-id result)
+                                 (smoke/format-error result)))
+                          (recur (inc attempt))
+
+                          :else
+                          result))))
+                  smoke-ok?        (or (nil? smoke-result)
+                                       (= :ok (:status smoke-result)))]
+              (when smoke-result
+                (if smoke-ok?
+                  (emit on-event "smoke_test" "passed")
+                  (emit on-event "smoke_test" "failed"
+                        :phase   (some-> (:phase smoke-result) name)
+                        :cell_id (some-> (:cell-id smoke-result) str)
+                        :message (smoke/format-error smoke-result))))
+
+              ;; On full success (cells green AND smoke passes), record a
+              ;; new green snapshot so subsequent runs can diff against this
+              ;; manifest version.
+              (when (and store (seq manifest-id) manifest
+                         all-cells-green? smoke-ok?)
+                (let [m-row (store/get-latest-manifest store manifest-id)]
+                  (store/save-green-snapshot! store
+                    {:manifest-id      manifest-id
+                     :manifest-version (or (:version m-row) 1)
+                     :body             (or (:body m-row) (pr-str manifest))
+                     :run-id           run-id})))
+
+              ;; Update run status and tree
+              (let [final-status (cond
+                                   (not all-cells-green?) "partial"
+                                   (not smoke-ok?)        "smoke_failed"
+                                   :else                  "completed")
+                    tree-json    (json/write-str
+                                   {:passed (mapv :cell-id passed)
+                                    :failed (into (mapv :cell-id failed)
+                                                  (mapv :cell-id failed-impl))})]
+                (when store
+                  (store/update-run-tree! store run-id final-status tree-json))
+                (emit on-event "complete" "done"
+                      :passed (count passed)
+                      :failed (+ (count failed) (count failed-impl))
+                      :smoke (if smoke-ok? "ok" "failed"))
+
+                {"status"        (case final-status
+                                   "completed"    "ok"
+                                   "smoke_failed" "smoke_failed"
+                                   "partial"      "partial")
+                 "run_id"        run-id
+                 "passed"        (mapv :cell-id passed)
+                 "failed"        (into (mapv :cell-id failed)
+                                       (mapv :cell-id failed-impl))
+                 :results        all-results
+                 :diff           diff-result
+                 :smoke-result   smoke-result})))))))))))
 
 ;; ── Resume ─────────────────────────────────────────────────────
 
@@ -1200,7 +1504,22 @@
         on-event    (or on-event (fn [_]))
         on-chunk    (or on-chunk (fn [_]))
         manifest-id (manifest-diff/normalize-manifest-id manifest-id)
-
+        ;; Same gate as orchestrate! — fail fast on opaque outputs or
+        ;; edge schema mismatches before doing any work.
+        validation  (when manifest (mv/validate-edges manifest))]
+    (when (= :error (:status validation))
+      (emit on-event "manifest" "invalid"
+            :issues     (or (:issues validation) [])
+            :mismatches (mapv #(select-keys % [:source-name :target-name
+                                                :missing-fields :type-diffs])
+                              (or (:mismatches validation) []))))
+    (if (= :error (:status validation))
+      {"status"     "manifest_invalid"
+       "run_id"     run-id
+       :issues      (:issues validation)
+       :mismatches  (:mismatches validation)
+       :manifest    manifest}
+      (let [
         ;; ── Diff against the previous green snapshot ──────────────
         prev-snapshot (when (and store (seq manifest-id))
                         (store/get-latest-green-snapshot store manifest-id))
@@ -1227,19 +1546,14 @@
                         (into {} (map (fn [[cn cd]] [(:id cd) cn]))
                               (:cells manifest)))
 
-        ;; Load resource docs from system.edn
-        resource-docs (try
-                        (when project-path
-                          (let [f (java.io.File. (str project-path "/resources/system.edn"))]
-                            (when (.exists f)
-                              (let [sys (binding [*read-eval* false]
-                                          (read-string (slurp f)))]
-                                (->> sys
-                                     (keep (fn [[k v]]
-                                             (when (and (map? v) (:mycelium/doc v))
-                                               [(keyword (name k)) (:mycelium/doc v)])))
-                                     (into {}))))))
-                        (catch Exception _ nil))
+        ;; Load resource docs + fixtures from system.edn. Both go through
+        ;; the aero-tolerant reader so #or / #env / #ig/ref tags don't
+        ;; trip parsing, and both cross-reference :reitit.routes/pages
+        ;; so the keys match what cells use in :requires (e.g. :db).
+        sys-edn          (when project-path
+                           (read-system-edn (str project-path "/resources/system.edn")))
+        resource-docs    (extract-resource-docs sys-edn)
+        resource-fixtures (extract-resource-fixtures sys-edn)
 
         ;; Build briefs from leaves
         briefs (mapv (fn [leaf]
@@ -1255,12 +1569,13 @@
                              context (when (and manifest cell-name)
                                        (let [ctx (mv/build-graph-context manifest cell-name)]
                                          (mv/format-graph-context ctx)))]
-                         {:id            cell-id
-                          :doc           doc
-                          :schema        (str "{:input " input-schema " :output " output-schema "}")
-                          :requires      requires
-                          :resource-docs resource-docs
-                          :context       context}))
+                         {:id                cell-id
+                          :doc               doc
+                          :schema            (str "{:input " input-schema " :output " output-schema "}")
+                          :requires          requires
+                          :resource-docs     resource-docs
+                          :resource-fixtures resource-fixtures
+                          :context           context}))
                      leaves)
 
         ;; Initialize per-cell state
@@ -1347,7 +1662,7 @@
                   :run_id run-id
                   :error (.getMessage e))))))
 
-    run-id))
+    run-id))))
 
 (defn approve-tests!
   "Approves a cell's tests. Writes test file to disk, starts implementation.
