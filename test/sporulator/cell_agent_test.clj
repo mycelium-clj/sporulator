@@ -1,6 +1,7 @@
 (ns sporulator.cell-agent-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.string :as str]
+            [sporulator.agent-loop :as agent-loop]
             [sporulator.cell-agent :as ca]
             [sporulator.store :as store]
             [sporulator.eval :as ev]
@@ -86,87 +87,80 @@
         (is (= "cell-agent" (:created-by cell)))))))
 
 ;; =============================================================
-;; implement-with-feedback (using mock LLM)
+;; mock agent helpers
 ;; =============================================================
 
-(def ^:private good-cell-response
-  "Here is your cell:
-```clojure
-(ns sporulator.test.cells.mock-impl
-  (:require [mycelium.cell :as cell]))
+(defn- mock-agent-success
+  "Returns a mock agent-loop/run! that immediately succeeds."
+  [code raw session]
+  {:status  :ok
+   :cell-id :cell-under-test
+   :code    code
+   :raw     raw
+   :session session})
 
-(cell/defcell :test/mock-impl
-  {:doc \"Doubles the input\"
-   :input {:x :int}
-   :output {:doubled :int}}
-  (fn [_ data] {:doubled (* 2 (:x data))}))
-```")
-
-(def ^:private bad-then-good-responses (atom []))
-
-(defn- make-mock-session
-  "Creates a mock LLM session that returns canned responses in order."
-  [responses]
-  (let [idx (atom 0)
-        msgs (atom [])]
-    {:id "mock"
-     :system-prompt ""
-     :messages msgs
-     :responses responses
-     :response-idx idx}))
+(defn- mock-agent-error
+  "Returns a mock agent-loop/run! that produces an error."
+  [error-msg session]
+  {:status  :error
+   :cell-id :cell-under-test
+   :error   error-msg
+   :session session})
 
 (deftest implement-with-feedback-test
-  (testing "succeeds on first attempt with valid cell"
-    (let [events   (atom [])
-          ;; Mock the LLM: return a valid cell on first try
-          result   (with-redefs [llm/session-send-stream
-                                 (fn [session client msg on-chunk & _]
-                                   (swap! (:messages session) conj {:role "user" :content msg})
-                                   (let [resp good-cell-response]
-                                     (on-chunk resp)
-                                     (swap! (:messages session) conj {:role "assistant" :content resp})
-                                     resp))]
-                     (ca/implement-with-feedback
-                       nil ;; client (mocked)
-                       {:id     ":test/mock-impl"
-                        :doc    "Doubles the input"
-                        :schema "{:input {:x :int} :output {:doubled :int}}"}
-                       (fn [_chunk])
-                       :on-feedback (fn [e] (swap! events conj e))))]
+  (testing "succeeds when agent loop returns ok"
+    (let [events (atom [])
+          session (llm/create-session "mock-ok" "prompt")
+          result (with-redefs [agent-loop/run!
+                               (fn [opts]
+                                 (let [evt-fn (:on-event opts)]
+                                   (evt-fn {"status" "started"})
+                                   (evt-fn {"status" "done"}))
+                                 (mock-agent-success
+                                   "(ns test.cells.mock-impl ...)"
+                                   "(fn [_ data] {:doubled (* 2 (:x data))})"
+                                   session))]
+                   (ca/implement-with-feedback
+                     nil
+                     {:id     ":test/mock-impl"
+                      :doc    "Doubles the input"
+                      :schema "{:input {:x :int} :output {:doubled :int}}"}
+                     (fn [_chunk])
+                     :on-feedback (fn [e] (swap! events conj e))))]
       (is (= :ok (:status result)))
       (is (= ":test/mock-impl" (:cell-id result)))
       (is (some? (:code result)))
-      ;; Should have a success event
-      (is (some #(= "success" (:event-type %)) @events))))
+      (is (= session (:session result)))
+      (is (some #(= "done" (:event-type %)) @events))))
 
-  (testing "retries on eval error then succeeds"
+  (testing "returns error when agent loop fails"
     (let [events (atom [])
-          ;; First response: broken code, second: fixed
-          call-count (atom 0)
-          result (with-redefs [llm/session-send-stream
-                               (fn [session client msg on-chunk & _]
-                                 (swap! (:messages session) conj {:role "user" :content msg})
-                                 (let [resp (if (zero? @call-count)
-                                              ;; First call: return code with undefined symbol
-                                              "```clojure\n(ns sporulator.test.cells.retry1\n  (:require [mycelium.cell :as cell]))\n\n(cell/defcell :test/retry-cell\n  {:doc \"Test retry\"\n   :input {:x :int} :output {:y :int}}\n  (fn [_ data] {:y (UNDEFINED-FN (:x data))}))\n```"
-                                              ;; Second call: return fixed code
-                                              "```clojure\n(ns sporulator.test.cells.retry1\n  (:require [mycelium.cell :as cell]))\n\n(cell/defcell :test/retry-cell\n  {:doc \"Test retry\"\n   :input {:x :int} :output {:y :int}}\n  (fn [_ data] {:y (* 2 (:x data))}))\n```")]
-                                   (swap! call-count inc)
-                                   (on-chunk resp)
-                                   (swap! (:messages session) conj {:role "assistant" :content resp})
-                                   resp))]
+          session (llm/create-session "mock-err" "prompt")
+          result (with-redefs [agent-loop/run!
+                               (fn [opts]
+                                 (let [evt-fn (:on-event opts)]
+                                   (evt-fn {"status" "started"}))
+                                 (mock-agent-error "broken cell" session))]
                    (ca/implement-with-feedback
                      nil
-                     {:id     ":test/retry-cell"
-                      :doc    "Test retry"
+                     {:id     ":test/broken-cell"
+                      :doc    "Always broken"
                       :schema "{:input {:x :int} :output {:y :int}}"}
                      (fn [_chunk])
-                     :on-feedback (fn [e] (swap! events conj e))
-                     :max-attempts 3))]
-      (is (= :ok (:status result)))
-      ;; Should have error then success events
-      (is (some #(= "error" (:event-type %)) @events))
-      (is (some #(= "success" (:event-type %)) @events)))))
+                     :on-feedback (fn [e] (swap! events conj e))))]
+      (is (= :error (:status result)))
+      (is (= "broken cell" (:error result)))
+      (is (some #(= "started" (:event-type %)) @events))))
+
+  (testing "passes turn-budget from max-attempts"
+    (let [opts-captured (atom nil)]
+      (with-redefs [agent-loop/run! (fn [opts] (reset! opts-captured opts)
+                                      {:status :ok :cell-id :x :code "()" :raw "()" :session nil})]
+        (ca/implement-with-feedback nil
+          {:id ":test/x" :doc "X" :schema "{}"}
+          (fn [_])
+          :max-attempts 7))
+      (is (= 7 (:turn-budget @opts-captured))))))
 
 ;; =============================================================
 ;; implement-cells (parallel)
@@ -174,24 +168,19 @@
 
 (deftest implement-cells-test
   (testing "implements multiple cells in parallel"
-    (let [results (with-redefs [llm/session-send-stream
-                                (fn [session client msg on-chunk & _]
-                                  (swap! (:messages session) conj {:role "user" :content msg})
-                                  (let [cell-id (re-find #":test/parallel-\w+" msg)
-                                        ns-name (str "sporulator.test.cells."
-                                                     (last (str/split (or cell-id ":test/unknown") #"/")))
-                                        resp (str "```clojure\n(ns " ns-name
-                                                  "\n  (:require [mycelium.cell :as cell]))\n\n"
-                                                  "(cell/defcell " cell-id
-                                                  "\n  {:doc \"Parallel cell\""
-                                                  "\n   :input {:x :int} :output {:y :int}}"
-                                                  "\n  (fn [_ data] {:y (:x data)}))\n```")]
-                                    (on-chunk resp)
-                                    (swap! (:messages session) conj {:role "assistant" :content resp})
-                                    resp))]
+    (let [call-count (atom 0)
+          results (with-redefs [agent-loop/run!
+                                (fn [opts]
+                                  (swap! call-count inc)
+                                  {:status  :ok
+                                   :cell-id (:cell-id opts)
+                                   :code    (str "source for " (:cell-id opts))
+                                   :raw     "(fn [_ data] {:y (:x data)})"
+                                   :session nil})]
                     (ca/implement-cells
                       nil
                       [{:id ":test/parallel-a" :doc "Cell A" :schema "{:input {:x :int} :output {:y :int}}"}
                        {:id ":test/parallel-b" :doc "Cell B" :schema "{:input {:x :int} :output {:y :int}}"}]))]
       (is (= 2 (count results)))
-      (is (every? #(= :ok (:status %)) results)))))
+      (is (every? #(= :ok (:status %)) results))
+      (is (= 2 @call-count)))))

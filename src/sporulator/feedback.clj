@@ -28,7 +28,7 @@
          on-attempt (fn [_])}}]
   (loop [msg     initial-msg
          attempt 0]
-    (let [raw       (llm/session-send-stream session client msg on-chunk)
+    (let [raw       (:content (llm/session-send-stream session client msg on-chunk))
           extracted (extract-fn raw)
           result    (validate-fn extracted)]
       (on-attempt {:attempt (inc attempt) :extracted extracted

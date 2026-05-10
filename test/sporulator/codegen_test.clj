@@ -45,7 +45,59 @@
                     :schema {:input [:map] :output [:map]}
                     :fn-body '(fn [resources data] data)})]
       ;; pr-str handles quoting automatically
-      (is (str/includes? result (pr-str "Validate \"special\" input"))))))
+      (is (str/includes? result (pr-str "Validate \"special\" input")))))
+
+  (testing "dispatched output (legacy bare-map input): normalised to [:per-transition {...}] wrapper with vector sub-schemas"
+    ;; Mycelium now requires the explicit [:per-transition {...}] wrapper for
+    ;; per-transition output. A bare map is always interpreted as lite-map
+    ;; syntax. Codegen still accepts the legacy bare-map input shape from
+    ;; upstream parsers and normalises it to the wrapper at emit time, with
+    ;; each sub-schema in Malli vector form.
+    (let [result (codegen/assemble-cell-source
+                   {:cell-ns "app.cells.validate-handle"
+                    :cell-id :guestbook/validate-handle
+                    :doc "Validates a handle."
+                    :schema {:input  {:handle :string}
+                             :output {:success {:validated-handle :string}
+                                      :failure {:error :string}}}
+                    :fn-body '(fn [_ {:keys [handle]}]
+                                (if (seq handle)
+                                  {:validated-handle handle}
+                                  {:error "empty"}))})]
+      (is (str/includes? result ":output [:per-transition")
+          "dispatched output must emit the [:per-transition ...] wrapper")
+      (is (str/includes? result ":success [:map [:validated-handle :string]]")
+          "success sub-schema must render as a [:map ...] vector")
+      (is (str/includes? result ":failure [:map [:error :string]]")
+          "failure sub-schema must render as a [:map ...] vector")))
+
+  (testing "dispatched output already in [:per-transition {...}] wrapper: passthrough with vector sub-schemas"
+    (let [result (codegen/assemble-cell-source
+                   {:cell-ns "app.cells.x"
+                    :cell-id :x/y
+                    :doc "..."
+                    :schema {:input  [:map [:n :int]]
+                             :output [:per-transition
+                                      {:success [:map [:n :int]]
+                                       :failure [:map [:error :string]]}]}
+                    :fn-body '(fn [_ d] d)})]
+      (is (str/includes? result ":output [:per-transition"))
+      (is (str/includes? result ":success [:map [:n :int]]"))
+      (is (str/includes? result ":failure [:map [:error :string]]"))))
+
+  (testing "flat output schema: emitted as-is, not wrapped"
+    (let [result (codegen/assemble-cell-source
+                   {:cell-ns "app.cells.flat"
+                    :cell-id :x/flat
+                    :doc "..."
+                    :schema {:input  {:n :int}
+                             :output {:status :keyword}}
+                    :fn-body '(fn [_ _] {:status :ok})})]
+      (is (str/includes? result ":output {:status :keyword}"))
+      (is (not (str/includes? result ":output [:per-transition"))
+          "flat output must not be wrapped as per-transition by codegen")
+      (is (not (str/includes? result ":output [:map"))
+          "flat output must not be normalised to vector form by codegen"))))
 
 ;; =============================================================
 ;; Test source assembly
@@ -64,7 +116,19 @@
       (is (str/includes? result "(def handler (:handler cell-spec))"))
       (is (str/includes? result "(def cell-spec (cell/get-cell! :order/validate))"))
       (is (str/includes? result "(defn approx="))
-      (is (str/includes? result "(deftest test-basic")))))
+      (is (str/includes? result "(deftest test-basic"))))
+
+  (testing "test ns requires next.jdbc.result-set as rs"
+    ;; Tests for cells reading back from JDBC datasources need access to
+    ;; rs/as-unqualified-maps via the builder-fn. The test-gen prompt
+    ;; encourages this pattern; the test ns must already require it so
+    ;; the LLM doesn't have to add the require itself.
+    (let [result (codegen/assemble-test-source
+                   {:test-ns "x.y-test"
+                    :cell-ns "x.y"
+                    :cell-id :x/y
+                    :test-body "(deftest t (is true))"})]
+      (is (str/includes? result "[next.jdbc.result-set :as rs]")))))
 
 ;; =============================================================
 ;; Manifest assembly

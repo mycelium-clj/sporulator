@@ -4,6 +4,7 @@
             [sporulator.extract :as extract]
             [sporulator.feedback :refer [feedback-loop]]
             [sporulator.llm :as llm]
+            [sporulator.manifest-diff :as manifest-diff]
             [sporulator.manifest-validate :as mv]
             [sporulator.prompts :as prompts]
             [sporulator.store :as store]))
@@ -139,7 +140,9 @@
    Returns {:version n} on success, or nil if no manifest found."
   [store response]
   (when-let [manifest (extract-manifest response)]
-    (let [manifest-id (str (:id manifest))
+    (let [;; Canonicalise the manifest-id by stripping the leading colon.
+          ;; Snapshots, the diff endpoint, and the UI all use the bare form.
+          manifest-id (manifest-diff/normalize-manifest-id (:id manifest))
           version (store/save-manifest! store
                     {:id   manifest-id
                      :body (pr-str manifest)
@@ -179,9 +182,9 @@
   (let [session (get-or-create-session session-id store)
         msg     (build-decompose-prompt requirements)]
     (persist-turn! store session-id "user" msg)
-    (let [response (llm/session-send-stream session client msg on-chunk)]
-      (persist-turn! store session-id "assistant" response)
-      response)))
+    (let [content (:content (llm/session-send-stream session client msg on-chunk))]
+      (persist-turn! store session-id "assistant" content)
+      content)))
 
 (defn build-manifest
   "Step 2: builds manifest from the decomposed steps (already in session).
@@ -194,16 +197,16 @@
       (let [fb-msg (str "Before building the manifest, incorporate this feedback on the steps:\n\n"
                         feedback "\n\nNow adjust your understanding accordingly.")]
         (persist-turn! store session-id "user" fb-msg)
-        (let [response (llm/session-send-stream session client fb-msg on-chunk)]
-          (persist-turn! store session-id "assistant" response))))
+        (let [content (:content (llm/session-send-stream session client fb-msg on-chunk))]
+          (persist-turn! store session-id "assistant" content))))
     ;; Build the manifest
     (let [manifest-msg (build-manifest-from-steps-prompt nil)]
       (persist-turn! store session-id "user" manifest-msg)
-      (let [response (llm/session-send-stream session client manifest-msg on-chunk)]
-        (persist-turn! store session-id "assistant" response)
+      (let [content (:content (llm/session-send-stream session client manifest-msg on-chunk))]
+        (persist-turn! store session-id "assistant" content)
         (when store
-          (save-response-manifest! store response))
-        response))))
+          (save-response-manifest! store content))
+        content))))
 
 (defn design-workflow
   "Two-step workflow design: first decomposes requirements into steps,
@@ -221,7 +224,7 @@
     ;; Step 1: Decompose requirements into steps
     (let [decompose-msg (build-decompose-prompt requirements)]
       (persist-turn! store session-id "user" decompose-msg)
-      (let [steps-response (llm/session-send-stream session client decompose-msg on-chunk-decompose)]
+      (let [steps-response (:content (llm/session-send-stream session client decompose-msg on-chunk-decompose))]
         (persist-turn! store session-id "assistant" steps-response)
         (when on-feedback
           (on-feedback {:event-type "steps_complete"
@@ -230,7 +233,7 @@
         ;; Step 2: Build manifest from the decomposed steps
         (let [manifest-msg (build-manifest-from-steps-prompt steps-response)]
           (persist-turn! store session-id "user" manifest-msg)
-          (let [manifest-response (llm/session-send-stream session client manifest-msg on-chunk-manifest)]
+          (let [manifest-response (:content (llm/session-send-stream session client manifest-msg on-chunk-manifest))]
             (persist-turn! store session-id "assistant" manifest-response)
             (when store
               (save-response-manifest! store manifest-response))
@@ -249,7 +252,7 @@
   [client session-id message on-chunk & {:keys [store]}]
   (let [session (get-or-create-session session-id store)]
     (persist-turn! store session-id "user" message)
-    (let [content (llm/session-send-stream session client message on-chunk)]
+    (let [content (:content (llm/session-send-stream session client message on-chunk))]
       (persist-turn! store session-id "assistant" content)
       (when store
         (save-response-manifest! store content))

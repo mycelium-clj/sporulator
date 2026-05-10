@@ -67,6 +67,17 @@
     (write-file! project-path rel-path cell-source)
     {:path rel-path :namespace ns-name}))
 
+(defn delete-cell!
+  "Deletes a cell's source file from disk if it exists. No-op otherwise.
+   Returns {:path :deleted? bool}."
+  [project-path base-namespace cell-id]
+  (let [name     (cell-name-from-id cell-id)
+        ns-name  (str base-namespace ".cells." name)
+        rel-path (ns-to-path ns-name)
+        f        (java.io.File. (str project-path "/" rel-path))]
+    {:path rel-path
+     :deleted? (when (.exists f) (.delete f))}))
+
 (defn write-test!
   "Writes a single cell's test file to disk.
    Returns {:path relative-path :namespace ns-name}."

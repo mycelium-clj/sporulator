@@ -5,6 +5,70 @@
   (:require [clojure.string :as str]))
 
 ;; =============================================================
+;; Schema rendering helpers
+;; =============================================================
+
+(defn- lite-map->vector-schema
+  "Converts a lite-syntax map schema {:k :type ...} to Malli vector form
+   [:map [:k :type] ...]. Returns the schema unchanged if it isn't a
+   lite-syntax map."
+  [schema]
+  (if (and (map? schema)
+           (seq schema)
+           (every? keyword? (keys schema)))
+    (into [:map] (map (fn [[k v]] [k v])) schema)
+    schema))
+
+(defn- per-transition-wrapper?
+  "True if `output` is the explicit [:per-transition {...}] form."
+  [output]
+  (and (vector? output)
+       (= :per-transition (first output))
+       (map? (second output))))
+
+(defn- legacy-dispatched-map?
+  "True if `output` is the pre-wrapper dispatched form: a map keyed by
+   transition labels whose values are vector or lite-map sub-schemas.
+   Sporulator still accepts this shape on input (LLMs occasionally
+   produce it) and normalises it to the wrapper at emit time."
+  [output]
+  (and (map? output)
+       (seq output)
+       (every? (fn [v] (or (vector? v) (and (map? v) (every? keyword? (keys v)))))
+               (vals output))))
+
+(defn- dispatched-output?
+  "True if `output` is dispatched in either the wrapper form or the
+   legacy bare-map form."
+  [output]
+  (or (per-transition-wrapper? output)
+      (legacy-dispatched-map? output)))
+
+(defn- canonicalise-transitions
+  "Normalises each per-transition sub-schema to Malli vector form."
+  [transitions]
+  (into {} (map (fn [[label sub]] [label (lite-map->vector-schema sub)])) transitions))
+
+(defn- render-output-schema
+  "Renders a cell's :output schema for emission inside (cell/defcell ...).
+   For dispatched outputs (either the new [:per-transition {...}] wrapper
+   or the legacy bare-map form), emits the canonical wrapper form with
+   each sub-schema in Malli vector form. Flat outputs pass through."
+  [output]
+  (cond
+    (nil? output)
+    output
+
+    (per-transition-wrapper? output)
+    [:per-transition (canonicalise-transitions (second output))]
+
+    (legacy-dispatched-map? output)
+    [:per-transition (canonicalise-transitions output)]
+
+    :else
+    output))
+
+;; =============================================================
 ;; Cell source assembly
 ;; =============================================================
 
@@ -32,7 +96,7 @@
        "\n(cell/defcell " (pr-str cell-id) "\n"
        "  {:doc " (pr-str doc) "\n"
        "   :input " (pr-str (:input schema)) "\n"
-       "   :output " (pr-str (:output schema))
+       "   :output " (pr-str (render-output-schema (:output schema)))
        (when (seq requires)
          (str "\n   :requires " (pr-str (vec requires))))
        "}\n"
@@ -47,7 +111,7 @@
        "(cell/defcell " (pr-str cell-id) "\n"
        "  {:doc " (pr-str doc) "\n"
        "   :input " (pr-str (:input schema)) "\n"
-       "   :output " (pr-str (:output schema)) "}\n"
+       "   :output " (pr-str (render-output-schema (:output schema))) "}\n"
        "  (fn [resources data] data))\n"))
 
 ;; =============================================================
@@ -62,6 +126,9 @@
        "  (:require [clojure.test :refer [deftest is testing]]\n"
        "            [mycelium.cell :as cell]\n"
        "            [malli.core :as m]\n"
+       "            [next.jdbc :as jdbc]\n"
+       "            [next.jdbc.sql :as jdbc-sql]\n"
+       "            [next.jdbc.result-set :as rs]\n"
        "            [" cell-ns "]))\n\n"
        "(def cell-spec (cell/get-cell! " (pr-str cell-id) "))\n"
        "(def handler (:handler cell-spec))\n"

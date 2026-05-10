@@ -211,3 +211,31 @@
     (let [code (extract-first-code-block response)]
       (when (and code (str/includes? code "deftest"))
         code))))
+
+(defn extract-cell-source-parts
+  "Splits an assembled cell source string back into the parts the agent
+   workspace expects:
+     {:handler  '(fn [resources data] ...)' as a string, or nil
+      :helpers  helper defns joined by blank lines, or nil}
+
+   Used to pre-load handler.clj and helpers.clj when regenerating an
+   existing cell in edit-mode. Returns nil keys when nothing is found."
+  [source]
+  (when (and source (not (str/blank? source)))
+    (when-let [forms (read-all-forms-lenient source)]
+      (let [defcell    (first (filter defcell-form? forms))
+            handler    (when defcell (last defcell))
+            ;; Helpers are top-level defns/defs that appear before the
+            ;; defcell form. Skip the (ns ...) declaration and skip the
+            ;; defcell itself.
+            helper-form? (fn [f]
+                           (and (seq? f)
+                                (contains? '#{defn def defmacro defprotocol defrecord deftype}
+                                           (first f))))
+            helpers    (->> forms
+                            (take-while #(not (defcell-form? %)))
+                            (filter helper-form?)
+                            vec)]
+        {:handler (when handler (pr-str handler))
+         :helpers (when (seq helpers)
+                    (str/join "\n\n" (map pr-str helpers)))}))))

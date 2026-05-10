@@ -4,10 +4,12 @@
             [clojure.data.json :as json]
             [zprint.core :as zp]
             [clojure.string :as str]
+            [sporulator.bootstrap :as bootstrap]
             [sporulator.cell-agent :as cell-agent]
             [sporulator.eval :as ev]
             [sporulator.graph-agent :as graph-agent]
             [sporulator.llm :as llm]
+            [sporulator.manifest-diff :as manifest-diff]
             [sporulator.manifest-validate :as mv]
             [sporulator.orchestrator :as orchestrator :refer [read-system-edn]]
             [sporulator.source-gen :as source-gen]
@@ -222,15 +224,70 @@
             (send-ws! ch {:type "stream_error" :id sid
                           :payload (.getMessage e)})))))))
 
-(defn- handle-cell-implement [{:keys [cell-client llm-client store]} ch msg]
+(defn- cell-ns-from-id
+  "Derives a namespace name from base-ns and cell-id.
+   :guestbook/collect with base-ns \"app\" → \"app.cells.collect\""
+  [base-ns cell-id]
+  (let [id-str (if (str/starts-with? (str cell-id) ":")
+                 (subs (str cell-id) 1)
+                 (str cell-id))
+        suffix (last (str/split id-str #"/"))]
+    (str base-ns ".cells." (str/replace suffix "_" "-"))))
+
+(defn- parse-brief-schema
+  "Parses a brief's :schema (an EDN string) into {:input ... :output ...}.
+   Tolerant: returns {:input [:map] :output [:map]} on parse failure."
+  [schema-str]
+  (try
+    (let [raw (binding [*read-eval* false]
+                (clojure.edn/read-string schema-str))
+          fix-keys (fn fix-keys [v]
+                     (cond
+                       (and (map? v) (seq v)
+                            (every? #(or (string? %) (symbol? %)) (keys v)))
+                       (into {} (map (fn [[k vv]] [(keyword k) (fix-keys vv)])) v)
+                       (and (map? v) (seq v) (every? keyword? (keys v))) v
+                       (and (vector? v) (= "map" (first v)))
+                       (into [:map] (map (fn [entry]
+                                            (if (vector? entry)
+                                              [(keyword (first entry)) (keyword (second entry))]
+                                              (keyword entry)))
+                                          (rest v)))
+                       (string? v) (keyword v)
+                       (symbol? v) (keyword v)
+                       :else v))]
+      {:input  (fix-keys (:input raw))
+       :output (fix-keys (:output raw))})
+    (catch Exception _ {:input [:map] :output [:map]})))
+
+(defn- handle-cell-implement [{:keys [cell-client llm-client store project-path]} ch msg]
   (let [sid      (get-in msg [:payload :session_id])
         brief    (get-in msg [:payload :brief])
-        client   (or cell-client llm-client)]
-    (if-not client
+        base-ns  (or (get-in msg [:payload :base_ns]) "app")
+        client   (or cell-client llm-client)
+        cell-id  (str (:id brief))
+        cell-id-key (cond-> cell-id (str/starts-with? cell-id ":") (subs 1))
+        ;; Pull the latest approved test contract for this cell, if any.
+        contracts (when store (store/get-test-contracts-for-cell store cell-id-key))
+        contract  (last contracts)
+        test-code (:test-code contract)
+        cell-ns   (cell-ns-from-id base-ns cell-id-key)
+        schema-parsed (parse-brief-schema (or (:schema brief) ""))]
+    (cond
+      (not client)
       (send-ws! ch {:type "stream_error" :id sid
                     :payload "LLM not configured."})
+
+      (str/blank? test-code)
+      (send-ws! ch {:type "stream_error" :id sid
+                    :payload (str "No test contract found for " cell-id
+                                  ". Generate tests first.")})
+
+      :else
       (future
         (try
+          ;; The agent loop's finalize already writes to :store and disk,
+          ;; so we don't double-save here.
           (let [result (cell-agent/implement-with-feedback
                          client brief
                          (fn [chunk]
@@ -239,10 +296,14 @@
                          :on-feedback
                          (fn [event]
                            (send-ws! ch {:type "feedback_event" :id sid
-                                         :payload event})))]
-            (when (and store (= :ok (:status result)))
-              (cell-agent/save-cell! store result
-                {:schema (:schema brief) :doc (:doc brief)}))
+                                         :payload event}))
+                         :test-code     test-code
+                         :cell-ns       cell-ns
+                         :schema-parsed schema-parsed
+                         :base-ns       base-ns
+                         :project-path  project-path
+                         :store         store
+                         :run-id        (:run-id contract))]
             (send-ws! ch {:type "cell_result" :id sid
                           :payload {:cell_id (:cell-id result)
                                     :status  (name (:status result))
@@ -296,10 +357,11 @@
       (future
         (try
           (let [session (llm/create-session (str "iterate:" sid) "")
-                content (llm/session-send-stream session client feedback
-                          (fn [chunk]
-                            (send-ws! ch {:type "stream_chunk" :id sid
-                                          :payload {:chunk chunk}})))]
+                content (:content
+                          (llm/session-send-stream session client feedback
+                            (fn [chunk]
+                              (send-ws! ch {:type "stream_chunk" :id sid
+                                            :payload {:chunk chunk}}))))]
             (send-ws! ch {:type "stream_end" :id sid
                           :payload {:content content}}))
           (catch Exception e
@@ -377,6 +439,14 @@
         leaves      (get-in msg [:payload :leaves])
         base-ns     (get-in msg [:payload :base_ns] "app")
         manifest-id (get-in msg [:payload :manifest_id])
+        ;; Implementor strategy. JSON arrives as a string; coerce to a
+        ;; keyword the orchestrator's case statement understands. Default
+        ;; is :flat (existing behaviour). Pass "bottom-up" to opt into
+        ;; the recursive-decomposer + parallel-leaf path.
+        strategy    (let [raw (get-in msg [:payload :strategy])]
+                      (case raw
+                        ("bottom-up" "bottom_up" :bottom-up) :bottom-up
+                        :flat))
         client      (or cell-client llm-client)
         manifest    (when (and store manifest-id)
                       (when-let [m (store/get-latest-manifest store manifest-id)]
@@ -390,6 +460,7 @@
                       :base-ns      base-ns
                       :store        store
                       :project-path project-path
+                      :strategy     strategy
                       :on-event     (fn [event]
                                       (send-ws! ch {:type "orchestrator_event"
                                                     :id sid
@@ -399,7 +470,8 @@
                                                     :id sid
                                                     :payload {:chunk chunk}}))})]
         (send-ws! ch {:type "orchestration_started" :id sid
-                      :payload {"run_id" run-id}})))))
+                      :payload {"run_id"   run-id
+                                "strategy" (name strategy)}})))))
 
 (defn- handle-approve-tests [_ctx ch msg]
   (let [sid     (get-in msg [:payload :session_id])
@@ -702,6 +774,34 @@
                           {:id id :body (or body "") :created-by "api"})]
             (json-response {"ID" id "Version" version}))))
 
+      ;; Diff between the latest manifest and the latest green snapshot
+      (and (= method :get) (= uri "/api/manifest/diff"))
+      (if-let [raw-id (query-param request "id")]
+        (let [;; Normalise the manifest-id so callers can pass either form
+              ;; (":foo/bar" or "foo/bar") and lookups all hit the same row.
+              id (manifest-diff/normalize-manifest-id raw-id)
+              m-row (store/get-latest-manifest store id)
+              parsed-cur (when m-row (mv/parse-manifest (:body m-row)))
+              cur-manifest (when (and parsed-cur (not (:error parsed-cur))) parsed-cur)
+              snap (store/get-latest-green-snapshot store id)
+              parsed-prev (when snap (mv/parse-manifest (:body snap)))
+              prev-manifest (when (and parsed-prev (not (:error parsed-prev))) parsed-prev)
+              d (manifest-diff/diff prev-manifest cur-manifest)
+              ->ids (fn [ks] (mapv str ks))]
+          (json-response
+            {"manifest_id"     id
+             "manifest_version" (when m-row (:version m-row))
+             "snapshot_version" (when snap (:manifest-version snap))
+             "snapshot_run_id"  (when snap (:run-id snap))
+             "added"           (->ids (:added d))
+             "removed"         (->ids (:removed d))
+             "schema_changed"  (->ids (:schema-changed d))
+             "doc_changed"     (->ids (:doc-changed d))
+             "unchanged"       (->ids (:unchanged d))
+             "empty"           (manifest-diff/empty-diff? d)
+             "summary"         (manifest-diff/format-diff d)}))
+        (json-response {"error" "missing id"} 400))
+
       ;; Manifest export
       (and (= method :post) (= uri "/api/manifest/export"))
       (let [{:keys [project_path manifest_id body]} (read-json-body request)
@@ -826,16 +926,44 @@
                      Falls back to GRAPH_BASE_URL, GRAPH_API_KEY, GRAPH_MODEL env vars
      :cell-llm     - cell agent LLM config {:base-url, :api-key, :model}
                      Falls back to CELL_BASE_URL, CELL_API_KEY, CELL_MODEL env vars"
-  [{:keys [port store project-path graph-llm cell-llm] :or {port 8420}}]
+  [{:keys [port store project-path graph-llm cell-llm base-ns]
+    :or   {port 8420 base-ns "app"}}]
   (let [graph-client (create-llm-client "GRAPH" graph-llm)
         cell-client  (create-llm-client "CELL" cell-llm)
         clients      (atom #{})
+        ;; If the store is empty for this project but the project has
+        ;; an existing manifest + cells on disk, seed them as the
+        ;; baseline so orchestrate!'s diff sees them as carry-over
+        ;; rather than re-implementing every cell from scratch.
+        boot-result  (when (and store project-path)
+                       (try (bootstrap/bootstrap-from-project!
+                              {:store store
+                               :project-path project-path
+                               :base-ns base-ns})
+                            (catch Throwable t
+                              (println "Sporulator bootstrap warning:"
+                                       (.getMessage t))
+                              nil)))
         ctx          {:store store :project-path project-path
                       :clients clients
                       :llm-client graph-client
                       :cell-client cell-client}
         stop-fn      (http/run-server (fn [req] (handler ctx req)) {:port port})]
     (println (str "Sporulator server started on port " port))
+    (when boot-result
+      (println (str "  Bootstrap: "
+                    (cond-> []
+                      (:manifest-saved? boot-result)
+                      (conj "manifest seeded")
+                      (pos? (:cells-saved boot-result))
+                      (conj (str (:cells-saved boot-result) " cell(s) seeded"))
+                      (pos? (:cells-skipped boot-result))
+                      (conj (str (:cells-skipped boot-result) " carry-over")))
+                    " (manifest-id: " (:manifest-id boot-result) ")"
+                    (when (and (not (:manifest-saved? boot-result))
+                               (zero? (:cells-saved boot-result))
+                               (zero? (:cells-skipped boot-result)))
+                      "no project files found"))))
     (doseq [[label client prefix] [["Graph" graph-client "GRAPH"]
                                     ["Cell"  cell-client  "CELL"]]]
       (if client
@@ -845,6 +973,7 @@
                           "deepseek-chat")))
         (println (str "  " label " LLM: not configured (set " prefix "_API_KEY)"))))
     {:stop-fn stop-fn :port port :store store :clients clients
+     :project-path project-path
      :llm-client graph-client :cell-client cell-client}))
 
 (defn stop!
