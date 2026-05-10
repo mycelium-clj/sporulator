@@ -47,12 +47,12 @@
       ;; pr-str handles quoting automatically
       (is (str/includes? result (pr-str "Validate \"special\" input")))))
 
-  (testing "dispatched output with lite-map sub-schemas: emits vector-form sub-schemas"
-    ;; mycelium.cell/output-dispatched? requires (every? vector? (vals output))
-    ;; — so per-transition sub-schemas in the emitted file MUST be vector-form
-    ;; [:map [:k v] ...], not lite-map {:k v}. Otherwise defcell normalizes the
-    ;; schema as a flat map and the workflow's schema-chain validator sees
-    ;; :success/:failure as data keys.
+  (testing "dispatched output (legacy bare-map input): normalised to [:per-transition {...}] wrapper with vector sub-schemas"
+    ;; Mycelium now requires the explicit [:per-transition {...}] wrapper for
+    ;; per-transition output. A bare map is always interpreted as lite-map
+    ;; syntax. Codegen still accepts the legacy bare-map input shape from
+    ;; upstream parsers and normalises it to the wrapper at emit time, with
+    ;; each sub-schema in Malli vector form.
     (let [result (codegen/assemble-cell-source
                    {:cell-ns "app.cells.validate-handle"
                     :cell-id :guestbook/validate-handle
@@ -64,20 +64,24 @@
                                 (if (seq handle)
                                   {:validated-handle handle}
                                   {:error "empty"}))})]
-      (is (str/includes? result ":output {:success [:map [:validated-handle :string]]")
+      (is (str/includes? result ":output [:per-transition")
+          "dispatched output must emit the [:per-transition ...] wrapper")
+      (is (str/includes? result ":success [:map [:validated-handle :string]]")
           "success sub-schema must render as a [:map ...] vector")
       (is (str/includes? result ":failure [:map [:error :string]]")
           "failure sub-schema must render as a [:map ...] vector")))
 
-  (testing "dispatched output with already-vector sub-schemas: emitted unchanged"
+  (testing "dispatched output already in [:per-transition {...}] wrapper: passthrough with vector sub-schemas"
     (let [result (codegen/assemble-cell-source
                    {:cell-ns "app.cells.x"
                     :cell-id :x/y
                     :doc "..."
                     :schema {:input  [:map [:n :int]]
-                             :output {:success [:map [:n :int]]
-                                      :failure [:map [:error :string]]}}
+                             :output [:per-transition
+                                      {:success [:map [:n :int]]
+                                       :failure [:map [:error :string]]}]}
                     :fn-body '(fn [_ d] d)})]
+      (is (str/includes? result ":output [:per-transition"))
       (is (str/includes? result ":success [:map [:n :int]]"))
       (is (str/includes? result ":failure [:map [:error :string]]"))))
 
@@ -90,6 +94,8 @@
                              :output {:status :keyword}}
                     :fn-body '(fn [_ _] {:status :ok})})]
       (is (str/includes? result ":output {:status :keyword}"))
+      (is (not (str/includes? result ":output [:per-transition"))
+          "flat output must not be wrapped as per-transition by codegen")
       (is (not (str/includes? result ":output [:map"))
           "flat output must not be normalised to vector form by codegen"))))
 

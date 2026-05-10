@@ -283,12 +283,15 @@ Lite syntax (auto-converts to Malli):
  :output {:tax :double}}
 ```
 
-Per-transition output schemas (for branching cells):
+Per-transition output schemas (for branching cells) — wrap in `[:per-transition {...}]`:
 ```clojure
 {:input  {:user-id :string}
- :output {:found     [:map [:profile [:map [:name :string]]]]
-          :not-found [:map [:error-message :string]]}}
+ :output [:per-transition
+          {:found     [:map [:profile [:map [:name :string]]]]
+           :not-found [:map [:error-message :string]]}]}
 ```
+A bare map is ALWAYS lite-map syntax (flat output). The
+`[:per-transition ...]` wrapper is required for dispatched outputs.
 
 Common types: :string :int :double :boolean :keyword :any :uuid
 Collections: [:vector :string], [:set :keyword]
@@ -319,11 +322,14 @@ concerns.
 
 ### Per-transition output schema
 
-When a cell branches, declare an output schema per edge:
+When a cell branches, declare an output schema per edge. The
+`[:per-transition {...}]` wrapper is required — a bare map is always
+treated as lite-map syntax:
 
 ```clojure
-:output {:pass [:map [:status [:= :ok]]]
-         :fail [:map [:status [:= :error]] [:reason :string]]}
+:output [:per-transition
+         {:pass [:map [:status [:= :ok]]]
+          :fail [:map [:status [:= :error]] [:reason :string]]}]
 ```
 
 ### Default fallback
@@ -356,12 +362,13 @@ different downstream data, decompose:
 
 WRONG (one cell carrying six different output shapes):
 ```clojure
-:start {:output {:list   [:map [:filter ...]]
-                 :add    [:map [:title :string]]
-                 :toggle [:map [:id :int]]
-                 :edit   [:map [:id :int] [:title :string]]
-                 :delete [:map [:id :int]]
-                 :clear  [:map]}}
+:start {:output [:per-transition
+                 {:list   [:map [:filter ...]]
+                  :add    [:map [:title :string]]
+                  :toggle [:map [:id :int]]
+                  :edit   [:map [:id :int] [:title :string]]
+                  :delete [:map [:id :int]]
+                  :clear  [:map]}]}
 :edges {:start {:list :list-todos, :add :add-todo, :toggle :toggle-todo,
                 :edit :edit-todo, :delete :delete-todo, :clear :clear-completed}}
 ```

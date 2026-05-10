@@ -131,30 +131,34 @@
 ;; =============================================================
 
 (deftest dispatched-output-detector-test
-  (testing "lite-form dispatched output (map values)"
+  (testing "[:per-transition {...}] wrapper with Malli-form sub-schemas"
     (is (orch/dispatched-output?
-          {:success {:validated-handle :string}
-           :failure {:error :string}})))
+          [:per-transition {:success [:map [:n :int]]
+                            :failure [:map [:e :string]]}])))
 
-  (testing "Malli-form dispatched output (vector values)"
+  (testing "[:per-transition {...}] wrapper with lite-map sub-schemas"
     (is (orch/dispatched-output?
-          {:success [:map [:n :int]]
-           :failure [:map [:e :string]]})))
+          [:per-transition {:success {:validated-handle :string}
+                            :failure {:error :string}}])))
 
-  (testing "single-transition output"
+  (testing "[:per-transition {...}] wrapper with single transition"
     (is (orch/dispatched-output?
-          {:success {:n :int}})))
+          [:per-transition {:success [:map [:n :int]]}])))
 
-  (testing "flat output is NOT dispatched"
-    (is (not (orch/dispatched-output? {:n :int :x :string})))
-    (is (not (orch/dispatched-output? {:status :keyword :total :double}))))
+  (testing "bare map is NOT dispatched (always lite-map syntax now)"
+    (is (not (orch/dispatched-output?
+               {:success [:map [:n :int]] :failure [:map [:e :string]]})))
+    (is (not (orch/dispatched-output? {:n :int :x :string}))))
+
+  (testing "flat schema vectors are NOT dispatched"
+    (is (not (orch/dispatched-output? [:map [:k :v]]))))
 
   (testing "edge cases"
     (is (not (orch/dispatched-output? nil)))
     (is (not (orch/dispatched-output? {})))
-    (is (not (orch/dispatched-output? [:map [:k :v]])))
     (is (not (orch/dispatched-output? "string")))
-    (is (not (orch/dispatched-output? {:k {}}))         "empty map values shouldn't count")))
+    (is (not (orch/dispatched-output? [:per-transition {}]))
+        "empty transitions map shouldn't count")))
 
 (deftest turn-budget-for-test
   (testing "cells without :requires stay at 15 turns"
@@ -181,7 +185,7 @@
     (let [prompt (#'orch/build-test-prompt
                    {:id "x/y"
                     :doc "Validates input. Returns :error on failure."
-                    :schema "{:input {:k :string} :output {:success {:n :int} :failure {:error :string}}}"
+                    :schema "{:input {:k :string} :output [:per-transition {:success [:map [:n :int]] :failure [:map [:error :string]]}]}"
                     :requires []
                     :resource-docs nil
                     :context nil})]
@@ -224,10 +228,10 @@
            (orch/parse-schema-output "{:input {:x :int} :output {:n :int}}"))))
 
   (testing "parses a dispatched output schema"
-    (is (= {:success {:validated-handle :string}
-            :failure {:error :string}}
+    (is (= [:per-transition {:success [:map [:validated-handle :string]]
+                             :failure [:map [:error :string]]}]
            (orch/parse-schema-output
-             "{:input {:handle :string} :output {:success {:validated-handle :string} :failure {:error :string}}}"))))
+             "{:input {:handle :string} :output [:per-transition {:success [:map [:validated-handle :string]] :failure [:map [:error :string]]}]}"))))
 
   (testing "blank or unparseable returns nil"
     (is (nil? (orch/parse-schema-output nil)))

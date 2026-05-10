@@ -149,8 +149,9 @@
     (let [cell-state {:cell-id   :guestbook/persist-entry
                       :brief     {:doc "Inserts a row." :requires [:db]}
                       :schema-parsed {:input  [:map [:k :string]]
-                                      :output {:success [:map [:id :int]]
-                                               :failure [:map [:error :string]]}}
+                                      :output [:per-transition
+                                               {:success [:map [:id :int]]
+                                                :failure [:map [:error :string]]}]}
                       :files     {"handler.clj" "" "helpers.clj" "" "test.clj" ""}
                       :task      nil
                       :change-summary nil}

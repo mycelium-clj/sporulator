@@ -81,11 +81,17 @@
         (str label " is not valid Malli: " (.getMessage t))))))
 
 (defn- dispatched-output?
-  "True when output is a map keyed by transition labels with vector
-   sub-schemas. Same heuristic mycelium uses."
+  "True when output is the explicit [:per-transition {...}] wrapper."
   [output]
-  (and (map? output) (seq output)
-       (every? vector? (vals output))))
+  (and (vector? output)
+       (= :per-transition (first output))
+       (map? (second output))))
+
+(defn- transitions-map
+  "Returns the {transition-label sub-schema} map from a [:per-transition {...}]
+   wrapper. Caller must already have verified `dispatched-output?`."
+  [output]
+  (second output))
 
 (defn- validate-schemas
   "Walks the cell's :input and :output schemas. For dispatched
@@ -99,7 +105,7 @@
                (and output (dispatched-output? output))
                (into (mapv (fn [[label sub]]
                              (check-malli (str "Output[" label "]") sub))
-                           output))
+                           (transitions-map output)))
 
                (and output (not (dispatched-output? output)))
                (conj (check-malli "Output schema" output)))
@@ -132,14 +138,15 @@
     (nil? output) {:ok? true}
 
     (dispatched-output? output)
-    (if-let [match (some (fn [[label sub]]
-                           (when (m/validate sub result) label))
-                         output)]
-      {:ok? true :transition match}
-      {:ok? false
-       :error (str "Handler returned " (pr-str result) " which does not "
-                   "match any declared output transition. Allowed transitions: "
-                   (pr-str (vec (keys output))))})
+    (let [transitions (transitions-map output)]
+      (if-let [match (some (fn [[label sub]]
+                             (when (m/validate sub result) label))
+                           transitions)]
+        {:ok? true :transition match}
+        {:ok? false
+         :error (str "Handler returned " (pr-str result) " which does not "
+                     "match any declared output transition. Allowed transitions: "
+                     (pr-str (vec (keys transitions))))}))
 
     :else
     (if (m/validate output result)

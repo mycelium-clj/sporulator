@@ -77,12 +77,13 @@
            "). Every cell must declare what it produces; downstream "
            "edges can't be validated against `:any`.")
 
-      ;; Dispatched: map-of-transition → sub-schema. Any opaque sub
-      ;; (e.g. `{:success [:map [:id :int]] :failure :any}`) is also a
-      ;; gap, since the :failure edge would be unbindable.
-      (and (map? output) (seq output))
-      (let [opaque-transitions
-            (vec (for [[label sub] output
+      ;; Dispatched: [:per-transition {label sub-schema ...}]. Any opaque
+      ;; sub (e.g. `[:per-transition {:success [:map [:id :int]] :failure :any}]`)
+      ;; is also a gap, since the :failure edge would be unbindable.
+      (and (vector? output) (= :per-transition (first output)) (map? (second output)))
+      (let [transitions (second output)
+            opaque-transitions
+            (vec (for [[label sub] transitions
                        :when (opaque-output-schema? sub)]
                    label))]
         (when (seq opaque-transitions)
@@ -142,13 +143,15 @@
         bad-in  (seq-ops-in-map-schema in)
         ;; Output may be dispatched (map of transition → vector schema).
         bad-out (cond
-                  (vector? out) (seq-ops-in-map-schema out)
-                  (and (map? out) (seq out))
+                  (and (vector? out) (= :per-transition (first out)) (map? (second out)))
                   (seq (mapcat (fn [[label sub]]
                                  (when-let [pairs (seq-ops-in-map-schema sub)]
                                    (mapv (fn [[k op]] [(keyword (str (name label) "/" (name k))) op])
                                          pairs)))
-                               out)))
+                               (second out)))
+
+                  (vector? out)
+                  (seq-ops-in-map-schema out))
         bad     (concat bad-in bad-out)]
     (when (seq bad)
       (str cell-name " uses sequence-operator schema head(s) inside map entries:\n"
@@ -304,9 +307,12 @@
                   target-cell (get cells target-name)]
             :when (and source-cell target-cell)
             :let [source-output (get-in source-cell [:schema :output])
-                  ;; For per-transition output maps, use the specific transition's schema
-                  source-output (if (and transition-key (map? source-output))
-                                  (get source-output transition-key source-output)
+                  ;; For [:per-transition {...}] outputs, use the specific transition's schema
+                  source-output (if (and transition-key
+                                         (vector? source-output)
+                                         (= :per-transition (first source-output))
+                                         (map? (second source-output)))
+                                  (get (second source-output) transition-key source-output)
                                   source-output)
                   target-input (get-in target-cell [:schema :input])]]
         {:source-name   source-name

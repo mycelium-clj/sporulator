@@ -172,26 +172,28 @@
       (catch Exception _ nil))))
 
 (defn dispatched-output?
-  "True if `output` is a dispatched-output map: keyed by transition labels
-   (e.g. :success / :failure), each value an inner sub-schema. Recognises
-   both the lite-form (map values) and the Malli-form (vector values).
+  "True if `output` is the [:per-transition {...}] wrapper form.
 
-   {:success {:n :int} :failure {:e :string}}            → true
-   {:success [:map [:n :int]] :failure [:map [:e :string]]} → true
-   {:n :int :x :string}                                   → false (flat)
-   {} or [:map ...]                                       → false"
+   [:per-transition {:success [:map [:n :int]] :failure [:map [:e :string]]}] → true
+   [:map [:n :int]]                                                            → false (flat)
+   {:n :int :x :string}                                                        → false (lite-map)"
   [output]
-  (and (map? output) (seq output)
-       (every? (fn [v] (or (and (map? v) (seq v))
-                            (vector? v)))
-               (vals output))))
+  (and (vector? output)
+       (= :per-transition (first output))
+       (map? (second output))
+       (seq (second output))))
+
+(defn- dispatched-transitions
+  "Returns the transitions map from a [:per-transition {...}] wrapper."
+  [output]
+  (second output))
 
 (defn- dispatched-shape-block
   "Renders the dispatched-output guidance block for the test/implementor
-   prompts when the cell's output is dispatched. `output` is the parsed
-   dispatched-output map."
+   prompts when the cell's output is dispatched. `output` is the cell's
+   `[:per-transition {...}]` wrapper."
   [output]
-  (let [pairs (vec output)
+  (let [pairs (vec (dispatched-transitions output))
         first-pair (first pairs)
         first-label (name (key first-pair))
         first-keys (cond
@@ -825,20 +827,24 @@
          "## When a cell has multiple outgoing edges (dispatched edges)\n\n"
          "If a cell's `:edges` entry is a map (e.g. "
          "`{:list :a, :add :b, :toggle :c}`), the cell must declare a "
-         "**per-transition `:output`** — a map keyed by the same transition "
-         "labels, where each value is a `[:map ...]` describing the data "
-         "shape produced on THAT transition. Each transition's output must "
-         "supply every REQUIRED key the corresponding target cell's `:input` "
-         "declares.\n\n"
+         "**per-transition `:output`** using the explicit "
+         "`[:per-transition {...}]` wrapper. The inner map is keyed by the "
+         "same transition labels, where each value is a `[:map ...]` "
+         "describing the data shape produced on THAT transition. Each "
+         "transition's output must supply every REQUIRED key the "
+         "corresponding target cell's `:input` declares.\n\n"
          "Example for a router with three branches:\n"
          "```clojure\n"
-         ":output {:list   [:map [:filter {:optional true} [:enum \"all\" \"active\"]]]\n"
-         "         :add    [:map [:title :string]]\n"
-         "         :toggle [:map [:id :int]]}\n"
+         ":output [:per-transition\n"
+         "         {:list   [:map [:filter {:optional true} [:enum \"all\" \"active\"]]]\n"
+         "          :add    [:map [:title :string]]\n"
+         "          :toggle [:map [:id :int]]}]\n"
          "```\n\n"
-         "A single-shape `:output` with all-optional keys does NOT satisfy "
-         "downstream consumers that require those keys — the producer's "
-         "REQUIRED keys are what counts.\n\n"
+         "A bare map without the `[:per-transition ...]` wrapper is "
+         "always interpreted as lite-map syntax (flat output), never "
+         "per-transition. A single-shape `:output` with all-optional keys "
+         "does NOT satisfy downstream consumers that require those keys — "
+         "the producer's REQUIRED keys are what counts.\n\n"
          "Return the corrected manifest as a single EDN block in a "
          "```clojure``` fence — no commentary outside the fence.")))
 

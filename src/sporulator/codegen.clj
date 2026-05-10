@@ -19,30 +19,54 @@
     (into [:map] (map (fn [[k v]] [k v])) schema)
     schema))
 
-(defn- dispatched-output?
-  "True if `output` is a dispatched-output schema map keyed by transition
-   labels. Mirrors mycelium.cell/output-dispatched? but accepts either
-   already-vector or lite-map sub-schemas — codegen needs to recognise
-   both shapes so it can canonicalise sub-schemas to vector form before
-   emission."
+(defn- per-transition-wrapper?
+  "True if `output` is the explicit [:per-transition {...}] form."
+  [output]
+  (and (vector? output)
+       (= :per-transition (first output))
+       (map? (second output))))
+
+(defn- legacy-dispatched-map?
+  "True if `output` is the pre-wrapper dispatched form: a map keyed by
+   transition labels whose values are vector or lite-map sub-schemas.
+   Sporulator still accepts this shape on input (LLMs occasionally
+   produce it) and normalises it to the wrapper at emit time."
   [output]
   (and (map? output)
        (seq output)
        (every? (fn [v] (or (vector? v) (and (map? v) (every? keyword? (keys v)))))
                (vals output))))
 
+(defn- dispatched-output?
+  "True if `output` is dispatched in either the wrapper form or the
+   legacy bare-map form."
+  [output]
+  (or (per-transition-wrapper? output)
+      (legacy-dispatched-map? output)))
+
+(defn- canonicalise-transitions
+  "Normalises each per-transition sub-schema to Malli vector form."
+  [transitions]
+  (into {} (map (fn [[label sub]] [label (lite-map->vector-schema sub)])) transitions))
+
 (defn- render-output-schema
   "Renders a cell's :output schema for emission inside (cell/defcell ...).
-   For dispatched outputs, each per-transition sub-schema is canonicalised
-   to vector form so that `defcell`'s `output-dispatched?` heuristic
-   (every? vector? (vals output)) trips at load time. Flat outputs and
-   already-vector schemas pass through unchanged."
+   For dispatched outputs (either the new [:per-transition {...}] wrapper
+   or the legacy bare-map form), emits the canonical wrapper form with
+   each sub-schema in Malli vector form. Flat outputs pass through."
   [output]
   (cond
-    (nil? output)             output
-    (dispatched-output? output)
-    (into {} (map (fn [[label sub]] [label (lite-map->vector-schema sub)])) output)
-    :else                     output))
+    (nil? output)
+    output
+
+    (per-transition-wrapper? output)
+    [:per-transition (canonicalise-transitions (second output))]
+
+    (legacy-dispatched-map? output)
+    [:per-transition (canonicalise-transitions output)]
+
+    :else
+    output))
 
 ;; =============================================================
 ;; Cell source assembly
